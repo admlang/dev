@@ -1,0 +1,11 @@
+// Docker Engine and Podman API client
+@manifest(version = "0.0.1")
+library adm.dev.docker {
+	use (
+		adm.dev.docker
+	)
+
+	export (
+		adm.dev.docker
+	)
+}

@@ -1,0 +1,11 @@
+// GitLab REST, GraphQL and webhooks client
+@manifest(version = "0.0.1")
+library adm.dev.gitlab {
+	use (
+		adm.dev.gitlab
+	)
+
+	export (
+		adm.dev.gitlab
+	)
+}

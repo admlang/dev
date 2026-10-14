@@ -1,0 +1,3 @@
+partial module adm.dev.kubernetes {
+	// Kubernetes API over std.net.http: kubeconfig (contexts, tokens, client certificates, exec plugins), in-cluster configuration, typed core resources and unstructured objects for custom resources, list and watch with bookmarks, server-side apply, logs, exec and port-forward, leader election
+}

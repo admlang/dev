@@ -1,0 +1,11 @@
+// GitHub REST, GraphQL and webhooks client
+@manifest(version = "0.0.1")
+library adm.dev.github {
+	use (
+		adm.dev.github
+	)
+
+	export (
+		adm.dev.github
+	)
+}

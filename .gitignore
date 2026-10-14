@@ -1,0 +1,2 @@
+# Built containers are release assets, never committed.
+*.admlib

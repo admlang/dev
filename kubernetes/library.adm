@@ -1,0 +1,11 @@
+// Kubernetes API client
+@manifest(version = "0.0.1")
+library adm.dev.kubernetes {
+	use (
+		adm.dev.kubernetes
+	)
+
+	export (
+		adm.dev.kubernetes
+	)
+}

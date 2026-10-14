@@ -1,0 +1,3 @@
+partial module adm.dev.github {
+	// GitHub API over std.net.http: REST and GraphQL, authentication as a token, a GitHub App (installation tokens) or an OAuth app, pagination and rate limits, webhook signature verification and typed events, GitHub Enterprise base URLs
+}

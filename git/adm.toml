@@ -1,0 +1,14 @@
+# adm.toml
+#
+# Manifest of the adm.dev.git library. The [publisher] section is
+# written by `adm app init` with the publisher's key.
+
+schema = 1
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:Wg81bZ2hdpxgdhjvfTQczkbzn9ZxpgaT9uq6fS8d/sw="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.dev.git"]
+description = "Git repositories, objects and transports"

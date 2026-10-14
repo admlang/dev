@@ -1,0 +1,3 @@
+partial module adm.dev.gitlab {
+	// GitLab API over std.net.http: REST and GraphQL, personal, project, job and OAuth tokens, pagination and rate limits, webhook token verification and typed events, self-managed base URLs
+}

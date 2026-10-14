@@ -1,0 +1,3 @@
+partial module adm.dev.docker {
+	// Docker Engine API over the Unix socket or TCP with TLS, also Podman's compatible API: containers (create, start, stop, logs, exec, wait, stats), images (pull, push, build from a context, inspect), volumes, networks, events, system information
+}

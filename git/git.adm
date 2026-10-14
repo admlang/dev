@@ -1,0 +1,3 @@
+partial module adm.dev.git {
+	// Git in ADM: repositories on disk (loose objects, packfiles and deltas, the index, refs and packed refs), commits, trees, blobs and tags, diffs, log and blame, checkout; smart HTTP and SSH transports for clone, fetch, push and ls-remote with credentials; no libgit2
+}
