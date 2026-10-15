@@ -1,0 +1,331 @@
+// The working tree: status, add, rm, mv, commit and line endings. With
+// ADM_TEST_GIT_KEEP set, each repository keeps `.git/adm-status` (our
+// porcelain) to compare with `git status --porcelain` by hand.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	internal def newWorktree(name string) !Repository {
+		let dir = try scratch(name)
+		let repo = try init(dir, InitOptions{initialBranch: "main"})
+		repo.config.override("user.name", "Ana Lima")
+		repo.config.override("user.email", "ana@example.com")
+		repo.config.override("core.excludesfile", "")
+		repo.config.override("core.attributesfile", "")
+		return repo
+	}
+
+	internal def writeFile(repo Repository, path string, text string) !none {
+		let full = os.join(repo.workDir, path)
+		try os.mkdir(os.dir(full), true)
+		try os.writeFile(full, text.bytes())
+		return none
+	}
+
+	// The porcelain status, also left in the repository for comparison.
+	internal def statusText(repo Repository, options StatusOptions = StatusOptions{}) !string {
+		let text = porcelain(try repo.status(options))
+		try os.writeFile(os.join(repo.gitDir, "adm-status"), text.bytes())
+		return text
+	}
+
+	check "Working tree" {
+		@test()
+		def reportsChanges() !none {
+			let repo = try newWorktree("status")
+			try writeFile(repo, "a.txt", "one\n")
+			try writeFile(repo, "b.txt", "two\n")
+			try writeFile(repo, "dir/c.txt", "three\n")
+			try repo.add(".")
+			fail "staged: {try statusText(repo)}" unless (try statusText(repo)) == "A  a.txt\nA  b.txt\nA  dir/c.txt\n"
+			try repo.commit("First")
+			fail "clean: {try statusText(repo)}" unless (try statusText(repo)) == ""
+			try writeFile(repo, "a.txt", "one changed\n")
+			try os.remove(os.join(repo.workDir, "b.txt"))
+			try writeFile(repo, "d.txt", "new\n")
+			try writeFile(repo, "fresh/e.txt", "e\n")
+			let text = try statusText(repo)
+			fail "status: {text}" unless text == " M a.txt\n D b.txt\n?? d.txt\n?? fresh/\n"
+			let all = try statusText(repo, StatusOptions{untracked: UntrackedMode.All})
+			fail "-uall: {all}" unless all == " M a.txt\n D b.txt\n?? d.txt\n?? fresh/e.txt\n"
+			try repo.add("a.txt", "b.txt")
+			let staged = try statusText(repo)
+			fail "after add: {staged}" unless staged == "M  a.txt\nD  b.txt\n?? d.txt\n?? fresh/\n"
+			repo.close()
+			return none
+		}
+
+		@test()
+		def detectsRenamesAndIgnores() !none {
+			let repo = try newWorktree("renames")
+			try writeFile(repo, ".gitignore", "*.log\nbuild/\n")
+			try writeFile(repo, "src/main.c", "int main() {\n\treturn 0;\n}\n")
+			try repo.add(".")
+			try repo.commit("Initial")
+			try repo.move("src/main.c", "src/app.c")
+			try writeFile(repo, "debug.log", "x\n")
+			try writeFile(repo, "build/out.o", "x\n")
+			let text = try statusText(repo)
+			fail "rename: {text}" unless text == "R  src/main.c -> src/app.c\n"
+			let ignored = try statusText(repo, StatusOptions{ignored: true})
+			fail "ignored: {ignored}" unless ignored == "!! build/\n!! debug.log\nR  src/main.c -> src/app.c\n"
+			// An ignored file is refused unless forced.
+			let refused = false
+			repo.add("debug.log") onerror (err error) {
+				refused = true
+				recover none
+			}
+			fail "ignored file added" unless refused
+			try repo.add(["debug.log"], AddOptions{force: true})
+			fail "forced add: {try statusText(repo)}" unless (try statusText(repo)) == "A  debug.log\nR  src/main.c -> src/app.c\n"
+			repo.close()
+			return none
+		}
+
+		@test()
+		def tracksModesLinksAndIntent() !none {
+			let repo = try newWorktree("modes")
+			try writeFile(repo, "run.sh", "#!/bin/sh\n")
+			try writeFile(repo, "target.txt", "t\n")
+			try os.symlink("target.txt", os.join(repo.workDir, "link"))
+			try repo.add(".")
+			try repo.commit("Initial")
+			let tree = try repo.tree("HEAD")
+			let link = tree.entry("link")
+			fail "link mode" when link is none || link.mode != EntryMode.Symlink
+			try os.chmod(os.join(repo.workDir, "run.sh"), 0o755)
+			try writeFile(repo, "later.txt", "l\n")
+			try repo.add(["later.txt"], AddOptions{intentToAdd: true})
+			let text = try statusText(repo)
+			fail "modes: {text}" unless text == " A later.txt\n M run.sh\n"
+			try repo.add("run.sh")
+			let mode = (try repo.index()).entry("run.sh")
+			fail "exec bit not staged" when mode is none || mode.mode != 0o100755
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def convertsLineEndings() !none {
+			let repo = try newWorktree("eol")
+			try writeFile(repo, ".gitattributes", "*.txt text eol=crlf\n*.bin -text\n")
+			try writeFile(repo, "a.txt", "one\r\ntwo\r\n")
+			try writeFile(repo, "b.bin", "raw\r\n")
+			try repo.add(".")
+			try repo.commit("Initial")
+			let a = try repo.blob("HEAD:a.txt")
+			fail "a.txt stored with CR" unless string(a.data) == "one\ntwo\n"
+			let b = try repo.blob("HEAD:b.bin")
+			fail "b.bin changed" unless string(b.data) == "raw\r\n"
+			fail "clean after add: {try statusText(repo)}" unless (try statusText(repo)) == ""
+			fail "smudge" unless string(try toWorktree(repo, "a.txt", a.data)) == "one\r\ntwo\r\n"
+			// core.autocrlf=true: CRLF files are stored with LF, LF ones too.
+			let auto = try newWorktree("autocrlf")
+			auto.config.override("core.autocrlf", "true")
+			try writeFile(auto, "c.txt", "x\r\ny\r\n")
+			try auto.add(".")
+			let idx = try auto.index()
+			let e = idx.entry("c.txt")
+			fail "c.txt not staged" when e is none
+			let (_, data) = try auto.raw(e.id)
+			fail "autocrlf stored {data.len()} bytes" unless string(data) == "x\ny\n"
+			try statusText(auto)
+			auto.close()
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def catchesRacilyCleanFiles() !none {
+			let repo = try newWorktree("racy")
+			try writeFile(repo, "f.txt", "aaaa\n")
+			try repo.add(".")
+			try repo.commit("Initial")
+			// Same size, same second: only the racy check sees it.
+			try writeFile(repo, "f.txt", "bbbb\n")
+			let text = try statusText(repo)
+			fail "racy: {text}" unless text == " M f.txt\n"
+			repo.close()
+			return none
+		}
+
+		@test()
+		def removesAndAmends() !none {
+			let repo = try newWorktree("rm")
+			try writeFile(repo, "keep.txt", "k\n")
+			try writeFile(repo, "gone.txt", "g\n")
+			try repo.add(".")
+			let first = try repo.commit("First")
+			try repo.remove(["gone.txt"])
+			fail "gone.txt still on disk" when os.exists(os.join(repo.workDir, "gone.txt")) onerror recover true
+			let text = try statusText(repo)
+			fail "rm: {text}" unless text == "D  gone.txt\n"
+			let second = try repo.commit("Second\n\n# comment\nbody  \n\n\n")
+			let c = try repo.commitAt(second)
+			fail "message cleanup: {c.message}" unless c.message == "Second\n\nbody\n"
+			fail "parent" unless c.parents.len() == 1 && c.parents[0].equals(first)
+			try writeFile(repo, "keep.txt", "k2\n")
+			try repo.add("keep.txt")
+			let amended = try repo.commit("Second, amended", CommitOptions{amend: true})
+			let a = try repo.commitAt(amended)
+			fail "amend parent" unless a.parents.len() == 1 && a.parents[0].equals(first)
+			fail "amend author kept" unless a.author.str() == c.author.str()
+			let log = try repo.reflog("HEAD")
+			fail "reflog {log.len()}" unless log.len() == 3 && log[2].message == "commit (amend): Second, amended"
+			// Nothing to commit.
+			let refused = false
+			repo.commit("Again") onerror (err error) {
+				refused = true
+				recover zeroId()
+			}
+			fail "empty commit accepted" unless refused
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def guardsRemovals() !none {
+			// Each case: what is done to `f.txt` after the commit, and whether
+			// `rm` and `rm --cached` go through without force (as git decides).
+			let cases string[][] = [["modify", "no", "yes"], ["stage", "no", "yes"], ["stage-modify", "no", "no"], ["new", "no", "yes"]]
+			for let c in cases {
+				for let cached in [false, true] {
+					let repo = try newWorktree("rm-{c[0]}-{cached}")
+					try writeFile(repo, "f.txt", "one\n")
+					try writeFile(repo, "keep.txt", "keep\n")
+					try repo.add("f.txt", "keep.txt")
+					let _ = try repo.commit("First")
+					switch c[0] {
+						case "modify":
+							try writeFile(repo, "f.txt", "two\n")
+						case "stage":
+							try writeFile(repo, "f.txt", "two\n")
+							try repo.add("f.txt")
+						case "stage-modify":
+							try writeFile(repo, "f.txt", "two\n")
+							try repo.add("f.txt")
+							try writeFile(repo, "f.txt", "three\n")
+						case "new":
+							try writeFile(repo, "g.txt", "new\n")
+							try repo.add("g.txt")
+					}
+					let target = c[0] == "new" ?? ("g.txt", "f.txt")
+					let want = cached ?? (c[2] == "yes", c[1] == "yes")
+					if gitBinary != "" {
+						let home = try scratch("rm-home")
+						let args = cached ?? (string["rm", "-n", "-q", "--cached", target], string["rm", "-n", "-q", target])
+						let gitOk = (runGit(home, repo.workDir, args) onerror recover "refused") != "refused"
+						fail "{c[0]} cached={cached}: git says {gitOk}, the case table {want}" unless gitOk == want
+					}
+					let ok = true
+					repo.remove([target], cached) onerror (err error) {
+						ok = false
+						recover none
+					}
+					fail "{c[0]} cached={cached}: removal {ok ?? ("went through", "was refused")}" unless ok == want
+					// Forced, it always goes.
+					if !ok {
+						try repo.remove([target], cached, true)
+					}
+					fail "{c[0]} cached={cached}: still staged" unless (try repo.index()).entry(target) is none
+				}
+			}
+			return none
+		}
+
+		@test()
+		def switchesBranches() !none {
+			let repo = try newWorktree("checkout")
+			try writeFile(repo, "shared.txt", "shared\n")
+			try writeFile(repo, "changing.txt", "main\n")
+			try writeFile(repo, "dir/only-main.txt", "m\n")
+			try repo.add(".")
+			let base = try repo.commit("Base")
+			try repo.createBranch("feature")
+			try repo.checkout("feature")
+			fail "branch is {try repo.branch()}" unless (try repo.branch()) == "feature"
+			try writeFile(repo, "changing.txt", "feature\n")
+			try repo.remove(["dir/only-main.txt"])
+			try writeFile(repo, "new.txt", "new\n")
+			try repo.add(".")
+			try repo.commit("Feature work")
+			// A local edit to a file both branches share is carried over.
+			try writeFile(repo, "shared.txt", "edited\n")
+			try repo.checkout("main")
+			fail "edit lost" unless string(try os.readFile(os.join(repo.workDir, "shared.txt"))) == "edited\n"
+			fail "changing.txt not switched" unless string(try os.readFile(os.join(repo.workDir, "changing.txt"))) == "main\n"
+			fail "new.txt left behind" when os.exists(os.join(repo.workDir, "new.txt")) onerror recover true
+			fail "only-main.txt not restored" unless os.exists(os.join(repo.workDir, "dir", "only-main.txt")) onerror recover false
+			fail "status after switch: {try statusText(repo)}" unless (try statusText(repo)) == " M shared.txt\n"
+			// An edit to a file that differs between branches stops the switch.
+			try writeFile(repo, "changing.txt", "local\n")
+			let refused = false
+			repo.checkout("feature") onerror (err error) {
+				refused = err.message.contains("would be overwritten")
+				recover none
+			}
+			fail "dirty switch allowed" unless refused
+			fail "branch moved anyway" unless (try repo.branch()) == "main"
+			// Force throws local changes away.
+			try repo.checkout("feature", CheckoutOptions{force: true})
+			fail "forced status: {try statusText(repo)}" unless (try statusText(repo)) == ""
+			// Detached at a commit.
+			try repo.checkout(base.str())
+			fail "not detached" unless (try repo.branch()) == ""
+			let log = try repo.reflog("HEAD")
+			let last = log[log.len() - 1]
+			fail "reflog says {last.message}" unless last.message == "checkout: moving from feature to {base.str()}" && last.newId.equals(base)
+			try repo.checkout("main")
+			try repo.renameBranch("feature", "topic")
+			fail "rename" unless (try repo.branches()).join(",") == "main,topic"
+			let unmerged = false
+			repo.deleteBranch("topic") onerror (err error) {
+				unmerged = true
+				recover none
+			}
+			fail "unmerged branch deleted" unless unmerged
+			try repo.deleteBranch("topic", true)
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def resetsAndRestores() !none {
+			let repo = try newWorktree("reset")
+			try writeFile(repo, "a.txt", "1\n")
+			try repo.add(".")
+			let first = try repo.commit("First")
+			try writeFile(repo, "a.txt", "2\n")
+			try repo.add(".")
+			let second = try repo.commit("Second")
+			try repo.reset("HEAD~1", ResetMode.Soft)
+			fail "soft: {try statusText(repo)}" unless (try statusText(repo)) == "M  a.txt\n"
+			fail "ORIG_HEAD" unless (try repo.resolve("ORIG_HEAD")).equals(second)
+			try repo.reset("HEAD", ResetMode.Mixed)
+			fail "mixed: {try statusText(repo)}" unless (try statusText(repo)) == " M a.txt\n"
+			try repo.reset("HEAD", ResetMode.Hard)
+			fail "hard: {try statusText(repo)}" unless (try statusText(repo)) == ""
+			fail "hard content" unless string(try os.readFile(os.join(repo.workDir, "a.txt"))) == "1\n"
+			try writeFile(repo, "a.txt", "3\n")
+			try repo.add("a.txt")
+			try repo.restore(["a.txt"], "", true, false)
+			fail "restore --staged: {try statusText(repo)}" unless (try statusText(repo)) == " M a.txt\n"
+			try repo.restore(["a.txt"])
+			fail "restore: {try statusText(repo)}" unless (try statusText(repo)) == ""
+			try repo.restore(["a.txt"], second.str())
+			fail "restore --source" unless string(try os.readFile(os.join(repo.workDir, "a.txt"))) == "2\n"
+			let log = try repo.reflog("HEAD")
+			fail "reset reflog" unless log[log.len() - 1].message == "reset: moving to HEAD" && log[log.len() - 3].message == "reset: moving to HEAD~1"
+			fail "head moved" unless (try repo.resolve("HEAD")).equals(first)
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+	}
+}

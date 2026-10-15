@@ -1,0 +1,85 @@
+// Compares diffs with git's on a corpus that git made: each case folder
+// holds `old`, `new` and `<variant>.diff` (the hunks of `git diff
+// --no-index` with that variant's options). Without
+// ADM_TEST_GIT_DIFF_CORPUS the suite passes without running.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	@env("ADM_TEST_GIT_DIFF_CORPUS")
+	internal const diffCorpus string
+
+	// Code-like texts with git's diffs of them (testdata/diffs.sh).
+	@embed("testdata/diffs.tar.gz")
+	internal const diffsTar byte[]
+
+	internal const diffVariants = string["myers", "patience", "histogram", "minimal", "w", "b", "eol", "blank", "u1", "noindent"]
+
+	// The cases of a corpus folder whose hunks differ from git's, as
+	// `case/variant`; with `keep` our output is written beside git's as
+	// `<variant>.got`.
+	internal def corpusDifferences(dir string, keep bool) !string[] {
+		let failures string[] = []
+		for let c in try os.readDir(dir) {
+			continue unless c.info.isDir
+			let old = try os.readFile(os.join(c.path, "old"))
+			let new0 = try os.readFile(os.join(c.path, "new"))
+			for let v in diffVariants {
+				let want = string(try os.readFile(os.join(c.path, v + ".diff")))
+				let got = string(unifiedHunks(old, new0, corpusOptions(v)))
+				if got != want {
+					failures.push("{c.info.name}/{v}")
+					try os.writeFile(os.join(c.path, v + ".got"), got.bytes()) when keep
+				}
+			}
+		}
+		return failures
+	}
+
+	internal def corpusOptions(variant string) DiffOptions {
+		switch variant {
+			case "patience":
+				return DiffOptions{algorithm: DiffAlgorithm.Patience}
+			case "histogram":
+				return DiffOptions{algorithm: DiffAlgorithm.Histogram}
+			case "minimal":
+				return DiffOptions{algorithm: DiffAlgorithm.Minimal}
+			case "w":
+				return DiffOptions{whitespace: Whitespace.All}
+			case "b":
+				return DiffOptions{whitespace: Whitespace.Change}
+			case "eol":
+				return DiffOptions{whitespace: Whitespace.AtEol}
+			case "blank":
+				return DiffOptions{ignoreBlankLines: true}
+			case "u1":
+				return DiffOptions{context: 1}
+			case "noindent":
+				return DiffOptions{indentHeuristic: false}
+		}
+		return DiffOptions{}
+	}
+
+	check "Diff corpus" {
+		@test()
+		def matchesGitOnFixtures() !none {
+			let dir = try unpackFixture(diffsTar, "git-diffs")
+			let failures = try corpusDifferences(dir, false)
+			fail "differ from git: {failures.join(", ")}" when failures.len() > 0
+			return none
+		}
+
+		@test()
+		def matchesGitDiff() !none {
+			return none when diffCorpus == ""
+			let failures = try corpusDifferences(diffCorpus, true)
+			for let f in failures {
+				println("differs: {f}")
+			}
+			fail "{failures.len()} diffs differ from git's" when failures.len() > 0
+			return none
+		}
+	}
+}

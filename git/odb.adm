@@ -1,0 +1,249 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.bytes
+		std.crypto
+		std.data.compress.zlib
+	)
+
+	// The object database of a repository: loose objects under
+	// `objects/xx/`, packfiles under `objects/pack/`, and the databases
+	// `objects/info/alternates` names. Missing objects make it look for
+	// packs again, since another process may have repacked.
+	internal type ObjectDatabase {
+		dir        string
+		format     ObjectFormat
+		packs      Pack[]           = []
+		packPaths  map<string, bool> = {}
+		alternates ObjectDatabase[] = []
+		// zlib level for loose objects (core.looseCompression).
+		level      int              = 1
+		midx       ?MultiPackIndex  = none
+		// Fetches objects a partial clone left out from its promisor remote;
+		// none for a complete repository.
+		fetchMissing ?def (ObjectId[]) !none = none
+		internal fetching bool = false
+
+		def new(dir string, format ObjectFormat) {
+			self.dir = dir
+			self.format = format
+		}
+
+		// Unmaps the packs when the database is released.
+		def dispose() {
+			close()
+		}
+
+		// Loads the packs and the alternates. Fails when a pack is unreadable.
+		def open() !none {
+			try scanPacks()
+			try loadAlternates(0)
+			return none
+		}
+
+		def close() {
+			for let p in packs {
+				p.close()
+			}
+			for let a in alternates {
+				a.close()
+			}
+			let m = midx
+			m.close() unless m is none
+		}
+
+		def loadAlternates(depth int) !none {
+			let path = os.join(dir, "info", "alternates")
+			return none unless os.exists(path) onerror recover false
+			fail "git: alternates nest too deep at {dir}" when depth > 5
+			let text = string(try os.readFile(path))
+			for let line in text.split("\n") {
+				let entry = line.trim()
+				continue when entry == "" || entry.startsWith("#")
+				let other = os.isAbs(entry) ?? (entry, os.clean(os.join(dir, entry)))
+				let alt = new ObjectDatabase(other, format)
+				try alt.scanPacks()
+				try alt.loadAlternates(depth + 1)
+				alternates.push(alt)
+			}
+			return none
+		}
+
+		// Loads the packs that appeared since the last scan, and the
+		// multi-pack index when there is one. Fails when one cannot be read.
+		def scanPacks() !none {
+			let packDir = os.join(dir, "pack")
+			return none unless os.exists(packDir) onerror recover false
+			let found os.DirEntry[] = []
+			for let e in try os.readDir(packDir) {
+				let name = e.info.name
+				continue unless name.startsWith("pack-") && name.endsWith(".pack")
+				continue when packPaths.hasKey(e.path)
+				continue unless os.exists(e.path.slice(0, e.path.len() - 5) + ".idx") onerror recover false
+				found.push(e)
+			}
+			// Newest first, as git searches them.
+			found.sort((a, b) => b.info.modTime.compare(a.info.modTime))
+			let fresh Pack[] = []
+			for let e in found {
+				let p = new Pack(e.path, format)
+				try p.load()
+				packPaths[e.path] = true
+				fresh.push(p)
+			}
+			packs = fresh + packs
+			if midx is none {
+				midx = try loadMultiPackIndex(self)
+			}
+			return none
+		}
+
+		def loosePath(id ObjectId) string {
+			let hex = id.str()
+			return os.join(dir, hex.slice(0, 2), hex.slice(2))
+		}
+
+		// The pack holding the object and its offset there, none when no
+		// pack here does.
+		def findPacked(id ObjectId) ?(Pack, int) {
+			let m = midx
+			if !(m is none) {
+				let hit = m.find(id.bytes)
+				return hit unless hit is none
+			}
+			for let p in packs {
+				continue unless m is none || !m.covers(p)
+				let n = p.find(id.bytes)
+				return (p, p.offsetAt(n)) when n >= 0
+			}
+			return none
+		}
+
+		// Whether the object is here or in an alternate.
+		def has(id ObjectId) bool {
+			return true when hasLocal(id)
+			for let a in alternates {
+				return true when a.has(id)
+			}
+			scanPacks() onerror recover none
+			return !(findPacked(id) is none)
+		}
+
+		def hasLocal(id ObjectId) bool {
+			return true unless findPacked(id) is none
+			return os.exists(loosePath(id)) onerror recover false
+		}
+
+		// The object's kind and content. Fails when it is missing or corrupt.
+		def readRaw(id ObjectId) !(ObjectKind, byte[]) {
+			let found = try lookup(id)
+			return found unless found is none
+			fail "git: object {id.str()} is missing" unless try fetchFromPromisor([id])
+			let fetched = try lookup(id)
+			fail "git: object {id.str()} is missing" when fetched is none
+			return fetched
+		}
+
+		// Fetches missing objects from the promisor remote; false when the
+		// repository has none (or a fetch is already running). Fails when
+		// the fetch does.
+		def fetchFromPromisor(ids ObjectId[]) !bool {
+			let fetch = fetchMissing
+			return false when fetch is none || fetching || ids.len() == 0
+			fetching = true
+			let failure ?error = none
+			fetch(ids) onerror (err error) {
+				failure = err
+				recover none
+			}
+			fetching = false
+			fail failure unless failure is none
+			return true
+		}
+
+		// The object's kind and content, none when it is missing. Fails when
+		// it is corrupt.
+		def lookup(id ObjectId) !?(ObjectKind, byte[]) {
+			let packed = findPacked(id)
+			if !(packed is none) {
+				let (p, n) = packed
+				let o = try p.readAt(n, self)
+				return (o.kind, o.data)
+			}
+			let loose = try readLoose(id)
+			return loose unless loose is none
+			for let a in alternates {
+				let found = try a.lookup(id)
+				return found unless found is none
+			}
+			try scanPacks()
+			let again = findPacked(id)
+			return none when again is none
+			let (p, n) = again
+			let o = try p.readAt(n, self)
+			return (o.kind, o.data)
+		}
+
+		// The object's kind and size without its content when it is packed.
+		// Fails when it is missing or corrupt.
+		def info(id ObjectId) !(ObjectKind, int) {
+			let packed = findPacked(id)
+			if !(packed is none) {
+				let (p, n) = packed
+				return try p.infoAt(n, self)
+			}
+			let (kind, data) = try readRaw(id)
+			return (kind, data.len())
+		}
+
+		// A loose object, none when there is no such file. Fails when the file
+		// is not a valid object or its content does not hash to its name.
+		def readLoose(id ObjectId) !?(ObjectKind, byte[]) {
+			let path = loosePath(id)
+			let raw = os.readFile(path) onerror recover byte[]
+			return none when raw.len() == 0
+			let whole = try zlib.decompress(raw)
+			let nul = indexByte(whole, 0, 0, whole.len() < 64 ?? (whole.len(), 64))
+			fail "git: {path} is not a git object" when nul < 0
+			let sp = indexByte(whole, 0x20, 0, nul)
+			fail "git: {path} is not a git object" when sp < 0
+			let kind = try parseKind(string(whole[0:sp]))
+			let size = string(whole[sp + 1:nul]).toInt<int>()
+			fail "git: {path} has the wrong size" when size != whole.len() - nul - 1
+			return (kind, whole[nul + 1:])
+		}
+
+		// Stores an object as a loose object unless it is already here, and
+		// returns its id. Fails when the file cannot be written.
+		def write(kind ObjectKind, content byte[]) !ObjectId {
+			let id = hashObject(kind, content, format)
+			return id when hasLocal(id)
+			let header = objectHeader(kind, content.len())
+			let buffer = new bytes.Buffer()
+			let w = new zlib.Writer(buffer, zlib.Level(level))
+			try w.write(header)
+			try w.write(content)
+			try w.close()
+			let path = loosePath(id)
+			let folder = os.dir(path)
+			try os.mkdir(folder, true)
+			try writeAtomically(path, buffer.bytes(), 0o444)
+			return id
+		}
+	}
+
+	// Writes a file through a temporary beside it and a rename, so a reader
+	// never sees half of it; `mode` sets its permissions when not 0. Fails
+	// when either step fails.
+	internal def writeAtomically(path string, data byte[], mode int = 0) !none {
+		let token = crypto.rand(6) onerror recover byte[]
+		let temp = os.join(os.dir(path), "tmp_{token.hex().lower()}_{os.base(path)}")
+		try os.writeFile(temp, data)
+		try os.chmod(temp, int64(mode)) unless mode == 0
+		os.rename(temp, path) onerror (err error) {
+			os.remove(temp) onerror recover none
+			fail err
+		}
+		return none
+	}
+}

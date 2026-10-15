@@ -1,0 +1,320 @@
+// The object store, references, revisions, walks and the index, checked
+// against what git 2.56 answered for the fixture repositories
+// (testdata/fixtures.sh builds them and testdata/fixtures.tar holds them).
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+		std.testing
+		std.data.encoding::(JSON)
+		std.formats.archive
+	)
+
+	@embed("testdata/fixtures.tar.gz")
+	internal const fixturesTar byte[]
+
+	internal let fixtureRoot = ""
+
+	// The folder the fixtures are unpacked into, once per run.
+	internal def fixtures() !string {
+		return fixtureRoot unless fixtureRoot == ""
+		fixtureRoot = try unpackFixture(fixturesTar, "git-fixtures")
+		return fixtureRoot
+	}
+
+	// Unpacks an embedded .tar.gz into a new folder of the run's scratch
+	// space and returns the folder.
+	internal def unpackFixture(data byte[], name string) !string {
+		let home = try os.appHome()
+		let dir = os.join(home, "{name}-{time.now().unixNs()}")
+		try os.mkdir(dir, true)
+		let tar = try archive.load(data)
+		try archive.extractAll(tar, dir, archive.ExtractOptions{})
+		return dir
+	}
+
+	internal struct ExpectedObject {
+		id   string
+		kind string
+		size int
+	}
+
+	internal struct ExpectedRef {
+		name   string
+		id     string
+		peeled string
+	}
+
+	internal struct ExpectedIndexEntry {
+		path  string
+		mode  int
+		id    string
+		stage int
+	}
+
+	internal struct ExpectedList {
+		key    string
+		values string[]
+	}
+
+	// What git answered about a fixture.
+	internal struct Expected {
+		format   string
+		resolved map<string, string>
+		objects  ExpectedObject[]
+		refs     ExpectedRef[]
+		logs     ExpectedList[]
+		bases    ExpectedList[]
+		reflogs  ExpectedList[]
+		patches  ExpectedList[]
+		blames   ExpectedList[]
+		index    ExpectedIndexEntry[]
+	}
+
+	internal def fixture(name string) !(Repository, Expected) {
+		let root = try fixtures()
+		let repo = try open(os.join(root, name + ".git"))
+		let e = Expected{}
+		let codec = new JSON()
+		try codec.decode(try os.readFile(os.join(root, "expected", name + ".json")), e)
+		return (repo, e)
+	}
+
+	internal const fixtureNames = string["basic", "twopacks", "sha256", "reftable", "index4", "split"]
+
+	// The walk `git rev-list <args>` makes.
+	internal def walkFor(repo Repository, spec string) !string[] {
+		let walk = new RevWalk(repo)
+		let words = spec.split(" ")
+		let paths string[] = []
+		let afterDashes = false
+		for let w in words {
+			if afterDashes {
+				paths.push(w)
+				continue
+			}
+			switch w {
+				case "--":
+					afterDashes = true
+				case "--topo-order":
+					walk.order = WalkOrder.Topological
+				case "--date-order":
+					walk.order = WalkOrder.DateTopological
+				case "--reverse":
+					walk.reverse = true
+				case "--first-parent":
+					walk.firstParent = true
+				case "--no-merges":
+					walk.noMerges = true
+				case "--merges":
+					walk.onlyMerges = true
+				case "--all":
+					let head = try repo.headId()
+					try walk.push(head) unless head is none
+					for let r in try repo.refs("refs/") {
+						let id = r.id
+						try walk.push(id) unless id is none
+					}
+				default:
+					try walk.pushRange(w)
+			}
+		}
+		walk.paths = paths
+		let out string[] = []
+		for {
+			let id = try walk.nextId()
+			break when id is none
+			out.push(id.str())
+		}
+		return out
+	}
+
+	check "Object store" {
+		@test()
+		def readsEveryObject() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				fail "{name}: format {formatName(repo.format)}" unless formatName(repo.format) == want.format
+				for let o in want.objects {
+					let id = try parseId(o.id)
+					let (kind, size) = try repo.info(id)
+					fail "{name}: {o.id} is {kindName(kind)} {size}, git says {o.kind} {o.size}" unless kindName(kind) == o.kind && size == o.size
+					let (k2, data) = try repo.raw(id)
+					fail "{name}: {o.id} reads {data.len()} bytes" unless data.len() == o.size
+					let again = hashObject(k2, data, repo.format)
+					fail "{name}: {o.id} hashes to {again.str()}" unless again.equals(id)
+					// Every object parses as its kind.
+					try repo.object(id)
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def resolvesRevisions() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let (rev, id) in want.resolved {
+					let got = repo.resolve(rev) onerror (err error) {
+						fail "{name}: {rev}: {err.message}"
+					}
+					fail "{name}: {rev} is {got.str()}, git says {id}" unless got.str() == id
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def listsReferences() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				let got = try repo.refs("refs/")
+				fail "{name}: {got.len()} references, git lists {want.refs.len()}" unless got.len() == want.refs.len()
+				for let (i, r) in want.refs {
+					let g = got[i]
+					fail "{name}: reference {i} is {g.name}, git says {r.name}" unless g.name == r.name
+					let id = try repo.refTarget(g.name)
+					fail "{name}: {r.name} names nothing" when id is none
+					fail "{name}: {r.name} is {id.str()}, git says {r.id}" unless id.str() == r.id
+					if r.peeled != "" {
+						let peeled = try repo.resolve(r.name + "^\{\}")
+						fail "{name}: {r.name} peels to {peeled.str()}, git says {r.peeled}" unless peeled.str() == r.peeled
+					}
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def readsReflogs() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let item in want.reflogs {
+					let ref = item.key
+					let lines = item.values
+					let log = try repo.reflog(ref)
+					fail "{name}: {ref} has {log.len()} reflog entries, git shows {lines.len()}" unless log.len() == lines.len()
+					for let (i, line) in lines {
+						let e = log[log.len() - 1 - i]
+						let text = "{e.newId.str()} {e.message}"
+						fail "{name}: {ref}@\{{i}\} is '{text}', git says '{line}'" unless text == line
+					}
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def walksHistory() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let item in want.logs {
+					let spec = item.key
+					let ids = item.values
+					let got = try walkFor(repo, spec)
+					fail "{name}: rev-list {spec} gives {got.join(" ")}, git gives {ids.join(" ")}" unless got.join(" ") == ids.join(" ")
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def findsMergeBases() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let item in want.bases {
+					let pair = item.key
+					let ids = item.values
+					let sides = pair.split(" ")
+					let bases = try mergeBases(repo, try repo.resolve(sides[0]), try repo.resolve(sides[1]))
+					let got = bases.mapElem(b => b.str())
+					got.sort((a, b) => compareBytes(a, b))
+					let wantSorted = ids.clone()
+					wantSorted.sort((a, b) => compareBytes(a, b))
+					fail "{name}: merge-base {pair} is {got.join(" ")}, git says {wantSorted.join(" ")}" unless got.join(" ") == wantSorted.join(" ")
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def writesPatches() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let item in want.patches {
+					let words = item.key.split(" ")
+					let options = PatchOptions{}
+					for let w in words.slice(2, words.len() - 2) {
+						switch w {
+							case "--binary":
+								options.binary = true
+							case "-U1":
+								options.diff = DiffOptions{...options.diff, context: 1}
+							case "--histogram":
+								options.diff = DiffOptions{...options.diff, algorithm: DiffAlgorithm.Histogram}
+						}
+					}
+					let d = try repo.diff(words[0], words[1], options)
+					let got = try d.patch()
+					let expected = item.values[0]
+					if got != expected {
+						let dir = keepDir == "" ?? (try fixtures(), keepDir)
+						let path = os.join(dir, "{name}-{words[0]}-{words[1]}.got")
+						try os.writeFile(path, got.bytes())
+						try os.writeFile(path + ".want", expected.bytes())
+						fail "{name}: git diff {item.key} differs; ours is in {path}"
+					}
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def blamesLines() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				for let item in want.blames {
+					let sp = item.key.indexOf(" ")
+					let rev = item.key.slice(0, sp)
+					let path = item.key.slice(sp + 1)
+					let lines = try repo.blame(path, rev)
+					let got = lines.mapElem(l => "{l.commit.str()} {l.originLine} {l.line} {l.path}")
+					for let (i, w) in item.values {
+						fail "{name}: blame {item.key} line {i + 1} is '{i < got.len() ?? (got[i], "")}', git says '{w}'" unless i < got.len() && got[i] == w
+					}
+					fail "{name}: blame {item.key} has {got.len()} lines, git {item.values.len()}" unless got.len() == item.values.len()
+				}
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def readsTheIndex() !none {
+			for let name in fixtureNames {
+				let (repo, want) = try fixture(name)
+				let idx = try repo.index()
+				fail "{name}: {idx.entries.len()} index entries, git lists {want.index.len()}" unless idx.entries.len() == want.index.len()
+				for let (i, w) in want.index {
+					let e = idx.entries[i]
+					fail "{name}: index entry {i} is {e.path} {"%o".format(e.mode)} {e.id.str()} {e.stage}" unless e.path == w.path && e.mode == w.mode && e.id.str() == w.id && e.stage == w.stage
+				}
+				// Written back and read again, it holds the same.
+				let copy = os.join(try fixtures(), "{name}-index-copy")
+				idx.path = copy
+				try idx.write()
+				let again = try readIndexFile(copy, repo.format, repo.gitDir)
+				fail "{name}: index changed when written" unless again.entries.len() == idx.entries.len()
+				repo.close()
+			}
+			return none
+		}
+	}
+}

@@ -1,0 +1,156 @@
+partial module adm.dev.git {
+	use std.os
+
+	// One pattern of an ignore file.
+	internal struct IgnoreRule {
+		pattern  string
+		// `!`: a match is not ignored after all.
+		negate   bool
+		// A trailing `/`: matches folders only.
+		dirOnly  bool
+		// No `/` but a trailing one: matched against the last component at
+		// any depth; else against the path from the file's folder.
+		basename bool
+		// The folder the rules' file is in, relative to the top, with a
+		// trailing `/` ("" at the top).
+		base     string
+	}
+
+	// The rules of one ignore file: blank lines and `#` comments skipped,
+	// trailing spaces dropped unless escaped, `!` negation, `/` anchoring
+	// and a trailing `/` for folders only.
+	internal def parseIgnore(text string, base string) IgnoreRule[] {
+		let out IgnoreRule[] = []
+		for let raw in text.split("\n") {
+			let line = raw.endsWith("\r") ?? (raw.slice(0, raw.len() - 1), raw)
+			continue when line == "" || line.startsWith("#")
+			// Trailing spaces go unless the last one is escaped.
+			let b = line.bytes()
+			let end = b.len()
+			for end > 0 && b[end - 1] == 0x20 {
+				break when end >= 2 && b[end - 2] == 0x5C
+				end--
+			}
+			let p = string(b[0:end])
+			continue when p == ""
+			let negate = false
+			if p.startsWith("!") {
+				negate = true
+				p = p.slice(1)
+			} else if p.startsWith("\\!") || p.startsWith("\\#") {
+				p = p.slice(1)
+			}
+			let dirOnly = false
+			if p.endsWith("/") {
+				dirOnly = true
+				p = p.slice(0, p.len() - 1)
+			}
+			continue when p == ""
+			let basename = !p.contains("/")
+			p = p.slice(1) when p.startsWith("/")
+			out.push(IgnoreRule{pattern: p, negate: negate, dirOnly: dirOnly, basename: basename, base: base})
+		}
+		return out
+	}
+
+	// Whether a rule matches a path (relative to the top) that is or is not
+	// a folder.
+	internal def ruleMatches(rule IgnoreRule, path string, isDir bool, caseFold bool) bool {
+		return false when rule.dirOnly && !isDir
+		return false unless rule.base == "" || path.startsWith(rule.base)
+		let rel = path.slice(rule.base.len())
+		if rule.basename {
+			return wildmatch(rule.pattern, pathBase(rel), true, caseFold)
+		}
+		return wildmatch(rule.pattern, rel, true, caseFold)
+	}
+
+	// IgnoreRules decides what git leaves untracked: the patterns of
+	// `.gitignore` files along a path (the nearest one first), then
+	// `info/exclude`, then core.excludesFile (default
+	// `~/.config/git/ignore`), the last matching pattern of a file deciding.
+	// A path under an ignored folder is ignored whatever its own rules say.
+	type IgnoreRules {
+		workDir  string
+		caseFold bool
+		// Rules of the files outside the tree, widest first.
+		internal global   IgnoreRule[]       = []
+		internal perDir   map<string, IgnoreRule[]> = {}
+		// Rules given by the program, which come before every file's.
+		internal extra    IgnoreRule[]       = []
+
+		def new(workDir string) {
+			self.workDir = workDir
+		}
+
+		// Adds patterns that take precedence over every ignore file (as
+		// `git status --ignored -x`).
+		def add(patterns string[]) {
+			extra.push(...parseIgnore(patterns.join("\n"), ""))
+		}
+
+		internal def rulesIn(dir string) IgnoreRule[] {
+			let known = perDir.get(dir)
+			return known unless known is none
+			let file = os.join(workDir, dir, ".gitignore")
+			let text = string(os.readFile(file) onerror recover byte[])
+			let rules = parseIgnore(text, dir == "" ?? ("", dir + "/"))
+			perDir[dir] = rules
+			return rules
+		}
+
+		// The decision of the rules for a path alone, without its folders:
+		// 1 ignored, -1 explicitly not ignored, 0 no rule matches.
+		internal def decide(path string, isDir bool) int {
+			for let i = extra.len() - 1; i >= 0; i-- {
+				let r = extra[i]
+				return r.negate ?? (-1, 1) when ruleMatches(r, path, isDir, caseFold)
+			}
+			// .gitignore files from the path's own folder up to the top.
+			let dir = os.dir(path)
+			dir = "" when dir == "." || dir == "/" || !path.contains("/")
+			for {
+				let rules = rulesIn(dir)
+				for let i = rules.len() - 1; i >= 0; i-- {
+					let r = rules[i]
+					return r.negate ?? (-1, 1) when ruleMatches(r, path, isDir, caseFold)
+				}
+				break when dir == ""
+				let up = os.dir(dir)
+				dir = up == "." || !dir.contains("/") ?? ("", up)
+			}
+			for let i = global.len() - 1; i >= 0; i-- {
+				let r = global[i]
+				return r.negate ?? (-1, 1) when ruleMatches(r, path, isDir, caseFold)
+			}
+			return 0
+		}
+
+		// Whether git ignores the path (relative to the top of the working
+		// tree): its own rules, or an ignored folder above it.
+		def ignored(path string, isDir bool = false) bool {
+			let parts = path.split("/")
+			let prefix = ""
+			for let i = 0; i < parts.len() - 1; i++ {
+				prefix = prefix == "" ?? (parts[i], prefix + "/" + parts[i])
+				return true when decide(prefix, true) == 1
+			}
+			return decide(path, isDir) == 1
+		}
+	}
+
+	// The ignore rules of a repository's working tree: its .gitignore
+	// files, `info/exclude` and core.excludesFile.
+	internal def ignoreRulesOf(repo Repository) IgnoreRules {
+		let rules = new IgnoreRules(repo.workDir)
+		rules.caseFold = repo.config.getBool("core.ignorecase", false) onerror recover false
+		let home = os.homeDir() onerror recover ""
+		let xdgDefault = home == "" ?? ("", os.join(home, ".config", "git", "ignore"))
+		let excludes = repo.config.getPath("core.excludesfile", xdgDefault)
+		if excludes != "" {
+			rules.global.push(...parseIgnore(string(os.readFile(excludes) onerror recover byte[]), ""))
+		}
+		rules.global.push(...parseIgnore(string(os.readFile(os.join(repo.commonDir, "info", "exclude")) onerror recover byte[]), ""))
+		return rules
+	}
+}

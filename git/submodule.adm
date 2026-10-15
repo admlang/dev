@@ -1,0 +1,192 @@
+partial module adm.dev.git {
+	use (
+		std.os
+	)
+
+	// A submodule: a repository the superproject records at a path, by
+	// commit.
+	struct Submodule {
+		// Its name in `.gitmodules` (usually the path).
+		name        string
+		path        string
+		// Where it is cloned from: the configuration's
+		// `submodule.<name>.url` when initialized, else `.gitmodules`'s,
+		// relative URLs resolved against the superproject's remote.
+		url         string    = ""
+		// The branch `.gitmodules` names; empty when none.
+		branch      string    = ""
+		// The commit the superproject's index records; none when the index
+		// has no entry for it.
+		commit      ?ObjectId = none
+		// Its URL is in the superproject's configuration (`git submodule
+		// init`).
+		initialized bool      = false
+		// Its repository exists.
+		cloned      bool      = false
+	}
+
+	// How to update submodules.
+	struct SubmoduleOptions {
+		// Initialize those not initialized yet (`--init`).
+		init      bool          = false
+		// Update submodules of submodules too (`--recursive`).
+		recursive bool          = false
+		// Only these paths; empty: all.
+		paths     string[]      = []
+		// Commits to fetch from each (`--depth`); 0: all.
+		depth     int           = 0
+		remote    RemoteOptions = RemoteOptions{}
+	}
+
+	// The `.gitmodules` text: the working tree's file, else HEAD's.
+	internal def gitmodulesText(repo Repository) !string {
+		if !repo.isBare() {
+			let full = os.join(repo.workDir, ".gitmodules")
+			return string(try os.readFile(full)) when try os.exists(full)
+		}
+		let head = try repo.headId()
+		return "" when head is none
+		let tree = try repo.tree((try repo.commitAt(head)).tree)
+		let entry = tree.entry(".gitmodules")
+		return "" when entry is none
+		let (_, data) = try repo.raw(entry.id)
+		return string(data)
+	}
+
+	// The superproject's submodules, from `.gitmodules`, the configuration
+	// and the index. Fails when `.gitmodules` cannot be read.
+	internal def listSubmodules(repo Repository) !Submodule[] {
+		let entries = try parseConfigText(try gitmodulesText(repo), ".gitmodules")
+		let byName map<string, Submodule> = {}
+		let order string[] = []
+		for let e in entries {
+			continue unless e.section == "submodule" && e.subsection != ""
+			let name = e.subsection
+			if !byName.hasKey(name) {
+				byName[name] = Submodule{name: name, path: name}
+				order.push(name)
+			}
+			let s = byName[name]
+			let v = e.value
+			let value = v is none ?? ("", v)
+			switch e.key {
+				case "path":
+					s.path = value
+				case "url":
+					s.url = value
+				case "branch":
+					s.branch = value
+			}
+		}
+		let gitlinks map<string, ObjectId> = {}
+		if !repo.isBare() {
+			let idx = try repo.index()
+			for let e in idx.entries {
+				gitlinks[e.path] = e.id when e.stage == 0 && (e.mode & 0o170000) == 0o160000
+			}
+		}
+		let out Submodule[] = []
+		for let name in order {
+			let s = byName[name]
+			fail "git: submodule {name} has a bad path {s.path}" when s.path == "" || s.path.startsWith("/") || s.path.split("/").includes("..")
+			let configured = repo.config.get("submodule.{name}.url")
+			if configured is none {
+				s.url = try resolveSubmoduleUrl(repo, s.url) when s.url.startsWith("./") || s.url.startsWith("../")
+			} else {
+				s.initialized = true
+				s.url = configured
+			}
+			let link = gitlinks.get(s.path)
+			s.commit = link unless link is none
+			s.cloned = try os.exists(submoduleGitDir(repo, name))
+			out.push(s)
+		}
+		return out
+	}
+
+	// Where a submodule's repository lives: `.git/modules/<name>`.
+	internal def submoduleGitDir(repo Repository, name string) string {
+		return os.join(repo.commonDir, "modules", name)
+	}
+
+	// A relative submodule URL (`../lib.git`) resolved against the
+	// superproject's default remote, or its own folder when it has none.
+	internal def resolveSubmoduleUrl(repo Repository, relative string) !string {
+		let branch = repo.branch() onerror recover ""
+		let remoteName = branch == "" ?? ("origin", repo.config.get("branch.{branch}.remote", "origin"))
+		let base = repo.config.get("remote.{remoteName}.url", "")
+		base = repo.isBare() ?? (repo.gitDir, repo.workDir) when base == ""
+		let rel = relative
+		let b = base
+		for b.endsWith("/") {
+			b = b.slice(0, b.len() - 1)
+		}
+		for {
+			if rel.startsWith("./") {
+				rel = rel.slice(2)
+			} else if rel.startsWith("../") {
+				rel = rel.slice(3)
+				let cut = b.lastIndexOf("/")
+				let colon = b.lastIndexOf(":")
+				if cut > colon && cut >= 0 {
+					b = b.slice(0, cut)
+				} else if colon >= 0 {
+					// scp-like `host:repo`: what is left is the host.
+					b = b.slice(0, colon + 1)
+					return b + rel
+				} else {
+					b = "."
+				}
+			} else {
+				break
+			}
+		}
+		return b.endsWith(":") ?? (b + rel, b + "/" + rel)
+	}
+
+	// Initializes, clones or fetches, and checks out each submodule at the
+	// commit the superproject records (detached), as `git submodule update`
+	// does. Fails on the first submodule that cannot be updated.
+	internal def doUpdateSubmodules(repo Repository, options SubmoduleOptions) !none {
+		fail "git: a bare repository has no submodules to check out" when repo.isBare()
+		for let s in try listSubmodules(repo) {
+			continue unless options.paths.len() == 0 || options.paths.includes(s.path)
+			if !s.initialized {
+				continue unless options.init
+				fail "git: submodule {s.name} has no URL" when s.url == ""
+				try repo.config.set("submodule.{s.name}.url", s.url)
+				s.initialized = true
+			}
+			let commit = s.commit
+			continue when commit is none
+			let sub = try ensureSubmoduleRepo(repo, s, options)
+			if !sub.has(commit) {
+				let _ = try fetchRemote(sub, "origin", FetchOptions{remote: options.remote, depth: options.depth})
+			}
+			if !sub.has(commit) {
+				// A commit no branch reaches: ask for it by id.
+				let _ = try fetchRemote(sub, "origin", FetchOptions{remote: options.remote, depth: options.depth, refspecs: [commit.str()]})
+			}
+			fail "git: submodule {s.path}: the remote does not have {commit.str()}" unless sub.has(commit)
+			try checkoutRevision(sub, commit.str(), CheckoutOptions{detach: true})
+			if options.recursive {
+				try doUpdateSubmodules(sub, SubmoduleOptions{init: true, recursive: true, depth: options.depth, remote: options.remote})
+			}
+			sub.close()
+		}
+		return none
+	}
+
+	// The submodule's repository, cloned into `.git/modules/<name>` with its
+	// working tree at its path when it is not there yet.
+	internal def ensureSubmoduleRepo(repo Repository, s Submodule, options SubmoduleOptions) !Repository {
+		let gitDir = submoduleGitDir(repo, s.name)
+		let workDir = os.join(repo.workDir, s.path)
+		if try os.exists(gitDir) {
+			return try openGitDir(gitDir, workDir)
+		}
+		try os.mkdir(workDir, true)
+		let sub = try cloneWithOptions(s.url, workDir, CloneOptions{remote: options.remote, depth: options.depth, checkout: false, separateGitDir: gitDir})
+		return sub
+	}
+}

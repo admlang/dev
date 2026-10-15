@@ -1,0 +1,69 @@
+// Ignore rules and attributes checked against what `git check-ignore
+// --no-index` and `git check-attr -a` answered for generated working trees
+// (testdata/rules.sh).
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+		std.data.encoding::(JSON)
+	)
+
+	@embed("testdata/rules.tar.gz")
+	internal const rulesTar byte[]
+
+	internal struct ExpectedRules {
+		paths      string[]
+		ignored    string[]
+		attributes ExpectedList[]
+	}
+
+	check "Ignore and attributes" {
+		@test()
+		def matchesGitRules() !none {
+			let root = try unpackFixture(rulesTar, "git-rules")
+			let failures string[] = []
+			for let c in try os.readDir(root) {
+				continue unless c.info.isDir
+				let want = ExpectedRules{}
+				let codec = new JSON()
+				try codec.decode(try os.readFile(os.join(c.path, "expected.json")), want)
+				let repo = try open(c.path)
+				// The fixtures were made without global files: so are the checks.
+				repo.config.override("core.excludesfile", "")
+				repo.config.override("core.attributesfile", "")
+				let ignore = ignoreRulesOf(repo)
+				for let p in want.paths {
+					let isDir = p.endsWith("/")
+					let path = isDir ?? (p.slice(0, p.len() - 1), p)
+					let got = ignore.ignored(path, isDir)
+					let expected = want.ignored.includes(path)
+					failures.push("{c.info.name}: ignored({p}) = {got}, git says {expected}") unless got == expected
+				}
+				let attrs = attributeRules(repo)
+				let byPath map<string, string[]> = {}
+				for let a in want.attributes {
+					byPath[a.key] = a.values
+				}
+				for let p in want.paths {
+					continue when p.endsWith("/")
+					let got string[] = []
+					for let (name, v) in attrs.all(p) {
+						let text = v.state == "value" ?? (v.value, v.state)
+						got.push("{name}={text}")
+					}
+					got.sort((x, y) => compareBytes(x, y))
+					let found = byPath.get(p)
+					let expected string[] = found is none ?? (string[], found)
+					expected.sort((x, y) => compareBytes(x, y))
+					failures.push("{c.info.name}: attributes of {p} are [{got.join(" ")}], git says [{expected.join(" ")}]") unless got.join(" ") == expected.join(" ")
+				}
+				repo.close()
+			}
+			for let f in failures {
+				println(f)
+			}
+			fail "{failures.len()} answers differ from git's" when failures.len() > 0
+			return none
+		}
+	}
+}

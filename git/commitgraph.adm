@@ -1,0 +1,304 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.services.storage::(MapAccess)
+	)
+
+	// A parent slot of the commit-graph that holds no parent.
+	internal const graphNoParent = 0x70000000
+
+	// One commit-graph file: one layer of a chain, or the whole graph.
+	internal type GraphLayer {
+		path        string
+		data        byte[]
+		hashLen     int
+		count       int
+		// Commits in the layers below this one.
+		base        int     = 0
+		fanoutAt    int     = 0
+		idsAt       int     = 0
+		dataAt      int     = 0
+		edgesAt     int     = -1
+		genAt       int     = -1
+		genOverAt   int     = -1
+		bloomIdxAt  int     = -1
+		bloomAt     int     = -1
+		bloomHashes int     = 0
+		bloomBits   int     = 0
+		bloomVersion int    = 0
+		mapping     ?os.Mapping = none
+
+		def new(path string, hashLen int) {
+			self.path = path
+			self.hashLen = hashLen
+		}
+
+		def close() {
+			let m = mapping
+			m.close() unless m is none
+			mapping = none
+		}
+
+		// Maps the file and reads its chunk table. Fails when it is not a
+		// commit-graph of the format.
+		def load() !none {
+			let m = try os.mapFile(path, MapAccess.Copy)
+			mapping = m
+			data = try m.pages(0, m.length())
+			fail "git: {path} is not a commit-graph" when data.len() < 8 || string(data[0:4]) != "CGPH"
+			fail "git: {path} has unsupported version {data[4]}" unless data[4] == 1
+			fail "git: {path} has the wrong object format" when (data[5] == 1 ?? (20, 32)) != hashLen
+			let chunks = int(data[6])
+			for let i = 0; i < chunks; i++ {
+				let at = 8 + i * 12
+				let id = string(data[at:at + 4])
+				let offset = int(be64(data, at + 4))
+				switch id {
+					case "OIDF":
+						fanoutAt = offset
+					case "OIDL":
+						idsAt = offset
+					case "CDAT":
+						dataAt = offset
+					case "EDGE":
+						edgesAt = offset
+					case "GDA2":
+						genAt = offset
+					case "GDO2":
+						genOverAt = offset
+					case "BIDX":
+						bloomIdxAt = offset
+					case "BDAT":
+						bloomAt = offset
+				}
+			}
+			fail "git: {path} lacks a required chunk" when fanoutAt == 0 || idsAt == 0 || dataAt == 0
+			count = be32(data, fanoutAt + 255 * 4)
+			if bloomAt > 0 && bloomIdxAt > 0 {
+				bloomVersion = be32(data, bloomAt)
+				bloomHashes = be32(data, bloomAt + 4)
+				bloomBits = be32(data, bloomAt + 8)
+				// Only version 2 hashes paths as git does today.
+				bloomAt = -1 unless bloomVersion == 2
+			}
+			return none
+		}
+
+		// The position of the id in this layer, or -1.
+		def position(id byte[]) int {
+			let first = int(id[0])
+			let lo = first == 0 ?? (0, be32(data, fanoutAt + (first - 1) * 4))
+			let hi = be32(data, fanoutAt + first * 4)
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let c = compareIdBytes(data, idsAt + mid * hashLen, id, 0, hashLen)
+				return mid when c == 0
+				if c < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return -1
+		}
+	}
+
+	// CommitGraph is `objects/info/commit-graph`, or the chain under
+	// `objects/info/commit-graphs/`: the tree, parents, commit time and
+	// generation of every commit it lists, without reading the commits.
+	internal type CommitGraph {
+		// Base first.
+		layers GraphLayer[]
+
+		def new(layers GraphLayer[]) {
+			self.layers = layers
+		}
+
+		def close() {
+			for let l in layers {
+				l.close()
+			}
+		}
+	}
+
+	// What a commit-graph records about one commit.
+	internal struct GraphCommit {
+		tree       ObjectId
+		parents    ObjectId[]
+		// Seconds since the epoch.
+		time       int64
+		// The corrected commit date when the graph has one, else the
+		// topological level.
+		generation int64
+		// The commit's graph position, for its Bloom filter.
+		layer      int
+		position   int
+	}
+
+	// The commit-graph of an object database, none when it has none or it
+	// does not fit the repository. Fails when a file is malformed.
+	internal def loadCommitGraph(objectsDir string, format ObjectFormat) !?CommitGraph {
+		let hashLen = idLength(format)
+		let info = os.join(objectsDir, "info")
+		let chain = os.join(info, "commit-graphs", "commit-graph-chain")
+		let layers GraphLayer[] = []
+		if os.exists(chain) onerror recover false {
+			let base = 0
+			for let line in string(try os.readFile(chain)).split("\n") {
+				let h = line.trim()
+				continue when h == ""
+				let l = new GraphLayer(os.join(info, "commit-graphs", "graph-{h}.graph"), hashLen)
+				try l.load()
+				l.base = base
+				base += l.count
+				layers.push(l)
+			}
+		} else {
+			let single = os.join(info, "commit-graph")
+			return none unless os.exists(single) onerror recover false
+			let l = new GraphLayer(single, hashLen)
+			try l.load()
+			layers.push(l)
+		}
+		return none when layers.len() == 0
+		return new CommitGraph(layers)
+	}
+
+	// The commit at a global graph position: its layer and position there.
+	internal def graphLayerOf(g CommitGraph, global int) (GraphLayer, int) {
+		let ls = g.layers
+		for let i = ls.len() - 1; i >= 0; i-- {
+			return (ls[i], global - ls[i].base) when global >= ls[i].base
+		}
+		return (ls[0], global)
+	}
+
+	// The id at a global graph position.
+	internal def graphIdAt(g CommitGraph, global int) ObjectId {
+		let (l, n) = graphLayerOf(g, global)
+		let at = l.idsAt + n * l.hashLen
+		return new ObjectId(l.data[at:at + l.hashLen].clone())
+	}
+
+	// What the graph records for the commit, none when it does not list it.
+	internal def graphLookup(g CommitGraph, id ObjectId) ?GraphCommit {
+		let ls = g.layers
+		for let i = ls.len() - 1; i >= 0; i-- {
+			let l = ls[i]
+			let n = l.position(id.bytes)
+			continue when n < 0
+			return graphCommitAt(g, i, n)
+		}
+		return none
+	}
+
+	internal def graphCommitAt(g CommitGraph, layerIndex int, n int) GraphCommit {
+		let l = g.layers[layerIndex]
+		let at = l.dataAt + n * (l.hashLen + 16)
+		let tree = new ObjectId(l.data[at:at + l.hashLen].clone())
+		let p1 = be32(l.data, at + l.hashLen)
+		let p2 = be32(l.data, at + l.hashLen + 4)
+		let parents ObjectId[] = []
+		parents.push(graphIdAt(g, p1)) unless p1 == graphNoParent
+		if p2 != graphNoParent {
+			if (p2 & 0x80000000) == 0 {
+				parents.push(graphIdAt(g, p2))
+			} else {
+				// An octopus: the rest of the parents in the edge list.
+				let k = p2 & 0x7FFFFFFF
+				for {
+					let e = be32(l.data, l.edgesAt + k * 4)
+					parents.push(graphIdAt(g, e & 0x7FFFFFFF))
+					break when (e & 0x80000000) != 0
+					k++
+				}
+			}
+		}
+		let word1 = be32(l.data, at + l.hashLen + 8)
+		let word2 = be32(l.data, at + l.hashLen + 12)
+		let seconds = (int64(word1 & 3) << 32) | int64(word2)
+		let generation = int64(word1 >> 2)
+		// The corrected commit date: the top layer's GDA2 chunk holds offsets
+		// from the commit time.
+		if l.genAt > 0 {
+			let off = be32(l.data, l.genAt + n * 4)
+			if (off & 0x80000000) == 0 {
+				generation = seconds + int64(off)
+			} else if l.genOverAt > 0 {
+				generation = seconds + be64(l.data, l.genOverAt + (off & 0x7FFFFFFF) * 8)
+			}
+		}
+		return GraphCommit{tree: tree, parents: parents, time: seconds, generation: generation, layer: layerIndex, position: n}
+	}
+
+	// Whether the commit's Bloom filter says the path may have changed
+	// against its first parent: false means it surely did not; true when the
+	// graph has no filter for it.
+	internal def graphMayChange(g CommitGraph, c GraphCommit, path string) bool {
+		let l = g.layers[c.layer]
+		return true when l.bloomAt <= 0 || l.bloomIdxAt <= 0
+		let end = be32(l.data, l.bloomIdxAt + c.position * 4)
+		let start = c.position == 0 ?? (0, be32(l.data, l.bloomIdxAt + (c.position - 1) * 4))
+		let size = end - start
+		return true when size <= 0
+		let filter = l.bloomAt + 12 + start
+		let bits = size * 8
+		// A one-byte filter of all ones: more than 512 changes.
+		return true when size == 1 && l.data[filter] == 0xFF
+		// The path and each folder above it are in the filter of a change.
+		let p = path.endsWith("/") ?? (path.slice(0, path.len() - 1), path)
+		let raw = p.bytes()
+		let h0 = murmur32(raw, uint32(0x293ae76f))
+		let h1 = murmur32(raw, uint32(0x7e646e2))
+		for let i = 0; i < l.bloomHashes; i++ {
+			let h = uint64(h0) + uint64(i) * uint64(h1)
+			let bit = int((h & 0xFFFFFFFF) % uint64(bits))
+			// Bits are numbered from the low bit of each 64-bit word, words in
+			// order.
+			let word = bit / 64
+			let inWord = bit % 64
+			let byteAt = filter + word * 8 + inWord / 8
+			return false when (l.data[byteAt] & byte(1 << (inWord % 8))) == 0
+		}
+		return true
+	}
+
+	// MurmurHash3 x86_32 of the data, as git's changed-path Bloom filters
+	// hash paths.
+	internal def murmur32(data byte[], seed uint32) uint32 {
+		let c1 = uint32(0xcc9e2d51)
+		let c2 = uint32(0x1b873593)
+		let h = seed
+		let n = data.len()
+		let blocks = n / 4
+		for let i = 0; i < blocks; i++ {
+			let at = i * 4
+			let k = uint32(data[at]) | (uint32(data[at + 1]) << 8) | (uint32(data[at + 2]) << 16) | (uint32(data[at + 3]) << 24)
+			k = k * c1
+			k = (k << 15) | (k >> 17)
+			k = k * c2
+			h = h ^ k
+			h = (h << 13) | (h >> 19)
+			h = h * 5 + uint32(0xe6546b64)
+		}
+		let tail = blocks * 4
+		let k1 = uint32(0)
+		let rest = n & 3
+		k1 = k1 ^ (uint32(data[tail + 2]) << 16) when rest == 3
+		k1 = k1 ^ (uint32(data[tail + 1]) << 8) when rest >= 2
+		if rest >= 1 {
+			k1 = k1 ^ uint32(data[tail])
+			k1 = k1 * c1
+			k1 = (k1 << 15) | (k1 >> 17)
+			k1 = k1 * c2
+			h = h ^ k1
+		}
+		h = h ^ uint32(n)
+		h = h ^ (h >> 16)
+		h = h * uint32(0x85ebca6b)
+		h = h ^ (h >> 13)
+		h = h * uint32(0xc2b2ae35)
+		h = h ^ (h >> 16)
+		return h
+	}
+}

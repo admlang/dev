@@ -1,0 +1,81 @@
+// Applying patches: git's own diffs of the corpus applied to the old text
+// give the new text, also when the file moved under them, and binary
+// patches round-trip.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	check "Apply" {
+		@test()
+		def appliesGitDiffs() !none {
+			let dir = try unpackFixture(diffsTar, "git-apply")
+			let failures string[] = []
+			let applied = 0
+			for let c in try os.readDir(dir) {
+				continue unless c.info.isDir
+				let old = try os.readFile(os.join(c.path, "old"))
+				let new0 = try os.readFile(os.join(c.path, "new"))
+				for let v in ["myers", "patience", "histogram", "minimal", "u1", "noindent"] {
+					let hunks = string(try os.readFile(os.join(c.path, v + ".diff")))
+					continue when hunks == ""
+					let text = "--- a/f\n+++ b/f\n" + hunks
+					let patches = try parsePatch(text)
+					fail "{c.info.name}/{v}: {patches.len()} file patches" unless patches.len() == 1
+					let got = applyFilePatch(old, patches[0]) onerror (err error) {
+						failures.push("{c.info.name}/{v}: {err.message}")
+						recover byte[]
+					}
+					if got.hex() != new0.hex() {
+						failures.push("{c.info.name}/{v}: result differs")
+						continue
+					}
+					applied++
+					// The same hunks after ten lines were added at the top: they
+					// apply further down.
+					let shifted = "x\nx\nx\nx\nx\nx\nx\nx\nx\nx\n".bytes() + old
+					let moved = applyFilePatch(shifted, patches[0]) onerror recover byte[]
+					let want = "x\nx\nx\nx\nx\nx\nx\nx\nx\nx\n".bytes() + new0
+					// A hunk that must match at the start no longer can.
+					let startsAtTop = patches[0].hunks.len() > 0 && patches[0].hunks[0].oldStart <= 1
+					failures.push("{c.info.name}/{v}: shifted result differs") unless startsAtTop || moved.hex() == want.hex()
+				}
+			}
+			for let f in failures {
+				println(f)
+			}
+			fail "{failures.len()} patches did not apply" when failures.len() > 0
+			fail "nothing applied" when applied == 0
+			return none
+		}
+
+		@test()
+		def roundTripsBinaryPatches() !none {
+			let repo = try newWorktree("binary-patch")
+			let one byte[] = "GIF89a".bytes() + byte[0, 1, 2, 3, 0] + "pixels".bytes()
+			let two byte[] = "GIF89a".bytes() + byte[0, 1, 2, 4, 0] + "pixels and more".bytes()
+			try os.writeFile(os.join(repo.workDir, "logo.gif"), one)
+			try repo.add(".")
+			try repo.commit("One")
+			try os.writeFile(os.join(repo.workDir, "logo.gif"), two)
+			let d = try repo.diffWorktree(PatchOptions{binary: true})
+			let patch = try d.patch()
+			fail "no binary patch: {patch}" unless patch.contains("GIT binary patch")
+			// Back to the committed file, then the patch brings the change back.
+			try os.writeFile(os.join(repo.workDir, "logo.gif"), one)
+			try repo.apply(patch)
+			let after = try os.readFile(os.join(repo.workDir, "logo.gif"))
+			fail "binary patch gave {after.len()} bytes" unless after.hex() == two.hex()
+			// A patch whose context is not there is refused, and nothing changes.
+			let refused = false
+			repo.apply("--- a/logo.gif\n+++ b/logo.gif\n@@ -1 +1 @@\n-nope\n+yes\n") onerror (err error) {
+				refused = true
+				recover none
+			}
+			fail "bad patch accepted" unless refused
+			repo.close()
+			return none
+		}
+	}
+}

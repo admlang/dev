@@ -1,0 +1,143 @@
+partial module adm.dev.git {
+	use (
+		std.crypto.hash
+		std.data.encoding::(hexencode, hexdecode)
+	)
+
+	// The hash a repository names its objects by: SHA-1 (20 bytes, every
+	// repository before Git 2.29 and most since) or SHA-256 (32 bytes,
+	// `extensions.objectFormat = sha256`).
+	enum ObjectFormat {
+		Sha1,
+		Sha256
+	}
+
+	// Bytes in an object id of the format.
+	internal def idLength(format ObjectFormat) int {
+		return format == ObjectFormat.Sha256 ?? (32, 20)
+	}
+
+	// The name of the format as configuration and the protocol write it:
+	// `sha1` or `sha256`.
+	internal def formatName(format ObjectFormat) string {
+		return format == ObjectFormat.Sha256 ?? ("sha256", "sha1")
+	}
+
+	// The format named `sha1` or `sha256`. Fails on any other name.
+	internal def parseFormat(name string) !ObjectFormat {
+		return ObjectFormat.Sha1 when name == "sha1"
+		return ObjectFormat.Sha256 when name == "sha256"
+		fail "git: unknown object format {name}"
+	}
+
+	// ObjectId names an object: the hash of its type, size and content.
+	type ObjectId {
+		// The raw hash: 20 bytes for SHA-1, 32 for SHA-256.
+		bytes byte[]
+
+		// An id over the raw hash; the array is kept, not copied.
+		def new(bytes byte[]) {
+			self.bytes = bytes
+		}
+
+		// The format the id's length implies.
+		def format() ObjectFormat {
+			return bytes.len() == 32 ?? (ObjectFormat.Sha256, ObjectFormat.Sha1)
+		}
+
+		// The id in lower-case hex, as git prints it.
+		def str() string {
+			return hexencode(bytes)
+		}
+
+		// The first `length` hex digits.
+		def short(length int = 7) string {
+			let text = str()
+			return length >= text.len() ?? (text, text.slice(0, length))
+		}
+
+		// Whether every byte is zero: the id the protocol and the reflog
+		// write for a reference that does not exist.
+		def isZero() bool {
+			for let b in bytes {
+				return false when b != 0
+			}
+			return true
+		}
+
+		// Whether both name the same object.
+		def equals(other ObjectId) bool {
+			let a = bytes
+			let b = other.bytes
+			return false when a.len() != b.len()
+			for let i = 0; i < a.len(); i++ {
+				return false when a[i] != b[i]
+			}
+			return true
+		}
+
+		// The first eight bytes as a number, for maps keyed by id.
+		def hash() uint64 {
+			let h = uint64(0)
+			let n = bytes.len() < 8 ?? (bytes.len(), 8)
+			for let i = 0; i < n; i++ {
+				h = (h << 8) | uint64(bytes[i])
+			}
+			return h
+		}
+
+		// Orders ids by their bytes, as pack indexes and trees sort them.
+		def compare(other ObjectId) int {
+			return compareIdBytes(bytes, 0, other.bytes, 0, bytes.len())
+		}
+	}
+
+	// Compares `n` bytes of `a` at `ao` with `b` at `bo`: -1, 0 or 1.
+	internal def compareIdBytes(a byte[], ao int, b byte[], bo int, n int) int {
+		for let i = 0; i < n; i++ {
+			let x = a[ao + i]
+			let y = b[bo + i]
+			if x != y {
+				return x < y ?? (-1, 1)
+			}
+		}
+		return 0
+	}
+
+	// The id written in full hex, 40 digits for SHA-1 or 64 for SHA-256.
+	// Fails on any other length or a character that is not a hex digit.
+	def parseId(text string) !ObjectId {
+		fail "git: {text} is not an object id" unless text.len() == 40 || text.len() == 64
+		let raw = hexdecode(text.lower()) onerror recover byte[]
+		fail "git: {text} is not an object id" when raw.len() * 2 != text.len()
+		return new ObjectId(raw)
+	}
+
+	// The id of every zero bytes in the format.
+	def zeroId(format ObjectFormat = ObjectFormat.Sha1) ObjectId {
+		let raw byte[]
+		raw.len(idLength(format))
+		return new ObjectId(raw)
+	}
+
+	// A digest of the format.
+	internal def newHasher(format ObjectFormat) hash.Hasher {
+		if format == ObjectFormat.Sha256 {
+			return new hash.SHA256()
+		}
+		return new hash.SHA1()
+	}
+
+	// The id of an object of the kind with the content: the hash of
+	// `<kind> <size>\0<content>`.
+	def hashObject(kind ObjectKind, content byte[], format ObjectFormat = ObjectFormat.Sha1) ObjectId {
+		let h = newHasher(format)
+		h.write(objectHeader(kind, content.len()))
+		return new ObjectId(h.hash(content))
+	}
+
+	// The header an object is hashed and stored with: `<kind> <size>\0`.
+	internal def objectHeader(kind ObjectKind, size int) byte[] {
+		return "{kindName(kind)} {size}".bytes() + byte(0)
+	}
+}

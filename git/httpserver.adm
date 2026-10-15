@@ -1,0 +1,135 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.bytes
+		std.net.http
+		std.data.compress.gzip
+	)
+
+	// Serves repositories over git's smart HTTP protocol (versions 2 and
+	// 0), as a handler for `std.net.http`: clones and fetches through
+	// `git-upload-pack`, pushes through `git-receive-pack`. The program
+	// decides which repository a path names and who may do what.
+	//
+	// ```
+	// let server = new git.Server(path => git.open("/srv/git/" + path))
+	// server.authorize = def (ctx http.Context, path string, push bool) !none {
+	// 	fail http.HttpError{message: "log in to push", status: 401} when push && !ctx.authenticated
+	// 	return none
+	// }
+	// mux.handle("/git/", http.stripPrefix("/git/", server))
+	// ```
+	type Server {
+		// The repository a request path names (what comes before
+		// `/info/refs`, `/git-upload-pack` or `/git-receive-pack`); none
+		// answers 404. Failing answers 500.
+		resolve   def (string) !?Repository
+		// Checks each request: the repository path and whether it pushes.
+		// Failing refuses it, with the status of an `HttpError` (403
+		// otherwise). Without it every fetch is allowed and every push
+		// refused.
+		authorize ?def (http.Context, string, bool) !none = none
+		options   ServeOptions
+
+		def new(resolve def (string) !?Repository) {
+			self.resolve = resolve
+			options = ServeOptions{}
+		}
+
+		// Answers one request of the smart protocol: `GET <repo>/info/refs`
+		// or `POST <repo>/git-upload-pack|git-receive-pack`; anything else
+		// is refused (dumb HTTP is not served). Fails when the repository
+		// cannot be read or the request is malformed.
+		def serve(ctx http.Context) !none {
+			let path = ctx.path().trimStart("/")
+			let req = ctx.request
+			let program = ""
+			let repoPath = ""
+			let advertise = false
+			if path.endsWith("/info/refs") && ctx.method() == http.Method.GET {
+				program = req.query("service", "")
+				repoPath = path.slice(0, path.len() - 10)
+				advertise = true
+			} else if ctx.method() == http.Method.POST {
+				for let p in string["git-upload-pack", "git-receive-pack"] {
+					if path.endsWith("/" + p) {
+						program = p
+						repoPath = path.slice(0, path.len() - p.len() - 1)
+					}
+				}
+			}
+			if program != "git-upload-pack" && program != "git-receive-pack" {
+				return try ctx.response.error(advertise ?? (403, 404), advertise ?? ("dumb HTTP is not served", "not found"))
+			}
+			let push = program == "git-receive-pack"
+			let auth = authorize
+			if auth is none {
+				return try ctx.response.error(403, "pushes are not allowed") when push
+			} else {
+				let refused ?error = none
+				auth(ctx, repoPath, push) onerror (err error) {
+					refused = err
+					recover none
+				}
+				if !(refused is none) {
+					let status = statusOf(refused)
+					if status == 401 {
+						ctx.response.headers.set("WWW-Authenticate", "Basic realm=\"git\"")
+					}
+					return try ctx.response.error(status, refused.message)
+				}
+			}
+			let repo = try resolve(repoPath)
+			return try ctx.response.error(404, "no repository at {repoPath}") when repo is none
+			let version = req.header("Git-Protocol").contains("version=2") ?? (2, 0)
+			let failure ?error = none
+			serveHttp(repo, ctx, program, version, advertise) onerror (err error) {
+				failure = err
+				recover none
+			}
+			repo.close()
+			fail failure unless failure is none
+			return none
+		}
+
+		internal def serveHttp(repo Repository, ctx http.Context, program string, version int, advertise bool) !none {
+			let res = ctx.response
+			res.headers.set("Cache-Control", "no-cache, max-age=0, must-revalidate")
+			res.headers.set("Expires", "Fri, 01 Jan 1980 00:00:00 GMT")
+			res.headers.set("Pragma", "no-cache")
+			if advertise {
+				res.headers.set("Content-Type", "application/x-{program}-advertisement")
+				if !(version == 2 && program == "git-upload-pack") {
+					try writePkt(res, "# service={program}")
+					try writeFlush(res)
+				}
+				try advertiseService(repo, program, version, res, options)
+				return try res.flush()
+			}
+			let body = ctx.request.body
+			let raw io.Reader = body is none ?? (new bytes.Reader([]), body)
+			if ctx.request.header("Content-Encoding").lower() == "gzip" {
+				raw = new gzip.Reader(raw)
+			}
+			let r = new PktReader(raw)
+			res.headers.set("Content-Type", "application/x-{program}-result")
+			if program == "git-receive-pack" {
+				try serveReceivePack(repo, r, res, options)
+			} else if version == 2 {
+				let _ = try serveCommandV2(repo, r, res, options)
+			} else {
+				try serveUploadPackV0(repo, r, res, options, true)
+			}
+			return try res.flush()
+		}
+	}
+
+	// The status an `HttpError` asks for, 403 for any other failure.
+	internal def statusOf(err error) int {
+		if err is http.HttpError {
+			let h http.HttpError = err
+			return h.status > 0 ?? (h.status, 403)
+		}
+		return 403
+	}
+}

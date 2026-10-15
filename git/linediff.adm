@@ -1,0 +1,1285 @@
+partial module adm.dev.git {
+	// How lines are matched between the two sides of a diff.
+	enum DiffAlgorithm {
+		// Myers' algorithm, giving up on perfect minimality for very large
+		// differences (git's default).
+		Myers,
+		// Myers' algorithm, always minimal.
+		Minimal,
+		// Lines that occur once on each side anchor the match first.
+		Patience,
+		// Patience extended to lines that are rare rather than unique.
+		Histogram
+	}
+
+	// Which whitespace differences a diff does not count.
+	enum Whitespace {
+		// Every byte counts.
+		Exact,
+		// Whitespace at the end of a line is ignored (`--ignore-space-at-eol`).
+		AtEol,
+		// A run of whitespace equals any other run (`-b`).
+		Change,
+		// Whitespace is ignored altogether (`-w`).
+		All
+	}
+
+	// Options for line diffs and the patches made from them.
+	struct DiffOptions {
+		algorithm       DiffAlgorithm = DiffAlgorithm.Myers
+		// Slide change groups to places an indented block starts and ends
+		// (git's diff.indentHeuristic, on by default).
+		indentHeuristic bool          = true
+		whitespace      Whitespace    = Whitespace.Exact
+		// A carriage return before the newline does not count.
+		ignoreCrAtEol   bool          = false
+		// Changes made only of blank lines are left out.
+		ignoreBlankLines bool         = false
+		// Lines of context around each hunk.
+		context         int           = 3
+		// Hunks this many lines apart or closer are joined.
+		interHunk       int           = 0
+		// Find the function a hunk is in for its header with these patterns
+		// instead of git's default (a line starting with a letter, `_` or
+		// `$`), as diff.<driver>.xfuncname writes them: one regular
+		// expression per line, the first that matches decides, a line
+		// starting with `!` rules matching lines out; the first group, when
+		// there is one, is what the header shows.
+		funcname        string        = ""
+		// The funcname patterns ignore case.
+		funcnameIgnoreCase bool       = false
+	}
+
+	// One change group: `oldCount` lines of the old side from `oldStart`
+	// replaced by `newCount` lines of the new side from `newStart` (both
+	// 0-based).
+	struct Edit {
+		oldStart int
+		oldCount int
+		newStart int
+		newCount int
+	}
+
+	// Splits text into lines, each keeping its newline; a last line without
+	// one is kept as it is.
+	internal def splitLines(data byte[]) byte[][] {
+		let out byte[][] = []
+		let start = 0
+		let n = data.len()
+		for let i = 0; i < n; i++ {
+			if data[i] == 0x0A {
+				out.push(data[start:i + 1])
+				start = i + 1
+			}
+		}
+		out.push(data[start:n]) when start < n
+		return out
+	}
+
+	// The form of a line that is compared: whitespace and carriage returns
+	// dropped as the options say.
+	internal def comparable(line byte[], options DiffOptions) byte[] {
+		let n = line.len()
+		let hasNewline = n > 0 && line[n - 1] == 0x0A
+		let end = hasNewline ?? (n - 1, n)
+		if options.ignoreCrAtEol && end > 0 && line[end - 1] == 0x0D {
+			end--
+		}
+		switch options.whitespace {
+			case Whitespace.Exact:
+				// The newline counts: a last line without one differs.
+				return end == n || (hasNewline && end == n - 1) ?? (line, line[0:end] + byte(0x0A))
+			case Whitespace.AtEol:
+				for end > 0 && isDiffSpace(line[end - 1]) {
+					end--
+				}
+				return line[0:end]
+			case Whitespace.Change:
+				let out byte[] = []
+				for end > 0 && isDiffSpace(line[end - 1]) {
+					end--
+				}
+				let inSpace = false
+				for let i = 0; i < end; i++ {
+					let c = line[i]
+					if isDiffSpace(c) {
+						inSpace = true
+						continue
+					}
+					out.push(0x20) when inSpace
+					inSpace = false
+					out.push(c)
+				}
+				return out
+			default:
+				let out byte[] = []
+				for let i = 0; i < end; i++ {
+					out.push(line[i]) unless isDiffSpace(line[i])
+				}
+				return out
+		}
+	}
+
+	internal def isDiffSpace(c byte) bool {
+		return c == 0x20 || c == 0x09 || c == 0x0D || c == 0x0B || c == 0x0C
+	}
+
+	// Two files as lines with a number per distinct (compared) line, and
+	// which lines each side changes.
+	internal type LineDiff {
+		a        byte[][]
+		b        byte[][]
+		ka       int[]
+		kb       int[]
+		changedA bool[]
+		changedB bool[]
+		// Occurrences of each key on each side.
+		countA   int[]  = []
+		countB   int[]  = []
+
+		def new(a byte[][], b byte[][]) {
+			self.a = a
+			self.b = b
+		}
+	}
+
+	// The change groups between two texts, as `git diff` finds them.
+	def diffLines(oldText byte[], newText byte[], options DiffOptions = DiffOptions{}) Edit[] {
+		let d = prepareDiff(splitLines(oldText), splitLines(newText), options)
+		runDiff(d, options)
+		compact(d, true, options)
+		compact(d, false, options)
+		return buildEdits(d)
+	}
+
+	internal def prepareDiff(a byte[][], b byte[][], options DiffOptions) LineDiff {
+		let d = new LineDiff(a, b)
+		let keys map<string, int> = {}
+		d.ka = lineKeys(a, keys, options)
+		d.kb = lineKeys(b, keys, options)
+		d.countA.len(keys.len())
+		d.countB.len(keys.len())
+		d.countA.fill(0)
+		d.countB.fill(0)
+		for let k in d.ka {
+			d.countA[k] = d.countA[k] + 1
+		}
+		for let k in d.kb {
+			d.countB[k] = d.countB[k] + 1
+		}
+		// One slot of padding on each end: compaction reads one past.
+		d.changedA.len(a.len() + 2)
+		d.changedA.fill(false)
+		d.changedB.len(b.len() + 2)
+		d.changedB.fill(false)
+		return d
+	}
+
+	internal def lineKeys(lines byte[][], keys map<string, int>, options DiffOptions) int[] {
+		let out int[]
+		out.len(lines.len())
+		for let i = 0; i < lines.len(); i++ {
+			// Hex keeps NUL bytes and invalid UTF-8 distinct in the map.
+			let text = comparable(lines[i], options).hex()
+			let k = keys.get(text)
+			if k is none {
+				let fresh = keys.len()
+				keys[text] = fresh
+				out[i] = fresh
+			} else {
+				out[i] = k
+			}
+		}
+		return out
+	}
+
+	// Marks the changed lines of both sides by the chosen algorithm.
+	internal def runDiff(d LineDiff, options DiffOptions) {
+		switch options.algorithm {
+			case DiffAlgorithm.Patience:
+				patience(d, 0, d.ka.len(), 0, d.kb.len(), options)
+			case DiffAlgorithm.Histogram:
+				histogram(d, 0, d.ka.len(), 0, d.kb.len(), options, 0)
+			default:
+				myersRange(d, 0, d.ka.len(), 0, d.kb.len(), options.algorithm == DiffAlgorithm.Minimal)
+		}
+	}
+
+	// The integer square root approximation git sizes its limits with.
+	internal def bogoSqrt(n0 int) int {
+		let i = 1
+		let n = n0
+		for n > 0 {
+			i <<= 1
+			n >>= 2
+		}
+		return i
+	}
+
+	internal const (
+		lineDiscard     = 0
+		lineKeep        = 1
+		lineInvestigate = 2
+	)
+
+	// Whether a line that matches many lines on the other side sits in a
+	// run of lines with no match, so that it can go without a search.
+	internal def discardMultimatch(action int[], i int, len int) bool {
+		let s = i > 100 ?? (i - 100, 0)
+		let e = len - 1 - i > 100 ?? (i + 100, len - 1)
+		let dis0 = 0
+		let pdis0 = 1
+		for let r = 1; i - r >= s; r++ {
+			let x = action[i - r]
+			if x == lineDiscard {
+				dis0++
+			} else if x == lineInvestigate {
+				pdis0++
+			} else {
+				break
+			}
+		}
+		return false when dis0 == 0
+		let dis1 = 0
+		let pdis1 = 1
+		for let r = 1; i + r <= e; r++ {
+			let x = action[i + r]
+			if x == lineDiscard {
+				dis1++
+			} else if x == lineInvestigate {
+				pdis1++
+			} else {
+				break
+			}
+		}
+		return false when dis1 == 0
+		dis1 += dis0
+		pdis1 += pdis0
+		return pdis1 * 4 < pdis1 + dis1
+	}
+
+	// Myers on a range, prepared as git prepares it: the common ends are
+	// set aside, lines with no match on the other side are changes, and
+	// lines with very many matches inside runs of such lines are changes
+	// too (unless minimal); the rest go to the middle-snake recursion.
+	internal def myersRange(d LineDiff, lo1 int, hi1 int, lo2 int, hi2 int, minimal bool) {
+		let n1 = hi1 - lo1
+		let n2 = hi2 - lo2
+		// Occurrences of each key on each side within the range.
+		let inA map<int, int> = {}
+		let inB map<int, int> = {}
+		for let i = lo1; i < hi1; i++ {
+			let c = inA.get(d.ka[i])
+			inA[d.ka[i]] = c is none ?? (1, c + 1)
+		}
+		for let j = lo2; j < hi2; j++ {
+			let c = inB.get(d.kb[j])
+			inB[d.kb[j]] = c is none ?? (1, c + 1)
+		}
+		let start = 0
+		let limit = n1 < n2 ?? (n1, n2)
+		for start < limit && d.ka[lo1 + start] == d.kb[lo2 + start] {
+			start++
+		}
+		let tail = 0
+		for tail < limit - start && d.ka[hi1 - 1 - tail] == d.kb[hi2 - 1 - tail] {
+			tail++
+		}
+		let len1 = n1 - start - tail
+		let len2 = n2 - start - tail
+		let mlim1 = minimal ?? (n1 + n2 + 1, bogoSqrt(n1))
+		mlim1 = 1024 when !minimal && mlim1 > 1024
+		let mlim2 = minimal ?? (n1 + n2 + 1, bogoSqrt(n2))
+		mlim2 = 1024 when !minimal && mlim2 > 1024
+		let action1 int[]
+		action1.len(len1)
+		for let i = 0; i < len1; i++ {
+			let c = inB.get(d.ka[lo1 + start + i])
+			let nm = c is none ?? (0, c)
+			action1[i] = nm == 0 ?? (lineDiscard, nm < mlim1 ?? (lineKeep, lineInvestigate))
+		}
+		let action2 int[]
+		action2.len(len2)
+		for let j = 0; j < len2; j++ {
+			let c = inA.get(d.kb[lo2 + start + j])
+			let nm = c is none ?? (0, c)
+			action2[j] = nm == 0 ?? (lineDiscard, nm < mlim2 ?? (lineKeep, lineInvestigate))
+		}
+		let refA int[] = []
+		for let i = 0; i < len1; i++ {
+			let act = action1[i]
+			act = discardMultimatch(action1, i, len1) ?? (lineDiscard, lineKeep) when act == lineInvestigate
+			if act == lineKeep {
+				refA.push(lo1 + start + i)
+			} else {
+				d.changedA[lo1 + start + i + 1] = true
+			}
+		}
+		let refB int[] = []
+		for let j = 0; j < len2; j++ {
+			let act = action2[j]
+			act = discardMultimatch(action2, j, len2) ?? (lineDiscard, lineKeep) when act == lineInvestigate
+			if act == lineKeep {
+				refB.push(lo2 + start + j)
+			} else {
+				d.changedB[lo2 + start + j + 1] = true
+			}
+		}
+		let xa int[]
+		xa.len(refA.len())
+		for let i = 0; i < refA.len(); i++ {
+			xa[i] = d.ka[refA[i]]
+		}
+		let xb int[]
+		xb.len(refB.len())
+		for let j = 0; j < refB.len(); j++ {
+			xb[j] = d.kb[refB[j]]
+		}
+		let m = new MyersState(xa, xb)
+		m.compare(0, xa.len(), 0, xb.len(), minimal)
+		for let i = 0; i < refA.len(); i++ {
+			d.changedA[refA[i] + 1] = true when m.changedA[i]
+		}
+		for let j = 0; j < refB.len(); j++ {
+			d.changedB[refB[j] + 1] = true when m.changedB[j]
+		}
+	}
+
+	// The middle-snake recursion of Myers' O(ND) algorithm (section 4b of
+	// his paper) over two sequences of line keys, with git's limits for
+	// costly inputs: past a cost of 256 a diagonal that has run a snake of
+	// 20 lines far enough is taken as the split, and past about the square
+	// root of the input size the furthest-reaching point is.
+	internal type MyersState {
+		a        int[]
+		b        int[]
+		changedA bool[]
+		changedB bool[]
+		forward  int[]
+		backward int[]
+		offset   int
+		maxCost  int
+
+		def new(a int[], b int[]) {
+			self.a = a
+			self.b = b
+			changedA.len(a.len())
+			changedA.fill(false)
+			changedB.len(b.len())
+			changedB.fill(false)
+			let n = a.len() + b.len() + 3
+			forward.len(2 * n + 2)
+			backward.len(2 * n + 2)
+			offset = b.len() + 1
+			let root = bogoSqrt(n)
+			maxCost = root < 256 ?? (256, root)
+		}
+
+		def compare(lo1 int, hi1 int, lo2 int, hi2 int, minimal bool) {
+			let x0 = lo1
+			let y0 = lo2
+			let x1 = hi1
+			let y1 = hi2
+			for x0 < x1 && y0 < y1 && a[x0] == b[y0] {
+				x0++
+				y0++
+			}
+			for x0 < x1 && y0 < y1 && a[x1 - 1] == b[y1 - 1] {
+				x1--
+				y1--
+			}
+			if x0 == x1 {
+				for let j = y0; j < y1; j++ {
+					changedB[j] = true
+				}
+				return
+			}
+			if y0 == y1 {
+				for let i = x0; i < x1; i++ {
+					changedA[i] = true
+				}
+				return
+			}
+			let (sx, sy, minLow, minHigh) = split(x0, x1, y0, y1, minimal)
+			compare(x0, sx, y0, sy, minLow)
+			compare(sx, x1, sy, y1, minHigh)
+		}
+
+		// A point on an optimal (or, past the cost cap, a good) path from
+		// (x0, y0) to (x1, y1), and whether each half still needs to be
+		// minimal.
+		def split(x0 int, x1 int, y0 int, y1 int, minimal bool) (int, int, bool, bool) {
+			let kmin = x0 - y1
+			let kmax = x1 - y0
+			let fmid = x0 - y0
+			let bmid = x1 - y1
+			let odd = ((fmid - bmid) & 1) != 0
+			let fmin = fmid
+			let fmax = fmid
+			let bmin = bmid
+			let bmax = bmid
+			let o = offset
+			forward[o + fmid] = x0
+			backward[o + bmid] = x1
+			let big = x1 + y1 + 1
+			for let cost = 1; ; cost++ {
+				let gotSnake = false
+				// Widen the diagonals the forward search covers, staying in the
+				// box; the slots just outside read as unreachable.
+				if fmin > kmin {
+					fmin--
+					forward[o + fmin - 1] = -1
+				} else {
+					fmin++
+				}
+				if fmax < kmax {
+					fmax++
+					forward[o + fmax + 1] = -1
+				} else {
+					fmax--
+				}
+				for let k = fmax; k >= fmin; k -= 2 {
+					let x = forward[o + k - 1] >= forward[o + k + 1] ?? (forward[o + k - 1] + 1, forward[o + k + 1])
+					let y = x - k
+					let before = x
+					for x < x1 && y < y1 && a[x] == b[y] {
+						x++
+						y++
+					}
+					gotSnake = true when x - before > 20
+					forward[o + k] = x
+					if odd && k >= bmin && k <= bmax && backward[o + k] <= x {
+						return (x, y, true, true)
+					}
+				}
+				if bmin > kmin {
+					bmin--
+					backward[o + bmin - 1] = big
+				} else {
+					bmin++
+				}
+				if bmax < kmax {
+					bmax++
+					backward[o + bmax + 1] = big
+				} else {
+					bmax--
+				}
+				for let k = bmax; k >= bmin; k -= 2 {
+					let x = backward[o + k - 1] < backward[o + k + 1] ?? (backward[o + k - 1], backward[o + k + 1] - 1)
+					let y = x - k
+					let before = x
+					for x > x0 && y > y0 && a[x - 1] == b[y - 1] {
+						x--
+						y--
+					}
+					gotSnake = true when before - x > 20
+					backward[o + k] = x
+					if !odd && k >= fmin && k <= fmax && x <= forward[o + k] {
+						return (x, y, true, true)
+					}
+				}
+				if minimal {
+					continue
+				}
+				if gotSnake && cost > 256 {
+					// A diagonal far along, whose last 20 steps were a snake.
+					let best = 0
+					let bx = 0
+					let by = 0
+					for let k = fmax; k >= fmin; k -= 2 {
+						let dd = k > fmid ?? (k - fmid, fmid - k)
+						let x = forward[o + k]
+						let y = x - k
+						let v = (x - x0) + (y - y0) - dd
+						if v > 4 * cost && v > best && x0 + 20 <= x && x < x1 && y0 + 20 <= y && y < y1 {
+							let run = true
+							for let r = 1; r <= 20 && run; r++ {
+								run = a[x - r] == b[y - r]
+							}
+							if run {
+								best = v
+								bx = x
+								by = y
+							}
+						}
+					}
+					return (bx, by, true, false) when best > 0
+					for let k = bmax; k >= bmin; k -= 2 {
+						let dd = k > bmid ?? (k - bmid, bmid - k)
+						let x = backward[o + k]
+						let y = x - k
+						let v = (x1 - x) + (y1 - y) - dd
+						if v > 4 * cost && v > best && x0 < x && x <= x1 - 20 && y0 < y && y <= y1 - 20 {
+							let run = true
+							for let r = 0; r < 20 && run; r++ {
+								run = a[x + r] == b[y + r]
+							}
+							if run {
+								best = v
+								bx = x
+								by = y
+							}
+						}
+					}
+					return (bx, by, false, true) when best > 0
+				}
+				if cost >= maxCost {
+					// Take whichever search got furthest along its diagonal.
+					let fbest = -1
+					let fx = 0
+					for let k = fmax; k >= fmin; k -= 2 {
+						let x = forward[o + k] < x1 ?? (forward[o + k], x1)
+						let y = x - k
+						if y1 < y {
+							x = y1 + k
+							y = y1
+						}
+						if fbest < x + y {
+							fbest = x + y
+							fx = x
+						}
+					}
+					let bbest = big * 2
+					let bx = 0
+					for let k = bmax; k >= bmin; k -= 2 {
+						let x = backward[o + k] > x0 ?? (backward[o + k], x0)
+						let y = x - k
+						if y < y0 {
+							x = y0 + k
+							y = y0
+						}
+						if x + y < bbest {
+							bbest = x + y
+							bx = x
+						}
+					}
+					if (x1 + y1) - bbest < fbest - (x0 + y0) {
+						return (fx, fbest - fx, true, false)
+					}
+					return (bx, bbest - bx, false, true)
+				}
+			}
+			return (x0, y0, true, true)
+		}
+	}
+
+	// Patience diff on a range: the lines unique on both sides, matched in
+	// their longest common order, anchor the match; the common lines
+	// around each anchor extend it, and the gaps between are diffed the
+	// same way. A range with no common line at all is all change; one with
+	// common lines but none unique on both sides goes to Myers.
+	internal def patience(d LineDiff, lo1 int, hi1 int, lo2 int, hi2 int, options DiffOptions) {
+		if lo1 == hi1 {
+			for let j = lo2; j < hi2; j++ {
+				d.changedB[j + 1] = true
+			}
+			return
+		}
+		if lo2 == hi2 {
+			for let i = lo1; i < hi1; i++ {
+				d.changedA[i + 1] = true
+			}
+			return
+		}
+		// For each key of A in order of first appearance: where it is, and
+		// where in B (-1 none, -2 more than once on either side).
+		let order int[] = []
+		let line1 map<int, int> = {}
+		let line2 map<int, int> = {}
+		for let i = lo1; i < hi1; i++ {
+			let k = d.ka[i]
+			if line1.hasKey(k) {
+				line2[k] = -2
+				continue
+			}
+			line1[k] = i
+			line2[k] = -1
+			order.push(k)
+		}
+		let anyMatch = false
+		for let j = lo2; j < hi2; j++ {
+			let k = d.kb[j]
+			let at = line2.get(k)
+			continue when at is none
+			anyMatch = true
+			line2[k] = at == -1 ?? (j, -2)
+		}
+		if !anyMatch {
+			for let i = lo1; i < hi1; i++ {
+				d.changedA[i + 1] = true
+			}
+			for let j = lo2; j < hi2; j++ {
+				d.changedB[j + 1] = true
+			}
+			return
+		}
+		let pairsA int[] = []
+		let pairsB int[] = []
+		for let k in order {
+			let j = line2[k]
+			continue when j < 0
+			pairsA.push(line1[k])
+			pairsB.push(j)
+		}
+		if pairsA.len() == 0 {
+			myersRange(d, lo1, hi1, lo2, hi2, false)
+			return
+		}
+		let chain = longestIncreasing(pairsB)
+		let x = lo1
+		let y = lo2
+		let c = 0
+		for {
+			let next1 = hi1
+			let next2 = hi2
+			if c < chain.len() {
+				next1 = pairsA[chain[c]]
+				next2 = pairsB[chain[c]]
+				for next1 > x && next2 > y && d.ka[next1 - 1] == d.kb[next2 - 1] {
+					next1--
+					next2--
+				}
+			}
+			for x < next1 && y < next2 && d.ka[x] == d.kb[y] {
+				x++
+				y++
+			}
+			if next1 > x || next2 > y {
+				patience(d, x, next1, y, next2, options)
+			}
+			return when c >= chain.len()
+			// Consecutive anchors are one run.
+			for c + 1 < chain.len() && pairsA[chain[c + 1]] == pairsA[chain[c]] + 1 && pairsB[chain[c + 1]] == pairsB[chain[c]] + 1 {
+				c++
+			}
+			x = pairsA[chain[c]] + 1
+			y = pairsB[chain[c]] + 1
+			c++
+		}
+	}
+
+	// The positions of a longest strictly increasing subsequence, by
+	// patience sorting.
+	internal def longestIncreasing(values int[]) int[] {
+		let tails int[] = []
+		let prev int[]
+		prev.len(values.len())
+		for let i = 0; i < values.len(); i++ {
+			let v = values[i]
+			let lo = 0
+			let hi = tails.len()
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				if values[tails[mid]] < v {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			prev[i] = lo > 0 ?? (tails[lo - 1], -1)
+			if lo == tails.len() {
+				tails.push(i)
+			} else {
+				tails[lo] = i
+			}
+		}
+		let out int[] = []
+		let k = tails.len() > 0 ?? (tails[tails.len() - 1], -1)
+		for k >= 0 {
+			out.push(k)
+			k = prev[k]
+		}
+		return out.reverse()
+	}
+
+	// Lines occurring more often than this on side A make histogram diff
+	// fall back to Myers for the range.
+	internal const histogramMaxChain = 64
+
+	// Histogram diff on a range (git's, from JGit): the common run anchored
+	// on the rarest line of A that also occurs in B splits the range, the
+	// part before it is diffed the same way and so is the part after. A
+	// range whose common lines all occur more than 64 times in A goes to
+	// Myers; one with no common line is all change.
+	internal def histogram(d LineDiff, lo1 int, hi1 int, lo2 int, hi2 int, options DiffOptions, depth int) {
+		let x0 = lo1
+		let y0 = lo2
+		let x1 = hi1
+		let y1 = hi2
+		for {
+			return when x0 >= x1 && y0 >= y1
+			if x0 == x1 {
+				for let j = y0; j < y1; j++ {
+					d.changedB[j + 1] = true
+				}
+				return
+			}
+			if y0 == y1 {
+				for let i = x0; i < x1; i++ {
+					d.changedA[i + 1] = true
+				}
+				return
+			}
+			// Occurrences of each key of A: the first, the next after each,
+			// and how many.
+			let firstAt map<int, int> = {}
+			let count map<int, int> = {}
+			let nextAt int[]
+			nextAt.len(x1 - x0)
+			for let i = x1 - 1; i >= x0; i-- {
+				let k = d.ka[i]
+				let f = firstAt.get(k)
+				nextAt[i - x0] = f is none ?? (-1, f)
+				firstAt[k] = i
+				let c = count.get(k)
+				count[k] = c is none ?? (1, c + 1)
+			}
+			let bestCnt = histogramMaxChain + 1
+			let hasCommon = false
+			let sa0 = -1
+			let ea0 = -1
+			let sb0 = -1
+			let eb0 = -1
+			let j = y0
+			for j < y1 {
+				let k = d.kb[j]
+				let nextJ = j + 1
+				let f = firstAt.get(k)
+				if !(f is none) {
+					let cnt = count[k]
+					if cnt > bestCnt {
+						hasCommon = true
+					} else {
+						hasCommon = true
+						let at = f
+						for {
+							let sa = at
+							let sb = j
+							let ea = at
+							let eb = j
+							let rc = cnt
+							for sa > x0 && sb > y0 && d.ka[sa - 1] == d.kb[sb - 1] {
+								sa--
+								sb--
+								let c = count[d.ka[sa]]
+								rc = c when 1 < rc && c < rc
+							}
+							for ea < x1 - 1 && eb < y1 - 1 && d.ka[ea + 1] == d.kb[eb + 1] {
+								ea++
+								eb++
+								let c = count[d.ka[ea]]
+								rc = c when 1 < rc && c < rc
+							}
+							nextJ = eb + 1 when nextJ <= eb
+							if ea0 - sa0 < ea - sa || rc < bestCnt {
+								sa0 = sa
+								ea0 = ea
+								sb0 = sb
+								eb0 = eb
+								bestCnt = rc
+							}
+							let np = nextAt[at - x0]
+							for np >= 0 && np <= ea {
+								np = nextAt[np - x0]
+							}
+							break when np < 0
+							at = np
+						}
+					}
+				}
+				j = nextJ
+			}
+			if hasCommon && bestCnt > histogramMaxChain {
+				myersRange(d, x0, x1, y0, y1, false)
+				return
+			}
+			if sa0 < 0 {
+				for let i = x0; i < x1; i++ {
+					d.changedA[i + 1] = true
+				}
+				for let jj = y0; jj < y1; jj++ {
+					d.changedB[jj + 1] = true
+				}
+				return
+			}
+			histogram(d, x0, sa0, y0, sb0, options, depth + 1)
+			x0 = ea0 + 1
+			y0 = eb0 + 1
+		}
+	}
+
+	// ---- sliding change groups ---------------------------------------------------
+
+	internal const (
+		startOfFilePenalty            = 1
+		endOfFilePenalty              = 21
+		totalBlankWeight              = -30
+		postBlankWeight               = 6
+		relativeIndentPenalty         = -4
+		relativeIndentWithBlankPenalty = 10
+		relativeOutdentPenalty        = 24
+		relativeOutdentWithBlankPenalty = 17
+		relativeDedentPenalty         = 23
+		relativeDedentWithBlankPenalty = 17
+		indentWeight                  = 60
+		indentMaxSliding              = 100
+		maxIndent                     = 200
+		maxBlanks                     = 20
+	)
+
+	// The indent of a line, tabs to multiples of 8, -1 for a blank line.
+	internal def lineIndent(line byte[]) int {
+		let n = 0
+		for let c in line {
+			if !isDiffSpace(c) && c != 0x0A {
+				return n
+			}
+			if c == 0x20 {
+				n++
+			} else if c == 0x09 {
+				n += 8 - n % 8
+			}
+			return maxIndent when n >= maxIndent
+		}
+		return -1
+	}
+
+	// The score of splitting the file above line `at`: an effective indent
+	// and a penalty, both lower being better (git's indent heuristic,
+	// weights from mhagger's diff-slider-tools corpus).
+	internal def splitScore(lines byte[][], at int) (int, int) {
+		let endOfFile = at >= lines.len()
+		let indent = endOfFile ?? (-1, lineIndent(lines[at]))
+		let preBlank = 0
+		let preIndent = -1
+		for let i = at - 1; i >= 0; i-- {
+			preIndent = lineIndent(lines[i])
+			break when preIndent != -1
+			preBlank++
+			if preBlank == maxBlanks {
+				preIndent = 0
+				break
+			}
+		}
+		let postBlank = 0
+		let postIndent = -1
+		for let i = at + 1; i < lines.len(); i++ {
+			postIndent = lineIndent(lines[i])
+			break when postIndent != -1
+			postBlank++
+			if postBlank == maxBlanks {
+				postIndent = 0
+				break
+			}
+		}
+		let penalty = 0
+		penalty += startOfFilePenalty when preIndent == -1 && preBlank == 0
+		penalty += endOfFilePenalty when endOfFile
+		let blankAfter = indent == -1 ?? (1 + postBlank, 0)
+		let totalBlank = preBlank + blankAfter
+		penalty += totalBlankWeight * totalBlank
+		penalty += postBlankWeight * blankAfter
+		let effective = indent != -1 ?? (indent, postIndent)
+		let anyBlanks = totalBlank != 0
+		if effective != -1 && preIndent != -1 {
+			if effective > preIndent {
+				penalty += anyBlanks ?? (relativeIndentWithBlankPenalty, relativeIndentPenalty)
+			} else if effective < preIndent {
+				if postIndent != -1 && postIndent > effective {
+					penalty += anyBlanks ?? (relativeOutdentWithBlankPenalty, relativeOutdentPenalty)
+				} else {
+					penalty += anyBlanks ?? (relativeDedentWithBlankPenalty, relativeDedentPenalty)
+				}
+			}
+		}
+		return (effective, penalty)
+	}
+
+	// Slides each change group of one side to a canonical place: as far down
+	// as it goes, then up to line up with a change on the other side, or
+	// to places the indent heuristic scores best. Groups that meet merge.
+	// `changed` and `otherChanged` are offset by one (index 0 and len+1
+	// are always false).
+	internal def compact(d LineDiff, sideA bool, options DiffOptions) {
+		let lines = sideA ?? (d.a, d.b)
+		let keys = sideA ?? (d.ka, d.kb)
+		let changed = sideA ?? (d.changedA, d.changedB)
+		let otherKeys = sideA ?? (d.kb, d.ka)
+		let otherChanged = sideA ?? (d.changedB, d.changedA)
+		let n = keys.len()
+		let m = otherKeys.len()
+		// Groups are [start, end) in 0-based line numbers; changed[i + 1].
+		let start = 0
+		let end = 0
+		for end < n && changed[end + 1] {
+			end++
+		}
+		let ostart = 0
+		let oend = 0
+		for oend < m && otherChanged[oend + 1] {
+			oend++
+		}
+		for {
+			if end > start {
+				let origStart = start
+				let origEnd = end
+				let size = 0
+				let earliestEnd = 0
+				let matchEnd = -1
+				for {
+					size = end - start
+					matchEnd = -1
+					// Up as far as possible.
+					for start > 0 && keys[start - 1] == keys[end - 1] {
+						start--
+						end--
+						changed[start + 1] = true
+						changed[end + 1] = false
+						for start > 0 && changed[start] {
+							start--
+						}
+						// The other side's group moves to the previous one.
+						oend = ostart - 1
+						ostart = oend
+						for ostart > 0 && otherChanged[ostart] {
+							ostart--
+						}
+					}
+					earliestEnd = end
+					matchEnd = end when oend > ostart
+					// Down as far as possible.
+					for end < n && keys[start] == keys[end] {
+						changed[start + 1] = false
+						changed[end + 1] = true
+						start++
+						end++
+						for end < n && changed[end + 1] {
+							end++
+						}
+						ostart = oend + 1
+						oend = ostart
+						for oend < m && otherChanged[oend + 1] {
+							oend++
+						}
+						matchEnd = end when oend > ostart
+					}
+					break when size == end - start
+				}
+				if end != earliestEnd {
+					if matchEnd != -1 {
+						// Back up to line up with a change on the other side.
+						for oend == ostart {
+							start--
+							end--
+							changed[start + 1] = true
+							changed[end + 1] = false
+							for start > 0 && changed[start] {
+								start--
+							}
+							oend = ostart - 1
+							ostart = oend
+							for ostart > 0 && otherChanged[ostart] {
+								ostart--
+							}
+						}
+					} else if options.indentHeuristic {
+						let shift = earliestEnd
+						shift = end - size - 1 when end - size - 1 > shift
+						shift = end - indentMaxSliding when end - indentMaxSliding > shift
+						let bestShift = -1
+						let bestIndent = 0
+						let bestPenalty = 0
+						for let s = shift; s <= end; s++ {
+							let (i1, p1) = splitScore(lines, s)
+							let (i2, p2) = splitScore(lines, s - size)
+							let ei = i1 + i2
+							let p = p1 + p2
+							let cmp = ei > bestIndent ?? (1, ei < bestIndent ?? (-1, 0))
+							if bestShift == -1 || indentWeight * cmp + (p - bestPenalty) <= 0 {
+								bestIndent = ei
+								bestPenalty = p
+								bestShift = s
+							}
+						}
+						for end > bestShift {
+							start--
+							end--
+							changed[start + 1] = true
+							changed[end + 1] = false
+							for start > 0 && changed[start] {
+								start--
+							}
+							oend = ostart - 1
+							ostart = oend
+							for ostart > 0 && otherChanged[ostart] {
+								ostart--
+							}
+						}
+					}
+				}
+				// Histogram's matches can leave equal lines inside a group that
+				// sliding merged: diff such a group again with Myers.
+				if oend > ostart && options.algorithm == DiffAlgorithm.Histogram && (start != origStart || end != origEnd) {
+					for let i = start; i < end; i++ {
+						changed[i + 1] = false
+					}
+					for let i = ostart; i < oend; i++ {
+						otherChanged[i + 1] = false
+					}
+					if sideA {
+						myersRange(d, start, end, ostart, oend, false)
+					} else {
+						myersRange(d, ostart, oend, start, end, false)
+					}
+				}
+			}
+			// The next group, here and on the other side.
+			break when end >= n
+			start = end + 1
+			end = start
+			for end < n && changed[end + 1] {
+				end++
+			}
+			ostart = oend + 1
+			oend = ostart
+			for oend < m && otherChanged[oend + 1] {
+				oend++
+			}
+		}
+	}
+
+	// The change groups from the changed flags, in order.
+	internal def buildEdits(d LineDiff) Edit[] {
+		let out Edit[] = []
+		let n = d.ka.len()
+		let m = d.kb.len()
+		let i = 0
+		let j = 0
+		for i < n || j < m {
+			if (i < n && d.changedA[i + 1]) || (j < m && d.changedB[j + 1]) {
+				let si = i
+				let sj = j
+				for i < n && d.changedA[i + 1] {
+					i++
+				}
+				for j < m && d.changedB[j + 1] {
+					j++
+				}
+				out.push(Edit{oldStart: si, oldCount: i - si, newStart: sj, newCount: j - sj})
+				continue
+			}
+			i++
+			j++
+		}
+		return out
+	}
+
+	// Whether every line an edit removes and adds is blank (for
+	// ignoreBlankLines): empty, or with a whitespace option on, nothing but
+	// whitespace.
+	internal def blankEdit(a byte[][], b byte[][], e Edit, options DiffOptions) bool {
+		for let i = e.oldStart; i < e.oldStart + e.oldCount; i++ {
+			return false unless blankLine(a[i], options)
+		}
+		for let j = e.newStart; j < e.newStart + e.newCount; j++ {
+			return false unless blankLine(b[j], options)
+		}
+		return true
+	}
+
+	internal def blankLine(line byte[], options DiffOptions) bool {
+		if options.whitespace == Whitespace.Exact && !options.ignoreCrAtEol {
+			return line.len() <= 1
+		}
+		for let c in line {
+			return false unless isDiffSpace(c) || c == 0x0A
+		}
+		return true
+	}
+
+	// The edits that make up the next hunk from `from`: the last one's
+	// index (git's grouping, which keeps changes `2 * context +
+	// interHunk` lines apart or closer together, and drops ignorable ones
+	// far from the rest). `first` moves past leading ignorable edits.
+	internal def nextHunk(edits Edit[], ignore bool[], from int, options DiffOptions) (int, int) {
+		let maxCommon = 2 * options.context + options.interHunk
+		let maxIgnorable = options.context
+		let first = from
+		// Ignorable edits too far before the next change are skipped; the
+		// scan goes on over every leading ignorable edit.
+		for let p = from; p < edits.len() && ignore[p]; p++ {
+			if p + 1 >= edits.len() || edits[p + 1].oldStart - (edits[p].oldStart + edits[p].oldCount) >= maxIgnorable {
+				first = p + 1
+			}
+		}
+		return (first, -1) when first >= edits.len()
+		let last = first
+		let ignored = 0
+		for let k = first + 1; k < edits.len(); k++ {
+			let prev = edits[k - 1]
+			let e = edits[k]
+			let distance = e.oldStart - (prev.oldStart + prev.oldCount)
+			break when distance > maxCommon
+			if distance < maxIgnorable && (!ignore[k] || last == k - 1) {
+				last = k
+				ignored = 0
+			} else if distance < maxIgnorable && ignore[k] {
+				ignored += e.newCount
+			} else if last != k - 1 && e.oldStart + ignored - (edits[last].oldStart + edits[last].oldCount) > maxCommon {
+				break
+			} else if !ignore[k] {
+				last = k
+				ignored = 0
+			} else {
+				ignored += e.newCount
+			}
+		}
+		return (first, last)
+	}
+
+	// Compiled funcname patterns: each with whether it rules lines out.
+	internal struct FuncPattern {
+		negate  bool
+		pattern regex
+	}
+
+	internal def compileFuncname(text string, ignoreCase bool) FuncPattern[] {
+		let out FuncPattern[] = []
+		for let line in text.split("\n") {
+			continue when line == ""
+			let negate = line.startsWith("!")
+			let body = negate ?? (line.slice(1), line)
+			let r = new regex(body, ignoreCase ?? ("i", ""))
+			out.push(FuncPattern{negate: negate, pattern: r}) when r.valid()
+		}
+		return out
+	}
+
+	// Whether a line starts a function for hunk headers, and the text the
+	// header shows for it.
+	internal def funcLine(line byte[], patterns FuncPattern[]) ?string {
+		if patterns.len() > 0 {
+			let end = line.len()
+			end-- when end > 0 && line[end - 1] == 0x0A
+			end-- when end > 0 && line[end - 1] == 0x0D
+			let text = string(line[0:end])
+			for let p in patterns {
+				let m = p.pattern.find(text)
+				continue when m is none
+				return none when p.negate
+				let shown = m.groups.len() > 0 && m.groups[0] != "" ?? (m.groups[0], m.text)
+				return truncateFunc(shown)
+			}
+			return none
+		}
+		return none when line.len() == 0
+		let c = line[0]
+		let starts = (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F || c == 0x24
+		return none unless starts
+		return truncateFunc(string(line))
+	}
+
+	internal def truncateFunc(text string) string {
+		let b = text.bytes()
+		let end = b.len() < 80 ?? (b.len(), 80)
+		for end > 0 && (isDiffSpace(b[end - 1]) || b[end - 1] == 0x0A) {
+			end--
+		}
+		return string(b[0:end])
+	}
+
+	// The hunks of a unified diff between the two texts: `@@` headers with
+	// the function each hunk is in, context, `-` and `+` lines, and
+	// `\ No newline at end of file` places a side lacks a final newline.
+	// Empty when the texts do not differ.
+	def unifiedHunks(oldText byte[], newText byte[], options DiffOptions = DiffOptions{}) byte[] {
+		let a = splitLines(oldText)
+		let b = splitLines(newText)
+		let d = prepareDiff(a, b, options)
+		runDiff(d, options)
+		compact(d, true, options)
+		compact(d, false, options)
+		let edits = buildEdits(d)
+		return formatHunks(a, b, edits, options)
+	}
+
+	// Writes the hunks of the edits.
+	internal def formatHunks(a byte[][], b byte[][], edits Edit[], options DiffOptions) byte[] {
+		let ignore bool[]
+		ignore.len(edits.len())
+		for let (i, e) in edits {
+			ignore[i] = options.ignoreBlankLines && blankEdit(a, b, e, options)
+		}
+		let out byte[] = []
+		let patterns = compileFuncname(options.funcname, options.funcnameIgnoreCase)
+		let ctx = options.context
+		let funcPrev = -1
+		let funcText = ""
+		let k = 0
+		for k < edits.len() {
+			let (first, last) = nextHunk(edits, ignore, k, options)
+			break when last < 0
+			let fe = edits[first]
+			let le = edits[last]
+			let s1 = fe.oldStart - ctx > 0 ?? (fe.oldStart - ctx, 0)
+			let s2 = fe.newStart - ctx > 0 ?? (fe.newStart - ctx, 0)
+			let lctx = ctx
+			lctx = a.len() - (le.oldStart + le.oldCount) when a.len() - (le.oldStart + le.oldCount) < lctx
+			lctx = b.len() - (le.newStart + le.newCount) when b.len() - (le.newStart + le.newCount) < lctx
+			let e1 = le.oldStart + le.oldCount + lctx
+			let e2 = le.newStart + le.newCount + lctx
+			// The function header: the nearest function line above the
+			// hunk, searched back to places the previous search started.
+			for let i = s1 - 1; i > funcPrev && i >= 0; i-- {
+				let f = funcLine(a[i], patterns)
+				if !(f is none) {
+					funcText = f
+					break
+				}
+			}
+			funcPrev = s1 - 1
+			out.push(...hunkHeader(s1 + 1, e1 - s1, s2 + 1, e2 - s2, funcText).bytes())
+			for let j = s2; j < fe.newStart; j++ {
+				emitLine(out, " ", b[j])
+			}
+			let i1 = fe.oldStart
+			let i2 = fe.newStart
+			for let x = first; x <= last; x++ {
+				let e = edits[x]
+				for i1 < e.oldStart && i2 < e.newStart {
+					emitLine(out, " ", b[i2])
+					i1++
+					i2++
+				}
+				for let i = e.oldStart; i < e.oldStart + e.oldCount; i++ {
+					emitLine(out, "-", a[i])
+				}
+				for let j = e.newStart; j < e.newStart + e.newCount; j++ {
+					emitLine(out, "+", b[j])
+				}
+				i1 = e.oldStart + e.oldCount
+				i2 = e.newStart + e.newCount
+			}
+			for let j = i2; j < e2; j++ {
+				emitLine(out, " ", b[j])
+			}
+			k = last + 1
+		}
+		return out
+	}
+
+	internal def hunkHeader(s1 int, c1 int, s2 int, c2 int, func string) string {
+		let a = c1 == 0 ?? ("{s1 - 1},0", c1 == 1 ?? ("{s1}", "{s1},{c1}"))
+		let b = c2 == 0 ?? ("{s2 - 1},0", c2 == 1 ?? ("{s2}", "{s2},{c2}"))
+		let tail = func == "" ?? ("", " " + func)
+		return "@@ -{a} +{b} @@{tail}\n"
+	}
+
+	internal def emitLine(out byte[], prefix string, line byte[]) {
+		out.push(...prefix.bytes())
+		out.push(...line)
+		if line.len() == 0 || line[line.len() - 1] != 0x0A {
+			out.push(..."\n\\ No newline at end of file\n".bytes())
+		}
+	}
+}

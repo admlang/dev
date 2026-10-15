@@ -1,0 +1,593 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.bytes
+		std.services.runtime::(Runtime)
+		std.data.encoding.codepages
+		std.data.encoding.shiftjis
+	)
+
+	// What git does with a file's line endings (convert.c's crlf actions).
+	internal const (
+		crlfBinary     = 0
+		crlfText       = 1
+		crlfTextInput  = 2
+		crlfTextCrlf   = 3
+		crlfAuto       = 4
+		crlfAutoInput  = 5
+		crlfAutoCrlf   = 6
+		crlfUndefined  = 7
+	)
+
+	// The conversions a path's attributes ask for.
+	internal struct Conversion {
+		crlf     int
+		ident    bool
+		// The filter driver's name; empty for none.
+		filter   string
+		// working-tree-encoding; empty for UTF-8 as stored.
+		encoding string
+	}
+
+	// The counts git decides text and line endings on.
+	internal struct TextStats {
+		crlf         int = 0
+		loneCr       int = 0
+		loneLf       int = 0
+		nul          int = 0
+		printable    int = 0
+		nonprintable int = 0
+	}
+
+	internal def textStats(data byte[]) TextStats {
+		let s = TextStats{}
+		let n = data.len()
+		let i = 0
+		for i < n {
+			let c = data[i]
+			if c == 0x0D {
+				if i + 1 < n && data[i + 1] == 0x0A {
+					s.crlf++
+					i += 2
+					continue
+				}
+				s.loneCr++
+				i++
+				continue
+			}
+			if c == 0x0A {
+				s.loneLf++
+			} else if c == 0x7F {
+				s.nonprintable++
+			} else if c < 32 {
+				if c == 0x08 || c == 0x09 || c == 0x1B || c == 0x0C {
+					s.printable++
+				} else {
+					s.nul++ when c == 0
+					s.nonprintable++
+				}
+			} else {
+				s.printable++
+			}
+			i++
+		}
+		// A trailing ^Z (DOS end of file) is not a sign of binary.
+		s.nonprintable-- when n >= 1 && data[n - 1] == 0x1A
+		return s
+	}
+
+	// Whether git's line-ending conversion treats the content as binary.
+	internal def statsBinary(s TextStats) bool {
+		return s.loneCr > 0 || s.nul > 0 || (s.printable >> 7) < s.nonprintable
+	}
+
+	// The conversions for a path from its attributes and core.autocrlf.
+	internal def conversionFor(repo Repository, attrs AttributeRules, path string) Conversion {
+		let a = attrs.all(path)
+		let crlf = crlfActionOf(a.get("text"))
+		crlf = crlfActionOf(a.get("crlf")) when crlf == crlfUndefined
+		if crlf != crlfBinary {
+			let eol = a.get("eol")
+			let e = eol is none ?? ("", attrText(eol))
+			if crlf == crlfAuto && e == "lf" {
+				crlf = crlfAutoInput
+			} else if crlf == crlfAuto && e == "crlf" {
+				crlf = crlfAutoCrlf
+			} else if e == "lf" {
+				crlf = crlfTextInput
+			} else if e == "crlf" {
+				crlf = crlfTextCrlf
+			}
+		}
+		let auto = repo.config.get("core.autocrlf", "false").lower()
+		if crlf == crlfText {
+			crlf = textEolIsCrlf(repo) ?? (crlfTextCrlf, crlfTextInput)
+		}
+		if crlf == crlfUndefined {
+			if auto == "input" {
+				crlf = crlfAutoInput
+			} else if (parseConfigBool(auto) onerror recover false) {
+				crlf = crlfAutoCrlf
+			} else {
+				crlf = crlfBinary
+			}
+		}
+		let identAttr = a.get("ident")
+		let filterAttr = a.get("filter")
+		let encAttr = a.get("working-tree-encoding")
+		return Conversion{
+			crlf: crlf,
+			ident: !(identAttr is none) && isSet(identAttr),
+			filter: filterAttr is none ?? ("", attrText(filterAttr)),
+			encoding: encAttr is none ?? ("", attrText(encAttr)),
+		}
+	}
+
+	internal def crlfActionOf(v ?AttrValue) int {
+		return crlfUndefined when v is none
+		return crlfText when v.state == "set"
+		return crlfBinary when v.state == "unset"
+		return crlfTextInput when v.state == "value" && v.value == "input"
+		return crlfAuto when v.state == "value" && v.value == "auto"
+		return crlfUndefined
+	}
+
+	// Whether text checked out without an eol attribute gets CRLF:
+	// core.autocrlf=true, or core.eol=crlf (native is LF here).
+	internal def textEolIsCrlf(repo Repository) bool {
+		let auto = repo.config.get("core.autocrlf", "false").lower()
+		return false when auto == "input"
+		return true when (parseConfigBool(auto) onerror recover false)
+		return repo.config.get("core.eol", "").lower() == "crlf"
+	}
+
+	internal def outputCrlf(repo Repository, action int) bool {
+		switch action {
+			case crlfBinary, crlfTextInput, crlfAutoInput:
+				return false
+			case crlfTextCrlf, crlfUndefined, crlfAutoCrlf:
+				return true
+		}
+		return textEolIsCrlf(repo)
+	}
+
+	internal def isAutoCrlf(action int) bool {
+		return action == crlfAuto || action == crlfAutoInput || action == crlfAutoCrlf
+	}
+
+	// Content as git stores it from the working tree's file at path:
+	// clean filter, then working-tree-encoding to UTF-8, then CRLF to LF as
+	// the attributes and core.autocrlf say, then `$Id: ...$` back to
+	// `$Id$`. `indexed` is the blob the index holds for the path, which
+	// `text=auto` looks at. Fails when a required filter fails or the
+	// encoding is not supported.
+	def toGit(repo Repository, path string, data byte[], indexed ?ObjectId = none) !byte[] {
+		let c = conversionFor(repo, try repo.attributes(), path)
+		let out = data
+		if c.filter != "" {
+			out = try runFilter(repo, c.filter, "clean", path, out)
+		}
+		if c.encoding != "" {
+			out = try decodeWorktreeEncoding(out, c.encoding, path)
+		}
+		out = try crlfToGit(repo, out, c.crlf, indexed)
+		out = identToGit(out) when c.ident
+		return out
+	}
+
+	internal def crlfToGit(repo Repository, data byte[], action int, indexed ?ObjectId) !byte[] {
+		return data when action == crlfBinary || data.len() == 0
+		let s = textStats(data)
+		return data when s.crlf == 0
+		if isAutoCrlf(action) {
+			return data when statsBinary(s)
+			// A file already stored with CR is left as it is.
+			if !(indexed is none) {
+				let (_, stored) = try repo.raw(indexed)
+				if indexByte(stored, 0x0D, 0, stored.len()) >= 0 {
+					let st = textStats(stored)
+					return data when !statsBinary(st) && st.crlf > 0
+				}
+			}
+			let out byte[] = []
+			out.cap(data.len())
+			for let b in data {
+				out.push(b) unless b == 0x0D
+			}
+			return out
+		}
+		let out byte[] = []
+		out.cap(data.len())
+		let n = data.len()
+		for let i = 0; i < n; i++ {
+			let b = data[i]
+			continue when b == 0x0D && i + 1 < n && data[i + 1] == 0x0A
+			out.push(b)
+		}
+		return out
+	}
+
+	// Content as git writes it to the working tree from a stored blob: the
+	// reverse of toGit (`$Id$` expanded, LF to CRLF, encoding, smudge
+	// filter). Fails when a required filter fails or the encoding is not
+	// supported.
+	def toWorktree(repo Repository, path string, data byte[]) !byte[] {
+		let c = conversionFor(repo, try repo.attributes(), path)
+		let out = data
+		out = identToWorktree(out, repo.format) when c.ident
+		out = crlfToWorktree(repo, out, c.crlf)
+		if c.encoding != "" {
+			out = try encodeWorktreeEncoding(out, c.encoding, path)
+		}
+		if c.filter != "" {
+			out = try runFilter(repo, c.filter, "smudge", path, out)
+		}
+		return out
+	}
+
+	internal def crlfToWorktree(repo Repository, data byte[], action int) byte[] {
+		return data when data.len() == 0 || !outputCrlf(repo, action)
+		let s = textStats(data)
+		return data when s.loneLf == 0
+		if isAutoCrlf(action) {
+			return data when s.loneCr > 0 || s.crlf > 0 || statsBinary(s)
+		}
+		let out byte[] = []
+		out.cap(data.len() + s.loneLf)
+		let n = data.len()
+		for let i = 0; i < n; i++ {
+			let b = data[i]
+			if b == 0x0A && (i == 0 || data[i - 1] != 0x0D) {
+				out.push(0x0D)
+			}
+			out.push(b)
+		}
+		return out
+	}
+
+	// `$Id: <anything>$` back to `$Id$`, unless a line ends before the
+	// closing dollar.
+	internal def identToGit(data byte[]) byte[] {
+		let out byte[] = []
+		let n = data.len()
+		let i = 0
+		for i < n {
+			let b = data[i]
+			out.push(b)
+			i++
+			continue unless b == 0x24
+			if i + 3 <= n && data[i] == 0x49 && data[i + 1] == 0x64 && data[i + 2] == 0x3A {
+				let close = indexByte(data, 0x24, i + 3, n)
+				break when close < 0
+				if indexByte(data, 0x0A, i + 3, close) < 0 {
+					out.push(0x49, 0x64, 0x24)
+					i = close + 1
+				}
+			}
+		}
+		for i < n {
+			out.push(data[i])
+			i++
+		}
+		return out
+	}
+
+	// `$Id$` (and an expanded git-style `$Id: x $`) to `$Id: <blob id> $`.
+	internal def identToWorktree(data byte[], format ObjectFormat) byte[] {
+		let id = hashObject(ObjectKind.Blob, data, format)
+		let out byte[] = []
+		let n = data.len()
+		let i = 0
+		for i < n {
+			let b = data[i]
+			out.push(b)
+			i++
+			continue unless b == 0x24
+			continue unless i + 3 <= n && data[i] == 0x49 && data[i + 1] == 0x64
+			let next = -1
+			if data[i + 2] == 0x24 {
+				next = i + 3
+			} else if data[i + 2] == 0x3A {
+				let close = indexByte(data, 0x24, i + 3, n)
+				break when close < 0
+				continue when indexByte(data, 0x0A, i + 3, close) >= 0
+				let space = indexByte(data, 0x20, i + 4, close)
+				// Spaces inside: another tool's keyword, kept.
+				continue when space >= 0 && space < close - 1
+				next = close + 1
+			}
+			continue when next < 0
+			out.push(..."Id: {id.str()} $".bytes())
+			i = next
+		}
+		return out
+	}
+
+	// ---- working-tree-encoding ---------------------------------------------------
+
+	// The encoding name normalised for comparison: upper case, `UTF16` as
+	// `UTF-16`.
+	internal def normalizeEncoding(name string) string {
+		let u = name.trim().upper()
+		return u.replace("UTF16", "UTF-16").replace("UTF32", "UTF-32").replace("UTF8", "UTF-8")
+	}
+
+	// Content in the working-tree encoding as UTF-8. UTF-16 and UTF-32
+	// without an endianness need a byte-order mark and the LE/BE forms must
+	// not have one (git's rules); single-byte code pages and Shift_JIS are
+	// supported besides. Fails on anything else or content that does not
+	// decode.
+	internal def decodeWorktreeEncoding(data byte[], name string, path string) !byte[] {
+		let enc = normalizeEncoding(name)
+		return data when enc == "UTF-8"
+		switch enc {
+			case "UTF-16", "UTF-16LE", "UTF-16BE", "UTF-16LE-BOM":
+				let bom = data.len() >= 2 && ((data[0] == 0xFF && data[1] == 0xFE) || (data[0] == 0xFE && data[1] == 0xFF))
+				fail "git: BOM is required in '{path}' if encoded as {name}" when enc == "UTF-16" && !bom
+				fail "git: BOM is prohibited in '{path}' if encoded as {name}" when (enc := "UTF-16LE" || "UTF-16BE") && bom
+				let endian = enc == "UTF-16BE" ?? (bytes.Endian.Big, bytes.Endian.Little)
+				return data.utf16(endian).bytes()
+			case "UTF-32", "UTF-32LE", "UTF-32BE":
+				let bom = data.len() >= 4 && ((data[0] == 0xFF && data[1] == 0xFE && data[2] == 0 && data[3] == 0) || (data[0] == 0 && data[1] == 0 && data[2] == 0xFE && data[3] == 0xFF))
+				fail "git: BOM is required in '{path}' if encoded as {name}" when enc == "UTF-32" && !bom
+				fail "git: BOM is prohibited in '{path}' if encoded as {name}" when enc != "UTF-32" && bom
+				return try utf32ToUtf8(data, enc)
+			case "SHIFT_JIS", "SHIFT-JIS", "SJIS", "CP932", "WINDOWS-31J":
+				return shiftjis.decode(data).bytes()
+		}
+		let page = codepages.forCharset(name)
+		fail "git: working-tree-encoding '{name}' of '{path}' is not supported" when page is none
+		return codepages.decode(data, page).bytes()
+	}
+
+	// UTF-8 content in the working-tree encoding (UTF-16 and UTF-32 with a
+	// big-endian byte-order mark, as iconv writes them). Fails when the
+	// encoding is not supported or a character has no form in it.
+	internal def encodeWorktreeEncoding(data byte[], name string, path string) !byte[] {
+		let enc = normalizeEncoding(name)
+		return data when enc == "UTF-8"
+		let text = string(data)
+		switch enc {
+			case "UTF-16", "UTF-16BE":
+				let out byte[] = enc == "UTF-16" ?? (byte[0xFE, 0xFF], byte[])
+				return out + utf16Bytes(text, true)
+			case "UTF-16LE":
+				return utf16Bytes(text, false)
+			case "UTF-16LE-BOM":
+				return byte[0xFF, 0xFE] + utf16Bytes(text, false)
+			case "UTF-32", "UTF-32BE", "UTF-32LE":
+				let big = enc != "UTF-32LE"
+				let out byte[] = enc == "UTF-32" ?? (byte[0, 0, 0xFE, 0xFF], byte[])
+				for let c in text {
+					let v = int(c)
+					if big {
+						out.push(byte(v >> 24), byte((v >> 16) & 0xFF), byte((v >> 8) & 0xFF), byte(v & 0xFF))
+					} else {
+						out.push(byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte(v >> 24))
+					}
+				}
+				return out
+			case "SHIFT_JIS", "SHIFT-JIS", "SJIS", "CP932", "WINDOWS-31J":
+				return try shiftjis.encode(text)
+		}
+		let page = codepages.forCharset(name)
+		fail "git: working-tree-encoding '{name}' of '{path}' is not supported" when page is none
+		return try codepages.encode(text, page)
+	}
+
+	internal def utf16Bytes(text string, big bool) byte[] {
+		let out byte[] = []
+		for let c in text {
+			let v = int(c)
+			let units int[] = []
+			if v >= 0x10000 {
+				let w = v - 0x10000
+				units.push(0xD800 | (w >> 10), 0xDC00 | (w & 0x3FF))
+			} else {
+				units.push(v)
+			}
+			for let u in units {
+				if big {
+					out.push(byte(u >> 8), byte(u & 0xFF))
+				} else {
+					out.push(byte(u & 0xFF), byte(u >> 8))
+				}
+			}
+		}
+		return out
+	}
+
+	internal def utf32ToUtf8(data byte[], enc string) !byte[] {
+		let big = enc == "UTF-32BE"
+		let start = 0
+		if enc == "UTF-32" {
+			big = data[0] == 0
+			start = 4
+		}
+		fail "git: UTF-32 content is not a whole number of characters" unless (data.len() - start) % 4 == 0
+		let out byte[] = []
+		for let i = start; i < data.len(); i += 4 {
+			let v = big ?? ((int(data[i]) << 24) | (int(data[i + 1]) << 16) | (int(data[i + 2]) << 8) | int(data[i + 3]), (int(data[i + 3]) << 24) | (int(data[i + 2]) << 16) | (int(data[i + 1]) << 8) | int(data[i]))
+			fail "git: invalid UTF-32 character" when v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)
+			out.append(char(v))
+		}
+		return out
+	}
+
+	// ---- filter drivers -------------------------------------------------------------
+
+	// Runs the filter driver's clean or smudge on content: its long-running
+	// `process` when configured, else its one-shot command through the
+	// shell with `%f` as the path. A driver without the command passes the
+	// content through. Fails when the driver fails and
+	// filter.<driver>.required is set.
+	internal def runFilter(repo Repository, driver string, which string, path string, data byte[]) !byte[] {
+		let required = repo.config.getBool("filter.{driver}.required", false) onerror recover false
+		let processCmd = repo.config.get("filter.{driver}.process", "")
+		let failure ?error = none
+		if processCmd != "" {
+			let out = filterProcess(repo, driver, processCmd, which, path, data) onerror (err error) {
+				failure = err
+				recover byte[]
+			}
+			return out when failure is none
+			fail failure when required
+			return data
+		}
+		let command = repo.config.get("filter.{driver}.{which}", "")
+		if command == "" {
+			fail "git: {path}: {which} filter '{driver}' is required but not configured" when required
+			return data
+		}
+		let cmd = command.replace("%f", shellQuote(path))
+		let out = runShellFilter(repo, cmd, data) onerror (err error) {
+			failure = err
+			recover byte[]
+		}
+		return out when failure is none
+		fail "git: {path}: {which} filter '{driver}' failed: {failure.message}" when required
+		return data
+	}
+
+	// A single-quoted shell word.
+	internal def shellQuote(text string) string {
+		return "'" + text.replace("'", "'\\''") + "'"
+	}
+
+	// Runs `sh -c command` in the working tree with data on its standard
+	// input and returns its standard output. Fails when it exits with a
+	// status other than 0.
+	internal def runShellFilter(repo Repository, command string, data byte[]) !byte[] {
+		let dir = repo.workDir == "" ?? (repo.gitDir, repo.workDir)
+		let p = try Runtime.start("sh", ["-c", command], {}, dir)
+		// Writing and reading at once: a filter may produce output before it
+		// has read all its input.
+		let writer = async feedInput(p, data)
+		let out byte[] = []
+		let buf byte[]
+		buf.len(65536)
+		for {
+			let n = try p.output.read(buf)
+			break when n == 0
+			out.push(...buf[0:n])
+		}
+		await writer
+		let code = try p.wait()
+		fail "exit status {code}" unless code == 0
+		return out
+	}
+
+	// Writes the data to the process's input and closes it; a process that
+	// stops reading early is not an error here (its exit status is).
+	internal def feedInput(p os.Process, data byte[]) {
+		p.input.write(data) onerror recover 0
+		p.input.close() onerror recover none
+	}
+
+	// One long-running filter process and the capabilities it announced.
+	internal type FilterProcess {
+		process      os.Process
+		reader       PktReader
+		capabilities string[]
+
+		def new(process os.Process, reader PktReader, capabilities string[]) {
+			self.process = process
+			self.reader = reader
+			self.capabilities = capabilities
+		}
+	}
+
+	// Sends content through the driver's long-running process (git's filter
+	// protocol, version 2), starting it the first time. Fails when the
+	// process cannot be started, does not speak the protocol, or reports an
+	// error for the file.
+	internal def filterProcess(repo Repository, driver string, command string, which string, path string, data byte[]) !byte[] {
+		let fp ?FilterProcess = repo.filters.get(driver)
+		if fp is none {
+			let dir = repo.workDir == "" ?? (repo.gitDir, repo.workDir)
+			let p = try Runtime.start("sh", ["-c", command], {}, dir)
+			let r = new PktReader(p.output)
+			try p.input.write(try pktLine("git-filter-client"))
+			try p.input.write(try pktLine("version=2"))
+			try p.input.write(pktFlush.bytes())
+			let hello = try r.section()
+			fail "git: filter process '{driver}' does not speak the filter protocol" unless hello.len() >= 1 && pktText(hello[0]) == "git-filter-server"
+			fail "git: filter process '{driver}' does not support version 2" unless hello.filter(h => pktText(h) == "version=2").len() == 1
+			try p.input.write(try pktLine("capability=clean"))
+			try p.input.write(try pktLine("capability=smudge"))
+			try p.input.write(pktFlush.bytes())
+			let caps string[] = []
+			for let c in try r.section() {
+				let t = pktText(c)
+				caps.push(t.slice(11)) when t.startsWith("capability=")
+			}
+			repo.filters[driver] = new FilterProcess(p, r, caps)
+		}
+		let f = repo.filters[driver]
+		return data unless f.capabilities.includes(which)
+		let w = f.process.input
+		try w.write(try pktLine("command={which}"))
+		try w.write(try pktLine("pathname={path}"))
+		try w.write(pktFlush.bytes())
+		let at = 0
+		for at < data.len() {
+			let end = at + (maxPktLine - 4) < data.len() ?? (at + (maxPktLine - 4), data.len())
+			try w.write(try pktLine(data[at:end]))
+			at = end
+		}
+		try w.write(pktFlush.bytes())
+		let status = filterStatus(try f.reader.section(), "success")
+		fail "git: filter process '{driver}' failed on {path}: {status}" unless status == "success"
+		let out byte[] = []
+		for {
+			let p = try f.reader.read()
+			break when p.kind == PktKind.Flush
+			out.push(...p.data)
+		}
+		// A status after the content: an empty list keeps the first.
+		let final = filterStatus(try f.reader.section(), status)
+		fail "git: filter process '{driver}' failed on {path}: {final}" unless final == "success"
+		return out
+	}
+
+	internal def filterStatus(lines Pkt[], fallback string) string {
+		for let l in lines {
+			let t = pktText(l)
+			return t.slice(7) when t.startsWith("status=")
+		}
+		return fallback
+	}
+
+	internal def indexOrNone(repo Repository) ?Index {
+		return tryIndex(repo) onerror recover none
+	}
+
+	internal def tryIndex(repo Repository) !?Index {
+		return try repo.index()
+	}
+
+	// ---- files of the working tree ------------------------------------------------
+
+	// The content git would store for a file of the working tree: a
+	// symbolic link's target, or the file through the clean conversions.
+	// Fails when the file cannot be read.
+	def worktreeContent(repo Repository, path string, index ?Index = none) !byte[] {
+		fail "git: the repository is bare" when repo.workDir == ""
+		let full = os.join(repo.workDir, path)
+		let info = try os.stat(full, false)
+		if (int(info.mode) & int(os.FileMode.Symlink)) != 0 {
+			return (try os.readLink(full)).bytes()
+		}
+		let data = try os.readFile(full)
+		let idx = index
+		if idx is none {
+			idx = indexOrNone(repo)
+		}
+		let indexed ?ObjectId = none
+		if !(idx is none) {
+			let e = idx.entry(path)
+			indexed = e is none ?? (none, e.id)
+		}
+		return try toGit(repo, path, data, indexed)
+	}
+}

@@ -1,0 +1,344 @@
+partial module adm.dev.git {
+	// How a conflict is written (merge.conflictStyle).
+	enum ConflictStyle {
+		// `<<<<<<<` ours `=======` theirs `>>>>>>>`.
+		Merge,
+		// Also the base, after `|||||||`.
+		Diff3,
+		// diff3 with the lines both sides agree on moved out of the
+		// conflict.
+		ZealousDiff3
+	}
+
+	// Which side a conflicting hunk takes instead of conflict markers.
+	enum MergeFavor {
+		None,
+		Ours,
+		Theirs,
+		// Both sides, ours first.
+		Union
+	}
+
+	// Options for merging file content.
+	struct TextMergeOptions {
+		style      ConflictStyle = ConflictStyle.Merge
+		favor      MergeFavor    = MergeFavor.None
+		// Characters in a conflict marker.
+		markerSize int           = 7
+		// The names after the markers.
+		ours       string        = "ours"
+		theirs     string        = "theirs"
+		base       string        = "base"
+		// The diffs both sides are taken with (merges use histogram).
+		diff       DiffOptions   = DiffOptions{algorithm: DiffAlgorithm.Histogram, indentHeuristic: false}
+	}
+
+	// One region of a merge: 0 conflict, 1 side one's change, 2 side two's,
+	// 3 both, 4 identical changes found while refining.
+	internal type MergeHunk {
+		mode int
+		i0   int
+		chg0 int
+		i1   int
+		chg1 int
+		i2   int
+		chg2 int
+
+		def new(mode int, i0 int, chg0 int, i1 int, chg1 int, i2 int, chg2 int) {
+			self.mode = mode
+			self.i0 = i0
+			self.chg0 = chg0
+			self.i1 = i1
+			self.chg1 = chg1
+			self.i2 = i2
+			self.chg2 = chg2
+		}
+	}
+
+	// Adds a region, joining it with the previous one when they touch (a
+	// joined region of different kinds is a conflict).
+	internal def appendMergeHunk(list MergeHunk[], mode int, i0 int, chg0 int, i1 int, chg1 int, i2 int, chg2 int) {
+		if list.len() > 0 {
+			let m = list[list.len() - 1]
+			if i1 <= m.i1 + m.chg1 || i2 <= m.i2 + m.chg2 {
+				m.mode = 0 when mode != m.mode
+				m.chg0 = i0 + chg0 - m.i0
+				m.chg1 = i1 + chg1 - m.i1
+				m.chg2 = i2 + chg2 - m.i2
+				return
+			}
+		}
+		list.push(new MergeHunk(mode, i0, chg0, i1, chg1, i2, chg2))
+	}
+
+	// The result of a content merge: the merged text, with markers where
+	// it conflicts, and how many conflicts there are.
+	struct TextMerge {
+		data      byte[]
+		conflicts int
+	}
+
+	// Merges two changed versions of a text with their common base, as git
+	// does (xdiff's zealous merge): changes on one side are taken, equal
+	// changes once, and overlapping different changes become conflicts,
+	// narrowed to the lines that really differ. Lines that end in CRLF
+	// get markers that end in CRLF.
+	def mergeText(base byte[], ours byte[], theirs byte[], options TextMergeOptions = TextMergeOptions{}) TextMerge {
+		let b = splitLines(base)
+		let o = splitLines(ours)
+		let t = splitLines(theirs)
+		let d1 = scriptOf(b, o, options.diff)
+		let d2 = scriptOf(b, t, options.diff)
+		if d1.len() == 0 {
+			return TextMerge{data: theirs, conflicts: 0}
+		}
+		if d2.len() == 0 {
+			return TextMerge{data: ours, conflicts: 0}
+		}
+		let diff3 = options.style != ConflictStyle.Merge
+		let list MergeHunk[] = []
+		let x = 0
+		let y = 0
+		for x < d1.len() && y < d2.len() {
+			let s1 = d1[x]
+			let s2 = d2[y]
+			if s1.oldStart + s1.oldCount < s2.oldStart {
+				appendMergeHunk(list, 1, s1.oldStart, s1.oldCount, s1.newStart, s1.newCount, s2.newStart - s2.oldStart + s1.oldStart, s1.oldCount)
+				x++
+				continue
+			}
+			if s2.oldStart + s2.oldCount < s1.oldStart {
+				appendMergeHunk(list, 2, s2.oldStart, s2.oldCount, s1.newStart - s1.oldStart + s2.oldStart, s2.oldCount, s2.newStart, s2.newCount)
+				y++
+				continue
+			}
+			let identical = s1.oldStart == s2.oldStart && s1.oldCount == s2.oldCount && s1.newCount == s2.newCount && sameLines(o, s1.newStart, t, s2.newStart, s1.newCount, options.diff)
+			if !identical {
+				let off = s1.oldStart - s2.oldStart
+				let ffo = off + s1.oldCount - s2.oldCount
+				let i0 = s1.oldStart
+				let i1 = s1.newStart
+				let i2 = s2.newStart
+				if off > 0 {
+					i0 -= off
+					i1 -= off
+				} else {
+					i2 += off
+				}
+				let chg0 = s1.oldStart + s1.oldCount - i0
+				let chg1 = s1.newStart + s1.newCount - i1
+				let chg2 = s2.newStart + s2.newCount - i2
+				if ffo < 0 {
+					chg0 -= ffo
+					chg1 -= ffo
+				} else {
+					chg2 += ffo
+				}
+				appendMergeHunk(list, 0, i0, chg0, i1, chg1, i2, chg2)
+			}
+			let end1 = s1.oldStart + s1.oldCount
+			let end2 = s2.oldStart + s2.oldCount
+			y++ when end1 >= end2
+			x++ when end2 >= end1
+		}
+		for x < d1.len() {
+			let s1 = d1[x]
+			appendMergeHunk(list, 1, s1.oldStart, s1.oldCount, s1.newStart, s1.newCount, s1.oldStart + t.len() - b.len(), s1.oldCount)
+			x++
+		}
+		for y < d2.len() {
+			let s2 = d2[y]
+			appendMergeHunk(list, 2, s2.oldStart, s2.oldCount, s2.oldStart + o.len() - b.len(), s2.oldCount, s2.newStart, s2.newCount)
+			y++
+		}
+		if options.style == ConflictStyle.ZealousDiff3 {
+			refineZdiff3(list, o, t, options.diff)
+		} else if !diff3 {
+			list = refineConflicts(list, o, t, options.diff)
+			list = simplifyNonConflicts(list)
+		}
+		return fillMerge(list, b, o, t, options)
+	}
+
+	// The edit script from a to b, as xdiff builds it for merges.
+	internal def scriptOf(a byte[][], b byte[][], options DiffOptions) Edit[] {
+		let d = prepareDiff(a, b, options)
+		runDiff(d, options)
+		compact(d, true, options)
+		compact(d, false, options)
+		return buildEdits(d)
+	}
+
+	internal def sameLines(a byte[][], ai int, b byte[][], bi int, count int, options DiffOptions) bool {
+		for let k = 0; k < count; k++ {
+			return false unless comparable(a[ai + k], options).hex() == comparable(b[bi + k], options).hex()
+		}
+		return true
+	}
+
+	// Drops the lines both sides share at the start and end of each
+	// conflict (zdiff3).
+	internal def refineZdiff3(list MergeHunk[], o byte[][], t byte[][], options DiffOptions) {
+		for let m in list {
+			continue unless m.mode == 0
+			for m.chg1 > 0 && m.chg2 > 0 && sameLines(o, m.i1, t, m.i2, 1, options) {
+				m.chg1--
+				m.chg2--
+				m.i1++
+				m.i2++
+			}
+			for m.chg1 > 0 && m.chg2 > 0 && sameLines(o, m.i1 + m.chg1 - 1, t, m.i2 + m.chg2 - 1, 1, options) {
+				m.chg1--
+				m.chg2--
+			}
+		}
+	}
+
+	// Splits each conflict into the parts where the two sides really
+	// differ, by diffing one side's lines against the other's; a conflict
+	// whose sides turn out equal is no conflict (mode 4).
+	internal def refineConflicts(list MergeHunk[], o byte[][], t byte[][], options DiffOptions) MergeHunk[] {
+		let out MergeHunk[] = []
+		for let m in list {
+			if m.mode != 0 || m.chg1 == 0 || m.chg2 == 0 {
+				out.push(m)
+				continue
+			}
+			let a = o.slice(m.i1, m.chg1)
+			let c = t.slice(m.i2, m.chg2)
+			let edits = scriptOf(a, c, options)
+			if edits.len() == 0 {
+				m.mode = 4
+				out.push(m)
+				continue
+			}
+			for let e in edits {
+				out.push(new MergeHunk(0, m.i0, m.chg0, m.i1 + e.oldStart, e.oldCount, m.i2 + e.newStart, e.newCount))
+			}
+		}
+		return out
+	}
+
+	// Joins conflicts with fewer than four unchanged lines between them, as
+	// it takes no more lines to show them as one.
+	internal def simplifyNonConflicts(list MergeHunk[]) MergeHunk[] {
+		let out MergeHunk[] = []
+		for let m in list {
+			if out.len() > 0 {
+				let prev = out[out.len() - 1]
+				let gapStart = prev.i1 + prev.chg1
+				let end = m.i1
+				if prev.mode == 0 && m.mode == 0 && end - gapStart <= 3 {
+					prev.chg1 = m.i1 + m.chg1 - prev.i1
+					prev.chg2 = m.i2 + m.chg2 - prev.i2
+					continue
+				}
+			}
+			out.push(m)
+		}
+		return out
+	}
+
+	// Whether line i of a file ends in CRLF; -1 when it cannot tell.
+	internal def eolCrlf(lines byte[][], i int) int {
+		return -1 when lines.len() == 0
+		if i < lines.len() - 1 {
+			let l = lines[i]
+			return l.len() > 1 && l[l.len() - 2] == 0x0D ?? (1, 0)
+		}
+		let last = lines[i]
+		if last.len() > 0 && last[last.len() - 1] == 0x0A {
+			return last.len() > 1 && last[last.len() - 2] == 0x0D ?? (1, 0)
+		}
+		return -1 when i == 0
+		let prev = lines[i - 1]
+		return prev.len() > 1 && prev[prev.len() - 2] == 0x0D ?? (1, 0)
+	}
+
+	// Whether conflict markers end in CRLF: when both sides' preceding (or
+	// first) lines do and the base's first line does.
+	internal def crNeeded(b byte[][], o byte[][], t byte[][], m MergeHunk) bool {
+		let n = eolCrlf(o, m.i1 > 0 ?? (m.i1 - 1, 0))
+		if n > 0 {
+			n = eolCrlf(t, m.i2 > 0 ?? (m.i2 - 1, 0))
+		}
+		if n > 0 {
+			n = eolCrlf(b, 0)
+		}
+		return n > 0
+	}
+
+	// Appends lines, a newline added after the last when it has none and
+	// `addNewline`.
+	internal def copyLines(out byte[], lines byte[][], from int, count int, needsCr bool, addNewline bool) {
+		return when count < 1
+		for let k = from; k < from + count; k++ {
+			out.push(...lines[k])
+		}
+		if addNewline {
+			let last = lines[from + count - 1]
+			if last.len() == 0 || last[last.len() - 1] != 0x0A {
+				out.push(0x0D) when needsCr
+				out.push(0x0A)
+			}
+		}
+	}
+
+	internal def marker(out byte[], c byte, size int, label string, needsCr bool) {
+		for let k = 0; k < size; k++ {
+			out.push(c)
+		}
+		if label != "" {
+			out.push(0x20)
+			out.push(...label.bytes())
+		}
+		out.push(0x0D) when needsCr
+		out.push(0x0A)
+	}
+
+	internal def fillMerge(list MergeHunk[], b byte[][], o byte[][], t byte[][], options TextMergeOptions) TextMerge {
+		let out byte[] = []
+		let conflicts = 0
+		let i = 0
+		let size = options.markerSize > 0 ?? (options.markerSize, 7)
+		let favor = 0
+		switch options.favor {
+			case MergeFavor.Ours:
+				favor = 1
+			case MergeFavor.Theirs:
+				favor = 2
+			case MergeFavor.Union:
+				favor = 3
+		}
+		for let m in list {
+			m.mode = favor when favor != 0 && m.mode == 0
+			if m.mode == 0 {
+				conflicts++
+				let cr = crNeeded(b, o, t, m)
+				copyLines(out, o, i, m.i1 - i, false, false)
+				marker(out, 0x3C, size, options.ours, cr)
+				copyLines(out, o, m.i1, m.chg1, cr, true)
+				if options.style != ConflictStyle.Merge {
+					marker(out, 0x7C, size, options.base, cr)
+					copyLines(out, b, m.i0, m.chg0, cr, true)
+				}
+				marker(out, 0x3D, size, "", cr)
+				copyLines(out, t, m.i2, m.chg2, cr, true)
+				marker(out, 0x3E, size, options.theirs, cr)
+			} else if (m.mode & 3) != 0 {
+				copyLines(out, o, i, m.i1 - i, false, false)
+				if (m.mode & 1) != 0 {
+					copyLines(out, o, m.i1, m.chg1, crNeeded(b, o, t, m), (m.mode & 2) != 0)
+				}
+				if (m.mode & 2) != 0 {
+					copyLines(out, t, m.i2, m.chg2, false, false)
+				}
+			} else {
+				continue
+			}
+			i = m.i1 + m.chg1
+		}
+		copyLines(out, o, i, o.len() - i, false, false)
+		return TextMerge{data: out, conflicts: conflicts}
+	}
+}

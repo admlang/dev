@@ -1,0 +1,580 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.data.compress.zlib
+	)
+
+	// One line of a hunk: ' ' context, '-' removed, '+' added; `eol` is
+	// false for a line followed by `\ No newline at end of file`.
+	internal struct HunkLine {
+		kind byte
+		text byte[]
+		eol  bool = true
+	}
+
+	// One hunk of a patch.
+	struct Hunk {
+		oldStart int
+		oldCount int
+		newStart int
+		newCount int
+		internal lines HunkLine[] = []
+	}
+
+	// One half of a binary patch: the content (`literal`) or a delta
+	// against the other side, inflated.
+	internal struct BinaryHalf {
+		isDelta bool
+		size    int
+		data    byte[]
+	}
+
+	// FilePatch is the change one file's part of a patch describes.
+	struct FilePatch {
+		kind       ChangeKind
+		oldPath    string
+		newPath    string
+		// 0 when the patch does not say.
+		oldMode    int = 0
+		newMode    int = 0
+		similarity int = 0
+		// The abbreviated ids of the `index` line; empty without one.
+		oldId      string = ""
+		newId      string = ""
+		hunks      Hunk[] = []
+		binary     bool = false
+		internal forward ?BinaryHalf = none
+		internal reverse ?BinaryHalf = none
+	}
+
+	// Reads a patch: git's format (`diff --git` headers with modes,
+	// renames, copies and binary patches) or a plain unified diff, with
+	// `strip` path components dropped from `--- a/x` names (1 by default,
+	// as `patch -p1`). Text before and between file patches (a mail
+	// message, a stat) is skipped. Fails on a malformed hunk.
+	def parsePatch(text string, strip int = 1) !FilePatch[] {
+		let lines = text.split("\n")
+		let out FilePatch[] = []
+		let i = 0
+		for i < lines.len() {
+			let line = lines[i]
+			if line.startsWith("diff --git ") {
+				let (fp, next) = try parseGitFilePatch(lines, i, strip)
+				out.push(fp)
+				i = next
+				continue
+			}
+			if line.startsWith("--- ") && i + 1 < lines.len() && lines[i + 1].startsWith("+++ ") {
+				let oldName = patchName(line.slice(4), strip)
+				let newName = patchName(lines[i + 1].slice(4), strip)
+				let kind = oldName == "" ?? (ChangeKind.Added, newName == "" ?? (ChangeKind.Deleted, ChangeKind.Modified))
+				let fp = FilePatch{kind: kind, oldPath: oldName == "" ?? (newName, oldName), newPath: newName == "" ?? (oldName, newName)}
+				let (hunks, next) = try parseHunks(lines, i + 2)
+				fp.hunks = hunks
+				out.push(fp)
+				i = next
+				continue
+			}
+			i++
+		}
+		return out
+	}
+
+	// A name from a `---`/`+++` line or `diff --git` header: unquoted, the
+	// timestamp after a tab dropped, `strip` components removed; empty for
+	// /dev/null.
+	internal def patchName(raw string, strip int) string {
+		let name = raw
+		let tab = name.indexOf("\t")
+		name = name.slice(0, tab) when tab >= 0
+		name = unquotePath(name.trim())
+		return "" when name == "/dev/null"
+		let parts = name.split("/")
+		return parts.slice(strip < parts.len() ?? (strip, parts.len() - 1), parts.len() - (strip < parts.len() ?? (strip, parts.len() - 1))).join("/")
+	}
+
+	// A path as git quotes it ("..." with C escapes) back to its bytes; an
+	// unquoted path as it is.
+	def unquotePath(text string) string {
+		return text unless text.startsWith("\"") && text.endsWith("\"") && text.len() >= 2
+		let b = text.bytes()
+		let out byte[] = []
+		let i = 1
+		let end = b.len() - 1
+		for i < end {
+			let c = b[i]
+			if c != 0x5C || i + 1 >= end {
+				out.push(c)
+				i++
+				continue
+			}
+			let e = b[i + 1]
+			i += 2
+			switch int(e) {
+				case 0x61:
+					out.push(0x07)
+				case 0x62:
+					out.push(0x08)
+				case 0x74:
+					out.push(0x09)
+				case 0x6E:
+					out.push(0x0A)
+				case 0x76:
+					out.push(0x0B)
+				case 0x66:
+					out.push(0x0C)
+				case 0x72:
+					out.push(0x0D)
+				default:
+					if e >= 0x30 && e <= 0x37 && i + 1 < end {
+						let v = int(e - 0x30) * 64 + int(b[i] - 0x30) * 8 + int(b[i + 1] - 0x30)
+						out.push(byte(v))
+						i += 2
+					} else {
+						out.push(e)
+					}
+			}
+		}
+		return string(out)
+	}
+
+	// The two names of a `diff --git a/x b/y` line; quoted names, and
+	// unquoted names with spaces when both are the same file.
+	internal def gitHeaderNames(rest string, strip int) (string, string) {
+		if rest.startsWith("\"") {
+			let close = 1
+			let b = rest.bytes()
+			for close < b.len() && !(b[close] == 0x22 && b[close - 1] != 0x5C) {
+				close++
+			}
+			let first = rest.slice(0, close + 1)
+			let second = rest.slice(close + 1).trim()
+			return (patchName(first, strip), patchName(second, strip))
+		}
+		// "a/x b/x": the split is where the two halves name the same path.
+		let half = (rest.len() - 1) / 2
+		if rest.len() % 2 == 1 && rest.slice(half, half + 1) == " " {
+			let x = patchName(rest.slice(0, half), strip)
+			let y = patchName(rest.slice(half + 1), strip)
+			return (x, y) when x == y
+		}
+		let sp = rest.lastIndexOf(" ")
+		return (patchName(rest.slice(0, sp), strip), patchName(rest.slice(sp + 1), strip))
+	}
+
+	internal def parseGitFilePatch(lines string[], start int, strip int) !(FilePatch, int) {
+		let (a, b) = gitHeaderNames(lines[start].slice(11), strip)
+		let fp = FilePatch{kind: ChangeKind.Modified, oldPath: a, newPath: b}
+		let i = start + 1
+		for i < lines.len() {
+			let line = lines[i]
+			break when line.startsWith("diff --git ") || line.startsWith("@@ ")
+			if line.startsWith("--- ") && i + 1 < lines.len() && lines[i + 1].startsWith("+++ ") {
+				let o = patchName(line.slice(4), strip)
+				let n = patchName(lines[i + 1].slice(4), strip)
+				fp.oldPath = o unless o == ""
+				fp.newPath = n unless n == ""
+				i += 2
+				let (hunks, next) = try parseHunks(lines, i)
+				fp.hunks = hunks
+				return (fp, next)
+			}
+			if line.startsWith("old mode ") {
+				fp.oldMode = parseOctal(line.slice(9))
+			} else if line.startsWith("new mode ") {
+				fp.newMode = parseOctal(line.slice(9))
+			} else if line.startsWith("new file mode ") {
+				fp.kind = ChangeKind.Added
+				fp.newMode = parseOctal(line.slice(14))
+			} else if line.startsWith("deleted file mode ") {
+				fp.kind = ChangeKind.Deleted
+				fp.oldMode = parseOctal(line.slice(18))
+			} else if line.startsWith("similarity index ") {
+				fp.similarity = line.slice(17).replace("%", "").toInt<int>()
+			} else if line.startsWith("rename from ") {
+				fp.kind = ChangeKind.Renamed
+				fp.oldPath = unquotePath(line.slice(12))
+			} else if line.startsWith("rename to ") {
+				fp.newPath = unquotePath(line.slice(10))
+			} else if line.startsWith("copy from ") {
+				fp.kind = ChangeKind.Copied
+				fp.oldPath = unquotePath(line.slice(10))
+			} else if line.startsWith("copy to ") {
+				fp.newPath = unquotePath(line.slice(8))
+			} else if line.startsWith("index ") {
+				let parts = line.slice(6).split(" ")
+				let ids = parts[0].split("..")
+				if ids.len() == 2 {
+					fp.oldId = ids[0]
+					fp.newId = ids[1]
+				}
+				if parts.len() > 1 {
+					let m = parseOctal(parts[1])
+					fp.oldMode = m when fp.oldMode == 0
+					fp.newMode = m when fp.newMode == 0
+				}
+			} else if line.startsWith("Binary files ") {
+				fp.binary = true
+			} else if line == "GIT binary patch" {
+				fp.binary = true
+				let (forward, after) = try parseBinaryHalf(lines, i + 1)
+				fp.forward = forward
+				i = after
+				if i < lines.len() && (lines[i].startsWith("literal ") || lines[i].startsWith("delta ")) {
+					let (reverse, after2) = try parseBinaryHalf(lines, i)
+					fp.reverse = reverse
+					i = after2
+				}
+				continue
+			}
+			i++
+		}
+		// A header with no hunks: a pure rename, mode change, or empty file.
+		fp.kind = ChangeKind.Modified when fp.kind == ChangeKind.Modified && fp.oldPath != fp.newPath
+		return (fp, i)
+	}
+
+	internal def parseOctal(text string) int {
+		let v = 0
+		for let c in text.trim().bytes() {
+			break unless c >= 0x30 && c <= 0x37
+			v = v * 8 + int(c - 0x30)
+		}
+		return v
+	}
+
+	// A `literal N` or `delta N` section and its base85 lines up to the
+	// blank line, inflated.
+	internal def parseBinaryHalf(lines string[], start int) !(BinaryHalf, int) {
+		let head = lines[start]
+		let isDelta = head.startsWith("delta ")
+		fail "git: corrupt binary patch" unless isDelta || head.startsWith("literal ")
+		let size = head.slice(isDelta ?? (6, 8)).trim().toInt<int>()
+		let body string[] = []
+		let i = start + 1
+		for i < lines.len() && lines[i] != "" {
+			body.push(lines[i])
+			i++
+		}
+		let deflated = try decodeBase85Lines(body)
+		let data = try zlib.decompress(deflated, size)
+		fail "git: binary patch has {data.len()} bytes, not {size}" unless data.len() == size
+		return (BinaryHalf{isDelta: isDelta, size: size, data: data}, i + 1)
+	}
+
+	// The hunks from `start` until the next file's header.
+	internal def parseHunks(lines string[], start int) !(Hunk[], int) {
+		let hunks Hunk[] = []
+		let i = start
+		for i < lines.len() && lines[i].startsWith("@@ ") {
+			let (h, next) = try parseHunk(lines, i)
+			hunks.push(h)
+			i = next
+		}
+		return (hunks, i)
+	}
+
+	internal def parseHunk(lines string[], start int) !(Hunk, int) {
+		let header = lines[start]
+		let close = header.indexOf(" @@", 3)
+		fail "git: malformed hunk header: {header}" when close < 0
+		let ranges = header.slice(3, close).split(" ")
+		fail "git: malformed hunk header: {header}" unless ranges.len() == 2 && ranges[0].startsWith("-") && ranges[1].startsWith("+")
+		let (os0, oc) = parseRange(ranges[0].slice(1))
+		let (ns, nc) = parseRange(ranges[1].slice(1))
+		let h = Hunk{oldStart: os0, oldCount: oc, newStart: ns, newCount: nc}
+		let oldLeft = oc
+		let newLeft = nc
+		let i = start + 1
+		for i < lines.len() && (oldLeft > 0 || newLeft > 0) {
+			let line = lines[i]
+			if line.startsWith("\\") {
+				let last = h.lines.len() - 1
+				h.lines[last] = HunkLine{...h.lines[last], eol: false} when last >= 0
+				i++
+				continue
+			}
+			let kind = line.len() == 0 ?? (byte(0x20), line.bytes()[0])
+			let textBytes = line.len() == 0 ?? (byte[], line.bytes()[1:].clone())
+			switch int(kind) {
+				case 0x20:
+					oldLeft--
+					newLeft--
+				case 0x2D:
+					oldLeft--
+				case 0x2B:
+					newLeft--
+				default:
+					fail "git: corrupt patch at line {i + 1}"
+			}
+			h.lines.push(HunkLine{kind: kind, text: textBytes})
+			i++
+		}
+		fail "git: corrupt patch: hunk at line {start + 1} is cut short" when oldLeft != 0 || newLeft != 0
+		// A no-newline marker right after the last line.
+		if i < lines.len() && lines[i].startsWith("\\") {
+			let last = h.lines.len() - 1
+			h.lines[last] = HunkLine{...h.lines[last], eol: false}
+			i++
+		}
+		return (h, i)
+	}
+
+	internal def parseRange(text string) (int, int) {
+		let comma = text.indexOf(",")
+		return (text.toInt<int>(), 1) when comma < 0
+		return (text.slice(0, comma).toInt<int>(), text.slice(comma + 1).toInt<int>())
+	}
+
+	// ---- applying -------------------------------------------------------------------
+
+	// The new content of a file from its old content and its part of a
+	// patch, as `git apply` places hunks: at the line the hunk says (after
+	// the shift of earlier hunks) or the nearest line where its context
+	// matches, searching both ways; a hunk at the start or without trailing
+	// context must match at the start or end. Fails when a hunk does not
+	// apply.
+	def applyFilePatch(old byte[], fp FilePatch) !byte[] {
+		if fp.binary {
+			let half = fp.forward
+			fail "git: cannot apply binary patch to '{fp.newPath}' without full index line" when half is none
+			return half.data unless half.isDelta
+			return try applyDelta(old, half.data)
+		}
+		let image = splitLines(old)
+		for let h in fp.hunks {
+			let pre byte[][] = []
+			let post byte[][] = []
+			let leading = 0
+			let trailing = 0
+			let seenChange = false
+			for let l in h.lines {
+				let text = l.eol ?? (l.text + byte(0x0A), l.text)
+				if l.kind == 0x20 {
+					pre.push(text)
+					post.push(text)
+					if seenChange {
+						trailing++
+					} else {
+						leading++
+					}
+				} else if l.kind == 0x2D {
+					pre.push(text)
+					seenChange = true
+					trailing = 0
+				} else {
+					post.push(text)
+					seenChange = true
+					trailing = 0
+				}
+			}
+			let matchBeginning = h.oldStart == 0 || h.oldStart == 1
+			let matchEnd = trailing == 0
+			let pos = h.newStart > 0 ?? (h.newStart - 1, 0)
+			let at = findHunk(image, pre, pos, matchBeginning, matchEnd)
+			fail "git: patch does not apply to '{fp.oldPath}' (hunk @@ -{h.oldStart},{h.oldCount} +{h.newStart},{h.newCount} @@)" when at < 0
+			let next byte[][] = image.slice(0, at).clone()
+			next.push(...post)
+			next.push(...image.slice(at + pre.len(), image.len() - at - pre.len()))
+			image = next
+		}
+		let out byte[] = []
+		for let l in image {
+			out.push(...l)
+		}
+		return out
+	}
+
+	// Where the preimage lines match the image: at `line`, then alternately
+	// one line further back and forward; -1 when nowhere.
+	internal def findHunk(image byte[][], pre byte[][], line0 int, matchBeginning bool, matchEnd bool) int {
+		let line = line0
+		if matchBeginning {
+			line = 0
+		} else if matchEnd {
+			line = image.len() - pre.len()
+		}
+		line = image.len() when line > image.len()
+		line = 0 when line < 0
+		let back = line
+		let fwd = line
+		let current = line
+		for let i = 0; ; i++ {
+			if hunkMatches(image, pre, current, matchBeginning, matchEnd) {
+				return current
+			}
+			for {
+				return -1 when back == 0 && fwd == image.len()
+				if (i & 1) != 0 {
+					if back == 0 {
+						i++
+						continue
+					}
+					back--
+					current = back
+				} else {
+					if fwd == image.len() {
+						i++
+						continue
+					}
+					fwd++
+					current = fwd
+				}
+				break
+			}
+		}
+		return -1
+	}
+
+	internal def hunkMatches(image byte[][], pre byte[][], at int, matchBeginning bool, matchEnd bool) bool {
+		return false when at + pre.len() > image.len()
+		return false when matchBeginning && at != 0
+		return false when matchEnd && at + pre.len() != image.len()
+		for let k = 0; k < pre.len(); k++ {
+			let a = image[at + k]
+			let b = pre[k]
+			return false unless a.len() == b.len()
+			for let j = 0; j < a.len(); j++ {
+				return false unless a[j] == b[j]
+			}
+		}
+		return true
+	}
+
+	// What applying a patch does to one path.
+	internal struct ApplyResult {
+		path    string
+		content byte[] = []
+		mode    int    = 0
+		deleted bool   = false
+	}
+
+	// Where `apply` writes.
+	enum ApplyTarget {
+		// The working tree only (`git apply`).
+		Worktree,
+		// The index only (`git apply --cached`).
+		Index,
+		// Both (`git apply --index`).
+		Both
+	}
+
+	// Applies a patch to the working tree, the index, or both, all files or
+	// none: every file is checked before anything is written. Fails when a
+	// file is missing or exists already as the patch says it should not,
+	// or a hunk does not apply.
+	internal def applyPatch(repo Repository, text string, target ApplyTarget, strip int) !none {
+		let patches = try parsePatch(text, strip)
+		let idx = try repo.index()
+		let useIndex = target != ApplyTarget.Worktree
+		let useTree = target != ApplyTarget.Index
+		fail "git: the repository is bare" when useTree && repo.isBare()
+		// Results first, written only when every file applied.
+		let results ApplyResult[] = []
+		for let fp in patches {
+			let oldPath = fp.oldPath
+			let old byte[] = []
+			let oldMode = fp.oldMode
+			if fp.kind != ChangeKind.Added {
+				if useIndex {
+					let e = idx.entry(oldPath)
+					fail "git: {oldPath}: does not exist in index" when e is none
+					let (_, data) = try repo.raw(e.id)
+					old = data
+					oldMode = e.mode when oldMode == 0
+				} else {
+					let full = os.join(repo.workDir, oldPath)
+					fail "git: {oldPath}: No such file or directory" unless os.exists(full) onerror recover false
+					old = try os.readFile(full)
+				}
+			} else {
+				if useIndex {
+					fail "git: {fp.newPath}: already exists in index" unless idx.entry(fp.newPath) is none
+				}
+				if useTree {
+					fail "git: {fp.newPath}: already exists in working directory" when os.exists(os.join(repo.workDir, fp.newPath)) onerror recover false
+				}
+			}
+			if fp.kind == ChangeKind.Deleted {
+				results.push(ApplyResult{path: oldPath, deleted: true})
+				continue
+			}
+			let content = try applyFilePatch(old, fp)
+			let mode = fp.newMode != 0 ?? (fp.newMode, oldMode != 0 ?? (oldMode, 0o100644))
+			if fp.kind == ChangeKind.Renamed {
+				results.push(ApplyResult{path: oldPath, deleted: true})
+			}
+			results.push(ApplyResult{path: fp.newPath, content: content, mode: mode})
+		}
+		if useIndex {
+			let lock = try acquireLock(idx.path)
+			let failure ?error = none
+			for let r in results {
+				if r.deleted {
+					idx.remove(r.path)
+					continue
+				}
+				let id = repo.write(ObjectKind.Blob, r.content) onerror (err error) {
+					failure = err
+					recover zeroId(repo.format)
+				}
+				break unless failure is none
+				idx.add(IndexEntry{path: r.path, id: id, mode: r.mode}) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			lock.write(encodeIndex(idx)) onerror (err error) {
+				lock.release()
+				fail err
+			}
+			try lock.commit()
+		}
+		if useTree {
+			for let r in results {
+				let full = os.join(repo.workDir, r.path)
+				if r.deleted {
+					os.remove(full) onerror recover none
+					removeEmptyParents(os.dir(full), repo.workDir)
+					continue
+				}
+				try writeWorktreeFile(repo, r.path, r.content, r.mode, false)
+			}
+		}
+		return none
+	}
+
+	// Writes a file of the working tree: a symbolic link for mode 120000,
+	// else the content (through the smudge conversions unless `raw`) with
+	// the executable bit for 100755. Fails when the file cannot be written.
+	internal def writeWorktreeFile(repo Repository, path string, content byte[], mode int, raw bool) !none {
+		let full = os.join(repo.workDir, path)
+		try os.mkdir(os.dir(full), true)
+		let existing = statOrNone(full, false)
+		if !(existing is none) {
+			if existing.isDir && (int(existing.mode) & int(os.FileMode.Symlink)) == 0 {
+				try os.remove(full, true)
+			} else {
+				try os.remove(full)
+			}
+		}
+		if mode == 0o120000 {
+			try os.symlink(string(content), full)
+			return none
+		}
+		let data = raw ?? (content, try toWorktree(repo, path, content))
+		try os.writeFile(full, data)
+		if mode == 0o100755 {
+			// Execute where reading is allowed, as the umask left reading.
+			let info = try os.stat(full, false)
+			let perm = int(info.mode) & 0o777
+			try os.chmod(full, int64(perm | ((perm & 0o444) >> 2)))
+		}
+		return none
+	}
+}

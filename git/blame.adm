@@ -1,0 +1,166 @@
+partial module adm.dev.git {
+	// BlameLine says which commit last changed a line of a file: the commit,
+	// the path the file had there, and the line's number there and in the
+	// file blamed (both from 1).
+	struct BlameLine {
+		commit     ObjectId
+		path       string
+		originLine int
+		line       int
+	}
+
+	// Options for `blame`.
+	struct BlameOptions {
+		// Lines `start` to `end` (from 1) only; 0 for the whole file.
+		start      int  = 0
+		end        int  = 0
+		// Follow the file through renames (on, as git blame does).
+		renames    bool = true
+		// Lines changed only in whitespace keep their older commit (`-w`).
+		whitespace Whitespace = Whitespace.Exact
+	}
+
+	// Lines of the final file still to be blamed, as one suspect holds
+	// them: for each, its number in the final file and in the suspect's
+	// version.
+	internal type Suspect {
+		commit  ObjectId
+		path    string
+		blob    ObjectId
+		time    int64
+		finals  int[] = []
+		origins int[] = []
+
+		def new(commit ObjectId, path string, blob ObjectId, time int64) {
+			self.commit = commit
+			self.path = path
+			self.blob = blob
+			self.time = time
+		}
+	}
+
+	// Who last changed each line of a file at a revision, as `git blame`
+	// finds it: lines are handed back from a commit to each parent in turn
+	// wherever the parent's version holds them unchanged, following the
+	// file when a parent has it under another name; what no parent takes
+	// is the commit's. Fails when the file is not in the revision.
+	internal def blameFile(repo Repository, path string, rev string, options BlameOptions) !BlameLine[] {
+		let start = try repo.peel(try repo.resolve(rev), ObjectKind.Commit)
+		let commit = try repo.commitAt(start)
+		let root = try repo.tree(commit.tree)
+		let entry = try root.find(path)
+		fail "git: no such path '{path}' in {rev}" when entry is none
+		let (_, data) = try repo.raw(entry.id)
+		let total = splitLines(data).len()
+		let first = options.start > 0 ?? (options.start, 1)
+		let last = options.end > 0 ?? (options.end, total)
+		fail "git: file {path} has only {total} lines" when last > total || first > last && total > 0
+		let s = new Suspect(start, path, entry.id, commit.committer.date.unixNs() / 1000000000)
+		for let l = first; l <= last; l++ {
+			s.finals.push(l)
+			s.origins.push(l)
+		}
+		let out BlameLine[] = []
+		// Suspects by commit and path, newest commit first.
+		let queue Suspect[] = [s]
+		let diffOptions = DiffOptions{whitespace: options.whitespace}
+		for queue.len() > 0 {
+			// The newest suspect; ties by queue order.
+			let best = 0
+			for let i = 1; i < queue.len(); i++ {
+				best = i when queue[i].time > queue[best].time
+			}
+			let cur = queue[best]
+			queue.remove(best)
+			let c = try repo.commitAt(cur.commit)
+			let parents = c.parents
+			let remainingFinal = cur.finals
+			let remainingOrigin = cur.origins
+			for let pid in parents {
+				break when remainingFinal.len() == 0
+				let parent = try repo.commitAt(pid)
+				let ppath = try parentPath(repo, c, parent, cur.path, options)
+				continue when ppath is none
+				let pt = try repo.tree(parent.tree)
+				let pe = try pt.find(ppath)
+				continue when pe is none
+				let ptime = parent.committer.date.unixNs() / 1000000000
+				let target = queueSuspect(queue, pid, ppath, pe.id, ptime)
+				if pe.id.equals(cur.blob) {
+					// The parent has the same content: every line goes there.
+					target.finals.push(...remainingFinal)
+					target.origins.push(...remainingOrigin)
+					remainingFinal = []
+					remainingOrigin = []
+					break
+				}
+				let (_, pdata) = try repo.raw(pe.id)
+				let (_, cdata) = try repo.raw(cur.blob)
+				let edits = diffLines(pdata, cdata, diffOptions)
+				let keptFinal int[] = []
+				let keptOrigin int[] = []
+				for let (k, o) in remainingOrigin {
+					let mapped = mapLineBack(edits, o)
+					if mapped > 0 {
+						target.finals.push(remainingFinal[k])
+						target.origins.push(mapped)
+					} else {
+						keptFinal.push(remainingFinal[k])
+						keptOrigin.push(o)
+					}
+				}
+				remainingFinal = keptFinal
+				remainingOrigin = keptOrigin
+			}
+			for let (k, f) in remainingFinal {
+				out.push(BlameLine{commit: cur.commit, path: cur.path, originLine: remainingOrigin[k], line: f})
+			}
+			queue = queue.filter(q => q.finals.len() > 0)
+		}
+		out.sort((a, b) => a.line < b.line ?? (-1, a.line > b.line ?? (1, 0)))
+		return out
+	}
+
+	// The suspect for a commit and path in the queue, made when missing.
+	internal def queueSuspect(queue Suspect[], commit ObjectId, path string, blob ObjectId, time int64) Suspect {
+		for let q in queue {
+			return q when q.commit.equals(commit) && q.path == path
+		}
+		let s = new Suspect(commit, path, blob, time)
+		queue.push(s)
+		return s
+	}
+
+	// The line of the old side an unchanged line of the new side came
+	// from (both from 1), or 0 when an edit added or changed it.
+	internal def mapLineBack(edits Edit[], line int) int {
+		let delta = 0
+		let n = line - 1
+		for let e in edits {
+			if n < e.newStart {
+				break
+			}
+			if n < e.newStart + e.newCount {
+				return 0
+			}
+			delta = (e.oldStart + e.oldCount) - (e.newStart + e.newCount)
+		}
+		return n + delta + 1
+	}
+
+	// The path the file has in a parent: the same path when the parent has
+	// it, else the path it was renamed from (whole-file rename detection);
+	// none when the file is new in the commit.
+	internal def parentPath(repo Repository, c Commit, parent Commit, path string, options BlameOptions) !?string {
+		let pt = try repo.tree(parent.tree)
+		let same = try pt.find(path)
+		return path unless same is none
+		return none unless options.renames
+		let changes = try diffTrees(repo, parent.tree, c.tree, ChangeOptions{renames: true})
+		for let ch in changes {
+			let moved = ch.kind := ChangeKind.Renamed || ChangeKind.Copied
+			return ch.oldPath when moved && ch.newPath == path
+		}
+		return none
+	}
+}

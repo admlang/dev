@@ -1,0 +1,183 @@
+// The client against git's own upload-pack and receive-pack, and git's
+// client against `git.Server`, when a git binary is given
+// (ADM_TEST_GIT_BINARY=git); skipped otherwise, since the suite never needs
+// git.
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.testing
+		std.services.runtime::(Runtime)
+	)
+
+	@env("ADM_TEST_GIT_BINARY")
+	internal const gitBinary string
+
+	// git's service programs run as child processes, as git's own `file://`
+	// transport runs them.
+	internal type GitProcessWire {
+		internal dir     string
+		internal home    string
+		internal process ?os.Process = none
+		internal reader  ?PktReader  = none
+
+		def new(dir string, home string) {
+			self.dir = dir
+			self.home = home
+		}
+
+		def advertise(program string, version int) !PktReader {
+			let env map<string, string> = {"HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "PATH": envOr("PATH")}
+			env["GIT_PROTOCOL"] = "version={version}" when version != 0
+			let p = try Runtime.start(gitBinary, [program.slice(4), dir], env)
+			process = p
+			let r = new PktReader(p.output)
+			reader = r
+			return r
+		}
+
+		def request(program string, body io.Reader) !PktReader {
+			let p = process
+			let r = reader
+			fail "not started" when p is none || r is none
+			let _ = try io.copy(body, p.input)
+			return r
+		}
+
+		def stateless() bool {
+			return false
+		}
+
+		def close() {
+			let p = process
+			if !(p is none) {
+				p.input.close() onerror recover none
+				p.wait() onerror recover 0
+			}
+		}
+	}
+
+	// Runs git with an isolated configuration; fails with its output when
+	// it exits with an error.
+	internal def runGit(home string, dir string, args string[]) !string {
+		let env map<string, string> = {"HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "PATH": envOr("PATH"), "GIT_TERMINAL_PROMPT": "0"}
+		let p = try Runtime.start(gitBinary, ["-C", dir] + args, env, errors = true)
+		try p.input.close()
+		let out = string(try io.readAll(p.output))
+		let errs = p.errors
+		let errText = errs is none ?? ("", string(try io.readAll(errs)))
+		let code = try p.wait()
+		fail "git {args.join(" ")} exited {code}: {errText}{out}" unless code == 0
+		return out
+	}
+
+	internal def envOr(name string) string {
+		let v = Runtime.getEnv(name)
+		return v is none ?? ("", v)
+	}
+
+	// A session against git's own service program for a folder.
+	internal def gitProcessSession(dir string, home string, program string, version int) !RemoteSession {
+		let session = new RemoteSession(new GitProcessWire(dir, home), program, RemoteOptions{protocol: version})
+		try session.open()
+		return session
+	}
+
+	check "Interoperability" {
+		@test()
+		def fetchesFromGit() !none {
+			return none when gitBinary == ""
+			let home = try scratch("interop-home")
+			let (src, ids) = try servedRepo("interop-src")
+			let _ = try runGit(home, src.gitDir, ["config", "uploadpack.allowFilter", "true"])
+			let branch = try src.branch()
+			for let v in protocols {
+				// A full clone, by hand: the refs, the pack, the result checked
+				// by git.
+				let repo = try init(try scratch("interop-fetch-v{v}"), InitOptions{bare: true})
+				let session = try gitProcessSession(src.gitDir, home, "git-upload-pack", v)
+				let refs = try session.lsRefs([])
+				fail "v{v}: {refs.len()} refs" unless refs.filter(r => r.name == "refs/heads/{branch}").len() == 1
+				let outcome = try fetchPack(session, repo, FetchRequest{wants: [ids[1], ids[0]], noHaves: true})
+				session.close()
+				fail "v{v}: no pack" when outcome.pack is none
+				let sent = try objectsToPack(src, [ids[1]], [])
+				try sameObjects(src, repo, sent.mapElem(it => it.id))
+				try repo.setRef("refs/heads/{branch}", ids[1])
+				// Negotiation: a new commit on top, fetched against what we have.
+				let next = try addCommit(src, branch, ids[1], "From git v{v}")
+				let again = try gitProcessSession(src.gitDir, home, "git-upload-pack", v)
+				let incremental = try fetchPack(again, repo, FetchRequest{wants: [next]})
+				again.close()
+				fail "v{v}: nothing fetched" when incremental.pack is none
+				fail "v{v}: next missing" unless repo.has(next)
+				try repo.setRef("refs/heads/{branch}", next)
+				let _ = try runGit(home, repo.gitDir, ["fsck", "--strict"])
+				// Shallow and filtered.
+				let shallow = try init(try scratch("interop-shallow-v{v}"), InitOptions{bare: true})
+				let s3 = try gitProcessSession(src.gitDir, home, "git-upload-pack", v)
+				let deep = try fetchPack(s3, shallow, FetchRequest{wants: [next], depth: 1, filter: "blob:none", noHaves: true})
+				s3.close()
+				fail "v{v}: shallow boundary {deep.shallow}" unless deep.shallow.len() == 1 && deep.shallow[0] == next.str()
+				try applyShallowUpdate(shallow, deep)
+				fail "v{v}: parent fetched" when shallow.has(ids[1])
+				try src.setRef("refs/heads/{branch}", ids[1])
+			}
+			return none
+		}
+
+		@test()
+		def pushesToGit() !none {
+			return none when gitBinary == ""
+			let home = try scratch("interop-push-home")
+			let (src, ids) = try servedRepo("interop-push-src")
+			for let v in protocols {
+				let target = try scratch("interop-target-v{v}")
+				let _ = try runGit(home, target, ["init", "-q", "--bare"])
+				let session = try gitProcessSession(target, home, "git-receive-pack", v)
+				let result = try doPush(src, session, RemoteConfig{name: "", url: target, pushUrl: target}, [try parseRefspec("refs/heads/topic:refs/heads/topic"), try parseRefspec("refs/tags/v1:refs/tags/v1")], PushOptions{})
+				session.wire.close()
+				fail "v{v}: push not made: {result.changes.mapElem(c => c.reason).join(", ")}" unless result.changes.filter(c => c.kind == RefChangeKind.Created).len() == 2
+				let out = try runGit(home, target, ["rev-parse", "refs/heads/topic"])
+				fail "v{v}: git sees topic at {out}" unless out.trim() == ids[0].str()
+				let _ = try runGit(home, target, ["fsck", "--strict"])
+			}
+			return none
+		}
+
+		@test()
+		def servesGit() !none {
+			return none when gitBinary == ""
+			let home = try scratch("interop-serve-home")
+			let (src, ids) = try servedRepo("interop-serve-src")
+			let ts = try gitHttpServer(src.gitDir)
+			let branch = try src.branch()
+			for let v in protocols {
+				let dir = try scratch("interop-serve-v{v}")
+				let url = ts.url + "/repo.git"
+				let _ = try runGit(home, dir, ["-c", "protocol.version={v}", "clone", "-q", url, "clone"])
+				let clone = os.join(dir, "clone")
+				let head = try runGit(home, clone, ["rev-parse", "HEAD"])
+				fail "v{v}: git cloned HEAD {head}" unless head.trim() == ids[1].str()
+				let _ = try runGit(home, clone, ["fsck", "--strict"])
+				let _ = try runGit(home, dir, ["-c", "protocol.version={v}", "clone", "-q", "--depth", "1", url, "shallow"])
+				let count = try runGit(home, os.join(dir, "shallow"), ["rev-list", "--count", "HEAD"])
+				fail "v{v}: shallow clone has {count} commits" unless count.trim() == "1"
+				let _ = try runGit(home, dir, ["-c", "protocol.version={v}", "clone", "-q", "--filter=blob:none", url, "partial"])
+				let _ = try runGit(home, os.join(dir, "partial"), ["fsck"])
+				// git pushes a commit (a thin pack) with a login.
+				let _ = try runGit(home, clone, ["-c", "user.name=Ana", "-c", "user.email=ana@example.com", "commit", "-q", "--allow-empty", "-m", "From git v{v}"])
+				let authUrl = url.replace("http://", "http://ana:secret@")
+				let _ = try runGit(home, clone, ["-c", "protocol.version={v}", "push", "-q", authUrl, "HEAD:refs/heads/{branch}"])
+				let pushed = try runGit(home, clone, ["rev-parse", "HEAD"])
+				fail "v{v}: push not served" unless (try src.resolve(branch)).str() == pushed.trim()
+				// And fetches it back after the server moved.
+				try src.setRef("refs/heads/{branch}", ids[1])
+				let _ = try runGit(home, clone, ["-c", "protocol.version={v}", "fetch", "-q", url])
+				let _ = try runGit(home, clone, ["fsck", "--strict"])
+			}
+			try ts.close()
+			return none
+		}
+	}
+}

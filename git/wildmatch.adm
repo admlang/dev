@@ -1,0 +1,234 @@
+partial module adm.dev.git {
+	// Whether `text` matches the glob `pattern` as git matches ignore rules,
+	// attributes, pathspecs and conditional includes: `?` and `*` match
+	// within one path component, `[...]` a character (with ranges, `!` or
+	// `^` to negate and `[:alpha:]`-style classes), `\` quotes the next
+	// character, and `**` between slashes (`**/x`, `x/**`, `a/**/b`) matches
+	// across components. With `pathname` off, `*` and `?` match `/` too.
+	// With `caseFold` letters match either case.
+	def wildmatch(pattern string, text string, pathname bool = true, caseFold bool = false) bool {
+		let m = new WildMatcher(pattern.bytes(), text.bytes(), pathname, caseFold)
+		return m.matchFrom(0, 0) == wildMatched
+	}
+
+	internal const (
+		wildMatched   = 0
+		wildNoMatch   = 1
+		// The rest of the text can never match: stop trying other splits.
+		wildAbortAll  = 2
+		// No later split of a `*` can match past the next `/`.
+		wildAbortStar = 3
+	)
+
+	internal type WildMatcher {
+		p        byte[]
+		t        byte[]
+		pathname bool
+		fold     bool
+
+		def new(p byte[], t byte[], pathname bool, fold bool) {
+			self.p = p
+			self.t = t
+			self.pathname = pathname
+			self.fold = fold
+		}
+
+		def lower(c byte) byte {
+			return c + 32 when fold && c >= 0x41 && c <= 0x5A
+			return c
+		}
+
+		def matchFrom(pi0 int, ti0 int) int {
+			let pi = pi0
+			let ti = ti0
+			let pn = p.len()
+			let tn = t.len()
+			for pi < pn {
+				let c = p[pi]
+				if ti >= tn && c != 0x2A {
+					return wildAbortAll
+				}
+				switch int(c) {
+					case 0x3F:
+						// ?
+						return wildNoMatch when pathname && t[ti] == 0x2F
+						pi++
+						ti++
+						continue
+					case 0x5C:
+						// \ quotes the next character
+						pi++
+						return wildAbortAll when pi >= pn
+						return wildNoMatch when lower(p[pi]) != lower(t[ti])
+						pi++
+						ti++
+						continue
+					case 0x5B:
+						let (ok, next) = matchClass(pi, t[ti])
+						return wildAbortAll when next < 0
+						return wildNoMatch unless ok
+						pi = next
+						ti++
+						continue
+					case 0x2A:
+						return matchStar(pi, ti)
+				}
+				return wildNoMatch when lower(c) != lower(t[ti])
+				pi++
+				ti++
+			}
+			return ti == tn ?? (wildMatched, wildNoMatch)
+		}
+
+		// A run of `*` at pi against the text from ti.
+		def matchStar(pi0 int, ti int) int {
+			let pi = pi0
+			let pn = p.len()
+			let tn = t.len()
+			let stars = 0
+			for pi < pn && p[pi] == 0x2A {
+				pi++
+				stars++
+			}
+			let across = !pathname
+			if pathname && stars >= 2 {
+				let before = pi0 == 0 || p[pi0 - 1] == 0x2F
+				let after = pi == pn || p[pi] == 0x2F
+				if before && after {
+					across = true
+					// `**/` also matches no component at all.
+					if pi < pn && p[pi] == 0x2F {
+						let r = matchFrom(pi + 1, ti)
+						return r when r == wildMatched
+					}
+				}
+			}
+			if pi == pn {
+				return wildMatched when across
+				// A trailing `*` matches the rest of this component only.
+				for let k = ti; k < tn; k++ {
+					return wildNoMatch when t[k] == 0x2F
+				}
+				return wildMatched
+			}
+			for let k = ti; k <= tn; k++ {
+				if across && pathname && pi < pn && p[pi] == 0x2F && p[pi - 1] == 0x2A {
+					// `**/rest`: only try positions just after a slash (or the
+					// start), so that `**/b` does not match `ab`.
+					if k > ti && t[k - 1] != 0x2F {
+						continue
+					}
+					let r = matchFrom(pi + 1, k)
+					return r when r == wildMatched
+					continue
+				}
+				let r = matchFrom(pi, k)
+				return r unless r == wildNoMatch
+				return wildAbortStar when !across && k < tn && t[k] == 0x2F
+			}
+			return wildAbortAll
+		}
+
+		// Whether the character matches the bracket expression at pi, and
+		// where the pattern goes on after it (-1 when it is unterminated).
+		def matchClass(pi0 int, c0 byte) (bool, int) {
+			let pn = p.len()
+			let c = lower(c0)
+			let pi = pi0 + 1
+			let negate = false
+			if pi < pn && (p[pi] == 0x21 || p[pi] == 0x5E) {
+				negate = true
+				pi++
+			}
+			let matched = false
+			let first = true
+			for {
+				return (false, -1) when pi >= pn
+				let ch = p[pi]
+				break when ch == 0x5D && !first
+				first = false
+				if ch == 0x5B && pi + 1 < pn && p[pi + 1] == 0x3A {
+					let end = -1
+					for let k = pi + 2; k + 1 < pn; k++ {
+						if p[k] == 0x3A && p[k + 1] == 0x5D {
+							end = k
+							break
+						}
+					}
+					if end >= 0 {
+						let name = string(p[pi + 2:end])
+						let known = classMatches(name, c0)
+						return (false, -1) when known < 0
+						matched = true when known == 1
+						pi = end + 2
+						continue
+					}
+				}
+				let lo = ch
+				if ch == 0x5C {
+					pi++
+					return (false, -1) when pi >= pn
+					lo = p[pi]
+				}
+				pi++
+				if pi + 1 < pn && p[pi] == 0x2D && p[pi + 1] != 0x5D {
+					let hi = p[pi + 1]
+					pi += 2
+					if hi == 0x5C {
+						return (false, -1) when pi >= pn
+						hi = p[pi]
+						pi++
+					}
+					if c0 >= lo && c0 <= hi {
+						matched = true
+					} else if fold {
+						let up = c0 >= 0x61 && c0 <= 0x7A ?? (c0 - 32, c0)
+						matched = true when (c >= lo && c <= hi) || (up >= lo && up <= hi)
+					}
+					continue
+				}
+				matched = true when lower(lo) == c
+			}
+			let ok = matched != negate
+			ok = false when pathname && c0 == 0x2F
+			return (ok, pi + 1)
+		}
+	}
+
+	// 1 when c is in the named class, 0 when not, -1 for a name that is not
+	// a class.
+	internal def classMatches(name string, c byte) int {
+		let alpha = (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+		let digit = c >= 0x30 && c <= 0x39
+		let r = false
+		switch name {
+			case "alnum":
+				r = alpha || digit
+			case "alpha":
+				r = alpha
+			case "blank":
+				r = c == 0x20 || c == 0x09
+			case "cntrl":
+				r = c < 0x20 || c == 0x7F
+			case "digit":
+				r = digit
+			case "graph":
+				r = c > 0x20 && c < 0x7F
+			case "lower":
+				r = c >= 0x61 && c <= 0x7A
+			case "print":
+				r = c >= 0x20 && c < 0x7F
+			case "punct":
+				r = c > 0x20 && c < 0x7F && !alpha && !digit
+			case "space":
+				r = c == 0x20 || (c >= 0x09 && c <= 0x0D)
+			case "upper":
+				r = c >= 0x41 && c <= 0x5A
+			case "xdigit":
+				r = digit || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
+			default:
+				return -1
+		}
+		return r ?? (1, 0)
+	}
+}

@@ -1,0 +1,327 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// The settings of a clone (`clone`'s parameters).
+	internal struct CloneOptions {
+		remote         RemoteOptions = RemoteOptions{}
+		// No working tree (`--bare`).
+		bare           bool          = false
+		// A bare copy of every reference, kept in step by fetch
+		// (`--mirror`).
+		mirror         bool          = false
+		// The remote's name.
+		origin         string        = "origin"
+		// The branch (or tag) to check out instead of the remote's HEAD.
+		branch         string        = ""
+		// Commits to keep from each tip (`--depth`); 0: all.
+		depth          int           = 0
+		// Commits newer than this only (`--shallow-since`).
+		shallowSince   ?time.Time    = none
+		// History reachable from these remote refs is left out
+		// (`--shallow-exclude`).
+		shallowExclude string[]      = []
+		// Fetch one branch only; none: when `depth` (or a shallow option)
+		// is set, as git does.
+		singleBranch   ?bool         = none
+		// Fetch tags (`--no-tags` clears it).
+		tags           bool          = true
+		// An object filter for a partial clone (`blob:none`, `tree:0`).
+		filter         string        = ""
+		// Check out the branch into the working tree.
+		checkout       bool          = true
+		// Clone and check out the submodules too.
+		submodules     bool          = false
+		// Reference storage of the new repository.
+		refFormat      RefFormat     = RefFormat.Files
+		// Keep the repository here and leave a `.git` file in the working
+		// tree pointing at it (`--separate-git-dir`).
+		separateGitDir string        = ""
+	}
+
+	// Clones a remote repository into `path` (an empty or missing folder):
+	// fetches its history, sets up the remote `origin`, checks out its
+	// default branch (or `branch`, a branch or a tag).
+	//
+	// `depth` keeps that many commits of each tip (`shallowSince` and
+	// `shallowExclude` cut by date and by remote reference), and implies one
+	// branch unless `singleBranch` says otherwise; `filter` makes a partial
+	// clone (`blob:none`, `blob:limit=1m`, `tree:0`) that fetches what it
+	// left out when it is read. `bare` and `mirror` make a repository with
+	// no working tree, `tags` false fetches none, `checkout` false leaves the
+	// working tree empty, `submodules` clones and checks those out too.
+	// `credentials` log in to an HTTP remote; `connection` holds the rest of
+	// what reaching it may need.
+	//
+	// Fails when the folder is not empty, the remote cannot be reached or
+	// sends something bad; nothing is left behind then.
+	def clone(url string, path string, depth int = 0, branch string = "", singleBranch ?bool = none, bare bool = false, mirror bool = false, filter string = "", tags bool = true, checkout bool = true, submodules bool = false, shallowSince ?time.Time = none, shallowExclude string[] = [], origin string = "origin", refFormat RefFormat = RefFormat.Files, separateGitDir string = "", credentials ?Credentials = none, connection RemoteOptions = RemoteOptions{}) !Repository {
+		let remote = withCredentials(connection, credentials)
+		return try cloneWithOptions(url, path, CloneOptions{remote: remote, bare: bare, mirror: mirror, origin: origin, branch: branch, depth: depth, shallowSince: shallowSince, shallowExclude: shallowExclude, singleBranch: singleBranch, tags: tags, filter: filter, checkout: checkout, submodules: submodules, refFormat: refFormat, separateGitDir: separateGitDir})
+	}
+
+	// The connection settings with `credentials` in them when given.
+	internal def withCredentials(connection RemoteOptions, credentials ?Credentials) RemoteOptions {
+		return connection when credentials is none
+		let out = RemoteOptions{...connection}
+		out.credentials = credentials
+		return out
+	}
+
+	internal def cloneWithOptions(url string, path string, options CloneOptions) !Repository {
+		if try os.exists(path) {
+			let entries = try os.readDir(path)
+			fail "git: {path} exists and is not empty" when entries.len() > 0
+		}
+		let created = !(try os.exists(path))
+		let repo = cloneInto(url, path, options) onerror (err error) {
+			// Leave nothing half-made behind: a folder this call created goes,
+			// an existing one is emptied.
+			removeTree(path, created)
+			fail err
+		}
+		return repo
+	}
+
+	// Removes what a failed clone wrote under `path` (and `path` itself when
+	// the clone created it).
+	internal def removeTree(path string, itself bool) {
+		let entries = os.readDir(path) onerror recover os.DirEntry[]
+		for let e in entries {
+			if e.info.isDir {
+				removeTree(e.path, true)
+			} else {
+				os.remove(e.path) onerror recover none
+			}
+		}
+		if itself {
+			os.remove(path) onerror recover none
+		}
+	}
+
+	internal def cloneInto(url string, path string, options CloneOptions) !Repository {
+		let session = try openSession(url, "git-upload-pack", options.remote, userConfig())
+		let result = cloneWith(session, url, path, options) onerror (err error) {
+			session.close()
+			fail err
+		}
+		session.close()
+		return result
+	}
+
+	internal def cloneWith(session RemoteSession, url string, path string, options CloneOptions) !Repository {
+		let bare = options.bare || options.mirror
+		let origin = options.origin
+		let shallow = options.depth > 0 || !(options.shallowSince is none) || options.shallowExclude.len() > 0
+		let single = options.singleBranch
+		let singleBranch = single is none ?? (shallow, single)
+		let headRefs = try session.lsRefs(["HEAD"])
+		let headTarget = ""
+		for let r in headRefs {
+			headTarget = r.target when r.name == "HEAD"
+		}
+		// The branch to set up: asked for, else the remote's HEAD.
+		let wantBranch = options.branch
+		let initial = wantBranch != "" ?? (wantBranch, headTarget.startsWith("refs/heads/") ?? (headTarget.slice(11), ""))
+		let repo = try init(path, InitOptions{bare: bare, format: session.format, refFormat: options.refFormat, separateGitDir: options.separateGitDir, initialBranch: initial == "" || !validRefName("refs/heads/" + initial) ?? ("", initial)})
+		let c = repo.config
+		let fetchSpecs string[] = []
+		let workSpecs string[] = []
+		let refsBase = "refs/remotes/{origin}/"
+		if options.mirror {
+			fetchSpecs = ["+refs/*:refs/*"]
+			workSpecs = fetchSpecs
+		} else if singleBranch {
+			// One branch: the one asked for or the remote's HEAD.
+			let b = wantBranch != "" ?? (wantBranch, initial)
+			let src = "refs/heads/{b}"
+			let tagRefs = try session.lsRefs(["refs/tags/{b}"])
+			if wantBranch != "" && tagRefs.filter(r => r.name == "refs/tags/{b}").len() > 0 {
+				workSpecs = ["+refs/tags/{b}:refs/tags/{b}"]
+			} else if bare {
+				workSpecs = ["+{src}:{src}"]
+			} else {
+				fetchSpecs = ["+{src}:{refsBase}{b}"]
+				workSpecs = fetchSpecs
+			}
+		} else if bare {
+			workSpecs = ["+refs/heads/*:refs/heads/*"]
+		} else {
+			fetchSpecs = ["+refs/heads/*:{refsBase}*"]
+			workSpecs = fetchSpecs
+		}
+		try c.set("remote.{origin}.url", url)
+		for let s in fetchSpecs {
+			try c.add("remote.{origin}.fetch", s)
+		}
+		try c.set("remote.{origin}.mirror", "true") when options.mirror
+		try c.set("remote.{origin}.tagOpt", "--no-tags") unless options.tags
+		if options.filter != "" {
+			let _ = try parseFilter(options.filter)
+			try c.set("core.repositoryformatversion", "1")
+			try c.set("remote.{origin}.promisor", "true")
+			try c.set("remote.{origin}.partialclonefilter", options.filter)
+		}
+		let tagMode = !options.tags ?? (TagMode.None, singleBranch || shallow ?? (TagMode.Follow, TagMode.All))
+		let specs Refspec[] = []
+		for let s in workSpecs {
+			specs.push(try parseRefspec(s))
+		}
+		let fetch = FetchOptions{remote: options.remote, tags: tagMode, depth: options.depth, shallowSince: options.shallowSince, shallowExclude: options.shallowExclude, filter: options.filter, writeFetchHead: false}
+		let remote = try remoteConfig(repo, origin)
+		let result = try doFetchLabeled(repo, session, remote, specs, false, [], tagMode, fetch, "clone: from {url}")
+		// HEAD and the local branch.
+		let refs = result.refs
+		let label = "clone: from {url}"
+		if bare {
+			let target = repo.refTarget(headTarget) onerror recover none
+			if headTarget != "" && !(target is none) {
+				try repo.setSymbolicRef("HEAD", headTarget, label)
+			}
+		} else {
+			try setUpCloneHead(repo, origin, initial, wantBranch, headTarget, refs, label)
+		}
+		let store = repo.refStore
+		if store is FileRefs {
+			let files FileRefs = store
+			try files.pack(id => peelOrNone(repo, id, ObjectKind.Commit))
+		}
+		installPromisorWith(repo, options.remote)
+		if !bare && options.checkout {
+			let head = try repo.headId()
+			if !(head is none) {
+				let commit = try repo.commitAt(head)
+				try prefetchTree(repo, commit.tree)
+				let _ = try switchTrees(repo, none, commit.tree, true)
+			}
+		}
+		if options.submodules && !bare {
+			try doUpdateSubmodules(repo, SubmoduleOptions{init: true, recursive: true, remote: options.remote, depth: options.depth > 0 ?? (1, 0)})
+		}
+		return repo
+	}
+
+	// Points HEAD at the cloned branch: a local branch made from its
+	// remote-tracking one, with its upstream recorded; HEAD detached at a
+	// tag's commit when a tag was asked for; `<origin>/HEAD` naming the
+	// remote's default branch. Fails when the branch asked for is not on
+	// the remote.
+	internal def setUpCloneHead(repo Repository, origin string, initial string, wantBranch string, headTarget string, refs RemoteRef[], label string) !none {
+		let who = try repo.identity("committer")
+		let zero = zeroId(repo.format)
+		if wantBranch != "" && refs.filter(r => r.name == "refs/tags/{wantBranch}").len() > 0 && refs.filter(r => r.name == "refs/heads/{wantBranch}").len() == 0 {
+			let tagId = try repo.resolve("refs/tags/{wantBranch}")
+			let commit = try repo.peel(tagId, ObjectKind.Commit)
+			try repo.refStore.commit([RefUpdate{name: "HEAD", newId: commit, message: label, deref: false}], who)
+			return none
+		}
+		if initial != "" {
+			let tracking = "refs/remotes/{origin}/{initial}"
+			let id = try repo.refTarget(tracking)
+			if id is none {
+				fail "git: remote branch {wantBranch} not found in upstream {origin}" when wantBranch != ""
+				// An empty remote: HEAD stays on its unborn branch.
+				return none
+			}
+			try repo.refStore.commit([RefUpdate{name: "HEAD", newId: id, expected: zero, message: label}], who)
+			try repo.config.set("branch.{initial}.remote", origin)
+			try repo.config.set("branch.{initial}.merge", "refs/heads/{initial}")
+		} else {
+			// The remote's HEAD is detached: so is ours, at the same commit.
+			let head = refs.filter(r => r.name == "HEAD")
+			if head.len() > 0 {
+				let id = head[0].id
+				if !(id is none) && repo.has(id) {
+					try repo.refStore.commit([RefUpdate{name: "HEAD", newId: id, message: label, deref: false}], who)
+				}
+			}
+		}
+		if headTarget.startsWith("refs/heads/") {
+			let dst = "refs/remotes/{origin}/{headTarget.slice(11)}"
+			let present = repo.refTarget(dst) onerror recover none
+			try repo.setSymbolicRef("refs/remotes/{origin}/HEAD", dst) unless present is none
+		}
+		return none
+	}
+
+	// ---- partial clones -------------------------------------------------------
+
+	// The remote a partial clone fetches missing objects from: the first
+	// remote marked `promisor`, or `extensions.partialClone`.
+	internal def promisorRemote(config Config) string {
+		for let name in config.subsections("remote") {
+			let p = config.getBool("remote.{name}.promisor", false) onerror recover false
+			return name when p
+		}
+		return config.get("extensions.partialclone", "")
+	}
+
+	// Lets the repository fetch objects its partial clone left out, when it
+	// is one, with default remote options (credential helpers).
+	internal def installPromisor(repo Repository) {
+		installPromisorWith(repo, RemoteOptions{})
+	}
+
+	// installPromisor with the options (credentials) lazy fetches use.
+	internal def installPromisorWith(repo Repository, options RemoteOptions) {
+		let name = promisorRemote(repo.config)
+		return when name == ""
+		// The hook holds the folder, not the repository, so the two do not
+		// keep each other alive.
+		let gitDir = repo.gitDir
+		let workDir = repo.workDir
+		repo.objects.fetchMissing = def (ids ObjectId[]) !none {
+			return try fetchMissingObjects(gitDir, workDir, name, ids, options)
+		}
+	}
+
+	// Fetches objects by id from the promisor remote, as git's lazy fetch
+	// does: no negotiation, no tags, trees without their blobs unless asked.
+	internal def fetchMissingObjects(gitDir string, workDir string, name string, ids ObjectId[], options RemoteOptions) !none {
+		let repo = try openGitDir(gitDir, workDir)
+		repo.objects.fetchMissing = none
+		let remote = try remoteConfig(repo, name)
+		let session = try openSession(remote.url, "git-upload-pack", options, repo.config)
+		let req = FetchRequest{wants: ids, includeTag: false, filter: "blob:none", noHaves: true}
+		let outcome = fetchPack(session, repo, req) onerror (err error) {
+			session.close()
+			repo.close()
+			fail err
+		}
+		session.close()
+		try markPromisor(repo, outcome.pack, [])
+		repo.close()
+		return none
+	}
+
+	// Fetches, in one request, the blobs of a tree a partial clone does not
+	// have (before a checkout reads them one by one).
+	internal def prefetchTree(repo Repository, tree ObjectId) !none {
+		return none when repo.objects.fetchMissing is none
+		let missing ObjectId[] = []
+		let seen map<string, bool> = {}
+		try collectMissing(repo, tree, missing, seen)
+		if missing.len() > 0 {
+			let _ = try repo.objects.fetchFromPromisor(missing)
+		}
+		return none
+	}
+
+	internal def collectMissing(repo Repository, id ObjectId, out ObjectId[], seen map<string, bool>) !none {
+		let k = id.str()
+		return none when seen.hasKey(k)
+		seen[k] = true
+		let t = try repo.tree(id)
+		for let e in t.entries {
+			if isTree(e.mode) {
+				try collectMissing(repo, e.id, out, seen)
+			} else if e.mode != EntryMode.Submodule && !repo.objects.hasLocal(e.id) {
+				out.push(e.id) unless seen.hasKey(e.id.str())
+				seen[e.id.str()] = true
+			}
+		}
+		return none
+	}
+}

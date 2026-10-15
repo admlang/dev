@@ -1,0 +1,667 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto
+	)
+
+	// A reference a remote lists.
+	struct RemoteRef {
+		name   string
+		// The object it names; none for an unborn `HEAD`.
+		id     ?ObjectId = none
+		// The reference a symbolic one names; empty otherwise.
+		target string    = ""
+		// For an annotated tag, the object it peels to.
+		peeled ?ObjectId = none
+	}
+
+	// What a fetch asks the remote for.
+	internal struct FetchRequest {
+		wants        ObjectId[]
+		// Commits to stop at, counted from the wants (`--depth`); 0: all.
+		depth        int      = 0
+		// The depth counts from the current shallow boundary instead.
+		deepenRelative bool   = false
+		// Commits older than this (Unix seconds) are left out; 0: none.
+		deepenSince  int64    = 0
+		// History reachable from these remote refs is left out.
+		deepenNot    string[] = []
+		// An object filter (`blob:none`, ...); empty: none.
+		filter       string   = ""
+		// Annotated tags pointing at fetched objects come along.
+		includeTag   bool     = true
+		// Fetching for a clone: nothing to negotiate.
+		noHaves      bool     = false
+	}
+
+	// What a fetch received: the pack it stored, and how the shallow
+	// boundary moves.
+	internal struct FetchOutcome {
+		// none when the remote sent no pack (nothing was missing).
+		pack      ?ObjectId = none
+		shallow   string[]  = []
+		unshallow string[]  = []
+	}
+
+	// One connection to a remote service, after its advertisement: the
+	// protocol version spoken, the capabilities, and (protocol 0) the
+	// references listed.
+	internal type RemoteSession {
+		wire       Wire
+		program    string
+		options    RemoteOptions
+		version             int                = 0
+		caps                map<string, string> = {}
+		advertised          RemoteRef[]        = []
+		// Shallow commits the remote has (protocol 0 advertisement).
+		remoteShallow       string[]           = []
+		format              ObjectFormat       = ObjectFormat.Sha1
+		reader     ?PktReader          = none
+
+		def new(wire Wire, program string, options RemoteOptions) {
+			self.wire = wire
+			self.program = program
+			self.options = options
+		}
+
+		// Reads the advertisement. Fails when the remote cannot be reached
+		// or answers what git would not.
+		def open() !none {
+			let r = try wire.advertise(program, options.protocol)
+			reader = r
+			let first = try r.peek()
+			if first.kind == PktKind.Data && pktText(first) == "version 2" {
+				let _ = try r.read()
+				version = 2
+				for let p in try r.section() {
+					let line = pktText(p)
+					let eq = line.indexOf("=")
+					if eq < 0 {
+						caps[line] = ""
+					} else {
+						caps[line.slice(0, eq)] = line.slice(eq + 1)
+					}
+				}
+			} else {
+				if first.kind == PktKind.Data && pktText(first) == "version 1" {
+					let _ = try r.read()
+					version = 1
+				}
+				try readRefAdvertisement(r)
+			}
+			let fmt = caps.get("object-format")
+			if !(fmt is none) {
+				switch fmt {
+					case "sha1":
+						format = ObjectFormat.Sha1
+					case "sha256":
+						format = ObjectFormat.Sha256
+					default:
+						fail "git: the remote uses object format {fmt}"
+				}
+			}
+			return none
+		}
+
+		// Protocol 0/1: `<id> <name>` lines, capabilities after a NUL on
+		// the first, `^\{\}` lines peeling the tag before them, `shallow`
+		// lines, then a flush.
+		def readRefAdvertisement(r PktReader) !none {
+			let symrefs map<string, string> = {}
+			for let (i, p) in try r.section() {
+				let raw = p.data
+				let n = raw.len()
+				n-- when n > 0 && raw[n - 1] == 0x0A
+				let nul = indexByte(raw, 0, 0, n)
+				let line = nul < 0 ?? (string(raw[0:n]), string(raw[0:nul]))
+				if nul >= 0 {
+					for let c in string(raw[nul + 1:n]).split(" ") {
+						continue when c == ""
+						let eq = c.indexOf("=")
+						if eq < 0 {
+							caps[c] = ""
+						} else if c.startsWith("symref=") {
+							let v = c.slice(7)
+							let colon = v.indexOf(":")
+							symrefs[v.slice(0, colon)] = v.slice(colon + 1) when colon > 0
+						} else {
+							caps[c.slice(0, eq)] = c.slice(eq + 1)
+						}
+					}
+				}
+				if line.startsWith("ERR ") {
+					fail "git: remote error: {line.slice(4)}"
+				}
+				if line.startsWith("shallow ") {
+					remoteShallow.push(line.slice(8))
+					continue
+				}
+				let space = line.indexOf(" ")
+				fail "git: bad reference advertisement line {line}" when space <= 0
+				let id = try parseId(line.slice(0, space))
+				let name = line.slice(space + 1)
+				continue when i == 0 && name == "capabilities^\{\}"
+				if name.endsWith("^\{\}") && advertised.len() > 0 {
+					let last = advertised[advertised.len() - 1]
+					last.peeled = id when last.name == name.slice(0, name.len() - 3)
+					continue
+				}
+				advertised.push(RemoteRef{name: name, id: id})
+			}
+			for let ref in advertised {
+				let t = symrefs.get(ref.name)
+				ref.target = t unless t is none
+			}
+			return none
+		}
+
+		// The capability lines every protocol 2 command starts with.
+		def commandHeader(command string) !byte[] {
+			let out = try pktLine("command={command}")
+			out = out + try pktLine("agent={gitAgent}") when caps.hasKey("agent")
+			out = out + try pktLine("object-format={formatName(format)}") when caps.hasKey("object-format")
+			if caps.hasKey("server-option") {
+				for let o in options.serverOptions {
+					out = out + try pktLine("server-option={o}")
+				}
+			}
+			return out
+		}
+
+		// The remote's references, those under `prefixes` when given (all
+		// otherwise), with symbolic targets and peeled tags. Fails when the
+		// connection breaks.
+		def lsRefs(prefixes string[] = []) !RemoteRef[] {
+			if version != 2 {
+				return advertised.filter(r => prefixes.len() == 0 || prefixes.filter(p => r.name.startsWith(p)).len() > 0)
+			}
+			let req = try commandHeader("ls-refs")
+			req = req + pktDelim.bytes()
+			req = req + try pktLine("symrefs")
+			req = req + try pktLine("peel")
+			let features = caps.get("ls-refs")
+			if !(features is none) && features.split(" ").includes("unborn") {
+				req = req + try pktLine("unborn")
+			}
+			for let p in prefixes {
+				req = req + try pktLine("ref-prefix {p}")
+			}
+			req = req + pktFlush.bytes()
+			let r = try wire.request(program, new bytes.Reader(req))
+			let out RemoteRef[] = []
+			for let p in try r.section() {
+				let line = pktText(p)
+				let words = line.split(" ")
+				fail "git: bad ls-refs line {line}" when words.len() < 2
+				let ref = RemoteRef{name: words[1]}
+				ref.id = try parseId(words[0]) unless words[0] == "unborn"
+				for let attr in words[2:] {
+					if attr.startsWith("symref-target:") {
+						ref.target = attr.slice(14)
+					} else if attr.startsWith("peeled:") {
+						ref.peeled = try parseId(attr.slice(7))
+					}
+				}
+				out.push(ref) when prefixes.len() == 0 || prefixes.filter(x => ref.name.startsWith(x)).len() > 0
+			}
+			try skipResponseEnd(r)
+			return out
+		}
+
+		// A stateless response may end in `0002`; it carries nothing.
+		def skipResponseEnd(r PktReader) !none {
+			return none unless wire.stateless()
+			let next = r.peek() onerror recover Pkt{kind: PktKind.Flush}
+			if next.kind == PktKind.ResponseEnd {
+				let _ = try r.read()
+			}
+			return none
+		}
+
+		def close() {
+			if !wire.stateless() && version == 2 {
+				wire.request(program, new bytes.Reader(pktFlush.bytes())) onerror recover new PktReader(new bytes.Reader([]))
+			}
+			wire.close()
+		}
+	}
+
+	// A capability's value, empty when it has none or is missing.
+	internal def capValue(caps map<string, string>, key string) string {
+		let v = caps.get(key)
+		return v is none ?? ("", v)
+	}
+
+
+	// ---- negotiation -------------------------------------------------------
+
+	// git's default ("consecutive") negotiator: local commits newest first
+	// from every reference, skipping what the remote said it has.
+	internal type Negotiator {
+		internal repo   Repository
+		internal queue  NodeQueue
+		internal nodes  map<string, WalkNode> = {}
+		internal common map<string, bool>     = {}
+		// Haves acknowledged as common, resent each stateless round.
+		acked           ObjectId[]            = []
+
+		def new(repo Repository) {
+			self.repo = repo
+			queue = new NodeQueue()
+		}
+
+		// Starts from the commits the local references name.
+		def start(tips ObjectId[]) {
+			for let id in tips {
+				push(id)
+			}
+		}
+
+		internal def push(id ObjectId) {
+			let k = id.str()
+			return when nodes.hasKey(k)
+			let n = loadNodeOrNone(repo, id) onerror recover none
+			return when n is none
+			nodes[k] = n
+			queue.push(n)
+		}
+
+		// The next commit to offer, none when there are no more.
+		def next() ?ObjectId {
+			for queue.len() > 0 {
+				let n = queue.pop()
+				let k = n.id.str()
+				continue when common.hasKey(k)
+				for let p in n.parents {
+					push(p)
+				}
+				return n.id
+			}
+			return none
+		}
+
+		// The remote has the commit: so it has its ancestors, which are not
+		// offered again (walked as far as they are loaded).
+		def ack(id ObjectId) {
+			let k = id.str()
+			acked.push(id) unless common.hasKey(k)
+			let stack ObjectId[] = [id]
+			for stack.len() > 0 {
+				let c = stack.pop()
+				let ck = c.str()
+				continue when common.hasKey(ck) && ck != k
+				common[ck] = true
+				let n = nodes.get(ck)
+				continue when n is none
+				for let p in n.parents {
+					stack.push(p) unless common.hasKey(p.str())
+				}
+			}
+		}
+	}
+
+	internal def loadNodeOrNone(repo Repository, id ObjectId) !?WalkNode {
+		return none unless repo.has(id)
+		return try loadNode(repo, id)
+	}
+
+	// The commits the local references name, for negotiation.
+	internal def negotiationTips(repo Repository) ObjectId[] {
+		let out ObjectId[] = []
+		let seen map<string, bool> = {}
+		let refs = repo.refs() onerror recover Reference[]
+		let head = repo.headId() onerror recover none
+		if !(head is none) {
+			out.push(head)
+			seen[head.str()] = true
+		}
+		for let r in refs {
+			let id = r.id
+			continue when id is none
+			let c = repo.peel(id, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			continue when c.isZero() || seen.hasKey(c.str())
+			seen[c.str()] = true
+			out.push(c)
+		}
+		return out
+	}
+
+	// How many haves the next round offers, as git grows it.
+	internal def nextFlush(stateless bool, count int) int {
+		if stateless {
+			return count < 16384 ?? (count * 2, count * 11 / 10)
+		}
+		return count < 32 ?? (count * 2, count + 32)
+	}
+
+	// Haves offered without an acknowledgement before git gives up.
+	internal const maxInVain = 256
+
+	// ---- fetching -----------------------------------------------------------
+
+	// Fetches what the request wants into the repository: negotiates with
+	// the local history, receives the pack and indexes it. Fails when the
+	// remote refuses or the pack is bad.
+	internal def fetchPack(session RemoteSession, repo Repository, req FetchRequest) !FetchOutcome {
+		fail "git: the remote uses {formatName(session.format)} and the repository {formatName(repo.format)}" when session.format != repo.format
+		return try fetchPackV2(session, repo, req) when session.version == 2
+		return try fetchPackV0(session, repo, req)
+	}
+
+	internal def fetchArgsV2(session RemoteSession, repo Repository, req FetchRequest) !byte[] {
+		let features = capValue(session.caps, "fetch").split(" ")
+		let out = try pktLine("thin-pack")
+		out = out + try pktLine("ofs-delta")
+		out = out + try pktLine("no-progress") when session.options.progress is none
+		out = out + try pktLine("include-tag") when req.includeTag
+		for let id in req.wants {
+			out = out + try pktLine("want {id.str()}")
+		}
+		if req.depth > 0 || req.deepenSince > 0 || req.deepenNot.len() > 0 || shallowCommits(repo).len() > 0 {
+			fail "git: the remote does not support shallow fetches" unless features.includes("shallow")
+			for let s in shallowCommits(repo).keys() {
+				out = out + try pktLine("shallow {s}")
+			}
+			out = out + try pktLine("deepen {req.depth}") when req.depth > 0
+			out = out + try pktLine("deepen-relative") when req.deepenRelative
+			out = out + try pktLine("deepen-since {req.deepenSince}") when req.deepenSince > 0
+			for let n in req.deepenNot {
+				out = out + try pktLine("deepen-not {n}")
+			}
+		}
+		if req.filter != "" {
+			fail "git: the remote does not support filters" unless features.includes("filter")
+			out = out + try pktLine("filter {req.filter}")
+		}
+		return out
+	}
+
+	internal def fetchPackV2(session RemoteSession, repo Repository, req FetchRequest) !FetchOutcome {
+		let neg = new Negotiator(repo)
+		neg.start(negotiationTips(repo)) unless req.noHaves
+		let args = try fetchArgsV2(session, repo, req)
+		let count = 16
+		let inVain = 0
+		for {
+			let body = try session.commandHeader("fetch")
+			body = body + pktDelim.bytes() + args
+			for let id in neg.acked {
+				body = body + try pktLine("have {id.str()}")
+			}
+			let added = 0
+			for added < count {
+				let id = neg.next()
+				break when id is none
+				body = body + try pktLine("have {id.str()}")
+				added++
+			}
+			inVain += added
+			let done = added == 0 || inVain >= maxInVain
+			body = body + try pktLine("done") when done
+			body = body + pktFlush.bytes()
+			count = nextFlush(true, count)
+			let r = try session.wire.request(session.program, new bytes.Reader(body))
+			let outcome = FetchOutcome{}
+			let p = try r.read()
+			if !done {
+				fail "git: expected acknowledgments, got {pktText(p)}" unless p.kind == PktKind.Data && pktText(p) == "acknowledgments"
+				let ready = false
+				for {
+					p = try r.read()
+					break unless p.kind == PktKind.Data
+					let line = pktText(p)
+					if line.startsWith("ACK ") {
+						neg.ack(try parseId(line.slice(4)))
+						inVain = 0
+					} else if line == "ready" {
+						ready = true
+					}
+				}
+				if !ready {
+					fail "git: bad end of acknowledgments" unless p.kind == PktKind.Flush
+					try session.skipResponseEnd(r)
+					continue
+				}
+				fail "git: missing sections after ready" unless p.kind == PktKind.Delimiter
+				p = try r.read()
+			}
+			// shallow-info, wanted-refs, packfile-uris, then packfile.
+			for {
+				fail "git: bad fetch response" unless p.kind == PktKind.Data
+				let header = pktText(p)
+				if header == "packfile" {
+					outcome.pack = try receivePack(session, repo, r)
+					try session.skipResponseEnd(r)
+					return outcome
+				}
+				for {
+					p = try r.read()
+					break unless p.kind == PktKind.Data
+					let line = pktText(p)
+					if header == "shallow-info" {
+						if line.startsWith("shallow ") {
+							outcome.shallow.push(line.slice(8))
+						} else if line.startsWith("unshallow ") {
+							outcome.unshallow.push(line.slice(10))
+						}
+					} else if header == "packfile-uris" {
+						fail "git: the remote sent packfile URIs, which were not asked for"
+					}
+				}
+				if p.kind == PktKind.Flush {
+					// No packfile section: nothing to send.
+					return outcome
+				}
+				p = try r.read()
+			}
+		}
+	}
+
+	// The capabilities a protocol 0 client asks for on its first want.
+	internal def fetchCapsV0(session RemoteSession, req FetchRequest) !string {
+		let want string[] = []
+		for let c in string["multi_ack_detailed", "side-band-64k", "thin-pack", "ofs-delta"] {
+			want.push(c) when session.caps.hasKey(c)
+		}
+		fail "git: the remote cannot send its pack on a side band" unless session.caps.hasKey("side-band-64k")
+		want.push("no-progress") when session.options.progress is none && session.caps.hasKey("no-progress")
+		want.push("include-tag") when req.includeTag && session.caps.hasKey("include-tag")
+		want.push("shallow") when session.caps.hasKey("shallow")
+		want.push("deepen-relative") when req.deepenRelative
+		want.push("agent={gitAgent}") when session.caps.hasKey("agent")
+		want.push("object-format={formatName(session.format)}") when session.caps.hasKey("object-format")
+		want.push("filter") when req.filter != ""
+		return want.join(" ")
+	}
+
+	// The part of a protocol 0 request every stateless round repeats: the
+	// wants, shallow lines, the depth and filter, and a flush.
+	internal def wantsV0(session RemoteSession, repo Repository, req FetchRequest) !byte[] {
+		let caps = try fetchCapsV0(session, req)
+		let out byte[] = []
+		for let (i, id) in req.wants {
+			out = out + try pktLine(i == 0 ?? ("want {id.str()} {caps}", "want {id.str()}"))
+		}
+		for let s in shallowCommits(repo).keys() {
+			out = out + try pktLine("shallow {s}")
+		}
+		if req.depth > 0 || req.deepenSince > 0 || req.deepenNot.len() > 0 {
+			fail "git: the remote does not support shallow fetches" unless session.caps.hasKey("shallow")
+			out = out + try pktLine("deepen {req.depth}") when req.depth > 0
+			out = out + try pktLine("deepen-since {req.deepenSince}") when req.deepenSince > 0
+			for let n in req.deepenNot {
+				out = out + try pktLine("deepen-not {n}")
+			}
+		}
+		if req.filter != "" {
+			fail "git: the remote does not support filters" unless session.caps.hasKey("filter")
+			out = out + try pktLine("filter {req.filter}")
+		}
+		return out + pktFlush.bytes()
+	}
+
+	// Reads `shallow`/`unshallow` lines up to a flush, after a deepening
+	// request.
+	internal def readShallowUpdate(r PktReader, outcome FetchOutcome) !none {
+		for {
+			let p = try r.read()
+			break unless p.kind == PktKind.Data
+			let line = pktText(p)
+			if line.startsWith("shallow ") {
+				outcome.shallow.push(line.slice(8))
+			} else if line.startsWith("unshallow ") {
+				outcome.unshallow.push(line.slice(10))
+			} else if line.startsWith("ERR ") {
+				fail "git: remote error: {line.slice(4)}"
+			}
+		}
+		return none
+	}
+
+	internal def fetchPackV0(session RemoteSession, repo Repository, req FetchRequest) !FetchOutcome {
+		let outcome = FetchOutcome{}
+		let wire = session.wire
+		let stateless = wire.stateless()
+		let deepening = req.depth > 0 || req.deepenSince > 0 || req.deepenNot.len() > 0
+		let wants = try wantsV0(session, repo, req)
+		let neg = new Negotiator(repo)
+		neg.start(negotiationTips(repo)) unless req.noHaves
+		let advertisement = session.reader
+		fail "git: the session is not open" when advertisement is none
+		let r PktReader = advertisement
+		if !stateless {
+			r = try wire.request(session.program, new bytes.Reader(wants))
+			try readShallowUpdate(r, outcome) when deepening
+		}
+		let count = 16
+		let inVain = 0
+		let gotContinue = false
+		let ready = false
+		for {
+			let body = stateless ?? (wants.clone(), byte[])
+			if stateless {
+				for let id in neg.acked {
+					body = body + try pktLine("have {id.str()}")
+				}
+			}
+			let added = 0
+			for added < count && !ready {
+				let id = neg.next()
+				break when id is none
+				body = body + try pktLine("have {id.str()}")
+				added++
+			}
+			inVain += added
+			let done = added == 0 || ready || (gotContinue && inVain >= maxInVain)
+			body = body + (done ?? (try pktLine("done"), pktFlush.bytes()))
+			count = nextFlush(stateless, count)
+			r = try wire.request(session.program, new bytes.Reader(body))
+			try readShallowUpdate(r, outcome) when stateless && deepening
+			if done {
+				// The final ACK or NAK (after any still owed for the last
+				// flush), then the pack.
+				for {
+					let p = try r.read()
+					fail "git: the remote ended before its pack" unless p.kind == PktKind.Data
+					let line = pktText(p)
+					fail "git: remote error: {line.slice(4)}" when line.startsWith("ERR ")
+					break when line == "NAK" || (line.startsWith("ACK ") && line.split(" ").len() == 2)
+				}
+				outcome.pack = try receivePack(session, repo, r)
+				return outcome
+			}
+			// One response per flush: ACKs, then NAK.
+			for {
+				let p = try r.read()
+				fail "git: the remote ended during negotiation" unless p.kind == PktKind.Data
+				let line = pktText(p)
+				fail "git: remote error: {line.slice(4)}" when line.startsWith("ERR ")
+				break when line == "NAK"
+				if line.startsWith("ACK ") {
+					let words = line.split(" ")
+					neg.ack(try parseId(words[1]))
+					inVain = 0
+					gotContinue = true
+					ready = true when words.len() > 2 && words[2] == "ready"
+				}
+			}
+		}
+	}
+
+	// Reads a pack from its side band (channel 1 data, 2 progress, 3 an
+	// error) into a temporary file and indexes it into the repository.
+	// Returns the pack's checksum; none when the pack held nothing.
+	internal def receivePack(session RemoteSession, repo Repository, r PktReader) !?ObjectId {
+		let dir = os.join(repo.objects.dir, "pack")
+		try os.mkdir(dir, true)
+		let token = crypto.rand(8) onerror recover byte[]
+		let temp = os.join(dir, "tmp_pack_{token.hex().lower()}")
+		let f = try os.open(temp, "w")
+		let failure ?error = none
+		let total = 0
+		copySideBand(session, r, f) onerror (err error) {
+			failure = err
+			recover 0
+		}
+		f.close() onerror recover none
+		if !(failure is none) {
+			os.remove(temp) onerror recover none
+			fail failure
+		}
+		let size = (try os.stat(temp)).size
+		if size == 0 {
+			os.remove(temp) onerror recover none
+			return none
+		}
+		let _ = total
+		let sum = indexPackFile(repo, temp) onerror (err error) {
+			os.remove(temp) onerror recover none
+			fail err
+		}
+		return sum
+	}
+
+	// Copies side-band channel 1 to `out` up to the flush, passing progress
+	// on. Returns the bytes copied. Fails on a channel 3 message.
+	internal def copySideBand(session RemoteSession, r PktReader, out io.Writer) !int {
+		let total = 0
+		let progress = session.options.progress
+		let pending = ""
+		for {
+			let p = try r.read()
+			break when p.kind == PktKind.Flush
+			continue unless p.kind == PktKind.Data && p.data.len() > 0
+			let band = p.data[0]
+			let payload = p.data[1:]
+			if band == 1 {
+				let _ = try out.write(payload)
+				total += payload.len()
+			} else if band == 2 {
+				if !(progress is none) {
+					pending += string(payload)
+					for {
+						let cut = firstLineEnd(pending)
+						break when cut < 0
+						progress(pending.slice(0, cut))
+						pending = pending.slice(cut + 1)
+					}
+				}
+			} else if band == 3 {
+				fail "git: remote error: {string(payload).trim()}"
+			} else {
+				fail "git: bad side-band channel {band}"
+			}
+		}
+		return total
+	}
+
+	// The first `\n` or `\r` in progress text, -1 when there is none.
+	internal def firstLineEnd(text string) int {
+		let n = text.indexOf("\n")
+		let c = text.indexOf("\r")
+		return c when n < 0 || (c >= 0 && c < n)
+		return n
+	}
+}

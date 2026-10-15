@@ -1,0 +1,809 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+		std.bytes
+		std.crypto
+		std.crypto.hash
+		std.data.compress.zlib
+	)
+
+	// Value types of a reftable ref record.
+	internal const (
+		rtDeletion = 0
+		rtOneId    = 1
+		rtTwoIds   = 2
+		rtSymbolic = 3
+		// Records between restart points (a full key) in written blocks.
+		rtRestartInterval = 16
+		// The size a written block aims at.
+		rtBlockTarget     = 4096
+	)
+
+	// One ref record of a table: the reference, or a deletion of it.
+	internal struct RtRef {
+		name        string
+		updateIndex int64
+		deleted     bool
+		ref         Reference
+	}
+
+	// One log record of a table, keyed by reference and update index.
+	internal struct RtLog {
+		name        string
+		updateIndex int64
+		deleted     bool
+		entry       ?ReflogEntry
+	}
+
+	// One reftable file, read whole.
+	internal type Reftable {
+		name     string
+		minIndex int64
+		maxIndex int64
+		refs     RtRef[] = []
+		logs     RtLog[] = []
+		size     int
+
+		def new(name string) {
+			self.name = name
+		}
+	}
+
+	// The reftable varint (the ofs-delta encoding) at `at`, and where it ends.
+	internal def rtVarint(data byte[], at int) !(int64, int) {
+		fail "git: truncated reftable" when at >= data.len()
+		let p = at
+		let c = int(data[p])
+		let v = int64(c & 0x7F)
+		for (c & 0x80) != 0 {
+			p++
+			fail "git: truncated reftable" when p >= data.len()
+			c = int(data[p])
+			v = ((v + 1) << 7) | int64(c & 0x7F)
+		}
+		return (v, p + 1)
+	}
+
+	internal def rtPutVarint(out byte[], value int64) {
+		let tmp byte[] = []
+		let v = value
+		tmp.push(byte(v & 0x7F))
+		v = v >> 7
+		for v > 0 {
+			v--
+			tmp.push(byte(0x80 | (v & 0x7F)))
+			v = v >> 7
+		}
+		for let i = tmp.len() - 1; i >= 0; i-- {
+			out.push(tmp[i])
+		}
+	}
+
+	internal def be24(data byte[], at int) int {
+		return (int(data[at]) << 16) | (int(data[at + 1]) << 8) | int(data[at + 2])
+	}
+
+	internal def putBe(out byte[], value int64, size int) {
+		for let i = size - 1; i >= 0; i-- {
+			out.push(byte((value >> (i * 8)) & 0xFF))
+		}
+	}
+
+	// Reads one reftable file. Fails when it is malformed.
+	internal def readReftable(path string, format ObjectFormat) !Reftable {
+		let data = try os.readFile(path)
+		let t = new Reftable(os.base(path))
+		t.size = data.len()
+		fail "git: {path} is not a reftable" when data.len() < 24 || string(data[0:4]) != "REFT"
+		let version = int(data[4])
+		fail "git: {path} has unsupported version {version}" unless version == 1 || version == 2
+		let headerSize = version == 1 ?? (24, 28)
+		let footerSize = version == 1 ?? (68, 72)
+		fail "git: {path} is truncated" when data.len() < headerSize + footerSize
+		let blockSize = be24(data, 5)
+		t.minIndex = be64(data, 8)
+		t.maxIndex = be64(data, 16)
+		let hashLen = idLength(format)
+		if version == 2 {
+			let hashId = string(data[24:28])
+			fail "git: {path} has the wrong object format" when (hashId == "s256" ?? (32, 20)) != hashLen
+		}
+		let footer = data.len() - footerSize
+		fail "git: {path} has a corrupt footer" when string(data[footer:footer + 4]) != "REFT"
+		let crcAt = data.len() - 4
+		fail "git: {path} has a bad footer checksum" when int(hash.crc32(data[footer:crcAt])) != be32(data, crcAt)
+		let f = footer + headerSize
+		let logPosition = int(be64(data, f + 24))
+		// A log-only table starts its logs right after the header and may
+		// leave the position 0.
+		logPosition = headerSize when logPosition == 0 && headerSize < footer && data[headerSize] == 0x67
+		// Ref blocks, from the first block (sharing the header) onward.
+		let pos = headerSize
+		let blockStart = 0
+		for pos < footer && data[pos] == 0x72 {
+			let blockLen = be24(data, pos + 1)
+			let blockEnd = blockStart + blockLen
+			fail "git: {path} has a corrupt block" when blockEnd > footer || blockLen < 6
+			try readRtBlock(data, pos + 4, blockEnd, hashLen, t, false)
+			if blockSize > 0 {
+				blockStart += blockSize
+			} else {
+				blockStart = blockEnd
+			}
+			pos = blockStart
+		}
+		if logPosition > 0 {
+			let lp = logPosition
+			for lp < footer && data[lp] == 0x67 {
+				let inflated = be24(data, lp + 1)
+				let (body, used) = try zlib.inflate(data, lp + 4, inflated - 4)
+				let block byte[] = data[lp:lp + 4].clone() + body
+				try readRtBlock(block, 4, block.len(), hashLen, t, true)
+				lp = lp + 4 + used
+			}
+		}
+		return t
+	}
+
+	// Reads the records of a ref or log block: from `from` to the restart
+	// table that ends at `end`.
+	internal def readRtBlock(data byte[], from int, end int, hashLen int, t Reftable, logs bool) !none {
+		let restarts = (int(data[end - 2]) << 8) | int(data[end - 1])
+		let recordsEnd = end - 2 - restarts * 3
+		fail "git: corrupt reftable block" when recordsEnd < from
+		let p = from
+		let prior byte[] = []
+		for p < recordsEnd {
+			let (prefix, p1) = try rtVarint(data, p)
+			let (suffixAndType, p2) = try rtVarint(data, p1)
+			let suffixLen = int(suffixAndType >> 3)
+			let kind = int(suffixAndType & 7)
+			fail "git: corrupt reftable record" when int(prefix) > prior.len() || p2 + suffixLen > recordsEnd
+			let key = prior[0:int(prefix)].clone() + data[p2:p2 + suffixLen]
+			prior = key
+			p = p2 + suffixLen
+			if logs {
+				let nul = indexByte(key, 0, 0, key.len())
+				fail "git: corrupt reftable log key" when nul < 0 || key.len() != nul + 9
+				let name = string(key[0:nul])
+				let updateIndex = int64(-1) - be64(key, nul + 1)
+				if kind == 0 {
+					t.logs.push(RtLog{name: name, updateIndex: updateIndex, deleted: true, entry: none})
+					continue
+				}
+				fail "git: corrupt reftable log record" when p + hashLen * 2 > recordsEnd
+				let oldId = new ObjectId(data[p:p + hashLen].clone())
+				let newId = new ObjectId(data[p + hashLen:p + hashLen * 2].clone())
+				p += hashLen * 2
+				let (nameLen, q1) = try rtVarint(data, p)
+				let who = string(data[q1:q1 + int(nameLen)])
+				let (emailLen, q2) = try rtVarint(data, q1 + int(nameLen))
+				let email = string(data[q2:q2 + int(emailLen)])
+				let (seconds, q3) = try rtVarint(data, q2 + int(emailLen))
+				let tz = (int(data[q3]) << 8) | int(data[q3 + 1])
+				tz = tz - 65536 when tz >= 32768
+				let (msgLen, q4) = try rtVarint(data, q3 + 2)
+				let message = string(data[q4:q4 + int(msgLen)])
+				// Messages are stored with their newline, which reflogs do not show.
+				message = message.slice(0, message.len() - 1) when message.endsWith("\n")
+				p = q4 + int(msgLen)
+				let sig = new Signature(who, email, time.fromUnixNs(seconds * 1000000000), duration(int64(tz) * 60000000000))
+				t.logs.push(RtLog{name: name, updateIndex: updateIndex, deleted: false, entry: ReflogEntry{oldId: oldId, newId: newId, who: sig, message: message}})
+				continue
+			}
+			let (delta, p3) = try rtVarint(data, p)
+			p = p3
+			let name = string(key)
+			let r = RtRef{name: name, updateIndex: t.minIndex + delta, deleted: kind == rtDeletion, ref: Reference{name: name}}
+			switch kind {
+				case rtOneId:
+					r.ref = Reference{name: name, id: new ObjectId(data[p:p + hashLen].clone())}
+					p += hashLen
+				case rtTwoIds:
+					r.ref = Reference{name: name, id: new ObjectId(data[p:p + hashLen].clone()), peeled: new ObjectId(data[p + hashLen:p + hashLen * 2].clone())}
+					p += hashLen * 2
+				case rtSymbolic:
+					let (targetLen, q) = try rtVarint(data, p)
+					r.ref = Reference{name: name, target: string(data[q:q + int(targetLen)])}
+					p = q + int(targetLen)
+				case rtDeletion:
+				default:
+					fail "git: unknown reftable value type {kind}"
+			}
+			t.refs.push(r)
+		}
+		return none
+	}
+
+	// Writes records into blocks of about rtBlockTarget bytes: each record
+	// is (key, the bytes after the key), keys sorted. Returns the blocks'
+	// bodies with their restart tables, and each block's last key.
+	internal def rtBlocks(keys byte[][], values byte[][], firstOffset int) (byte[][], byte[][]) {
+		let blocks byte[][] = []
+		let lastKeys byte[][] = []
+		let i = 0
+		let n = keys.len()
+		let base = firstOffset
+		for i < n {
+			let body byte[] = []
+			let restarts int[] = []
+			let prior byte[] = []
+			let count = 0
+			for i < n {
+				let key = keys[i]
+				let restart = count % rtRestartInterval == 0
+				let prefix = 0
+				if !restart {
+					let m = prior.len() < key.len() ?? (prior.len(), key.len())
+					for prefix < m && prior[prefix] == key[prefix] {
+						prefix++
+					}
+				}
+				let record byte[] = []
+				rtPutVarint(record, int64(prefix))
+				let suffix = key.len() - prefix
+				// The value's type sits in the low three bits of the first
+				// byte of values[i], which carries it there.
+				rtPutVarint(record, (int64(suffix) << 3) | int64(values[i][0]))
+				record.push(...key[prefix:])
+				record.push(...values[i][1:])
+				let projected = base + 4 + body.len() + record.len() + (restarts.len() + 1) * 3 + 2
+				break when count > 0 && projected > rtBlockTarget
+				restarts.push(base + 4 + body.len()) when restart
+				body.push(...record)
+				prior = key
+				count++
+				i++
+			}
+			for let r in restarts {
+				putBe(body, int64(r), 3)
+			}
+			putBe(body, int64(restarts.len()), 2)
+			blocks.push(body)
+			lastKeys.push(prior)
+			base = 0
+		}
+		return (blocks, lastKeys)
+	}
+
+	// The bytes of a reftable holding the refs and logs, both sorted by key.
+	internal def encodeReftable(refs RtRef[], logs RtLog[], minIndex int64, maxIndex int64, format ObjectFormat) byte[] {
+		let version = format == ObjectFormat.Sha256 ?? (2, 1)
+		let header byte[] = "REFT".bytes()
+		header.push(byte(version))
+		putBe(header, 0, 3)
+		putBe(header, minIndex, 8)
+		putBe(header, maxIndex, 8)
+		header.push(..."s256".bytes()) when version == 2
+		let out byte[] = header.clone()
+		let refKeys byte[][] = []
+		let refValues byte[][] = []
+		for let r in refs {
+			refKeys.push(r.name.bytes())
+			let v byte[] = []
+			let id = r.ref.id
+			let peeled = r.ref.peeled
+			let kind = rtDeletion
+			if r.deleted {
+				kind = rtDeletion
+			} else if r.ref.target != "" {
+				kind = rtSymbolic
+			} else if !(peeled is none) {
+				kind = rtTwoIds
+			} else {
+				kind = rtOneId
+			}
+			v.push(byte(kind))
+			rtPutVarint(v, r.updateIndex - minIndex)
+			switch kind {
+				case rtOneId:
+					v.push(...refIdOrZero(r.ref, format).bytes)
+				case rtTwoIds:
+					v.push(...refIdOrZero(r.ref, format).bytes)
+					v.push(...refIdOrZero(Reference{name: "", id: peeled}, format).bytes)
+				case rtSymbolic:
+					rtPutVarint(v, int64(r.ref.target.bytes().len()))
+					v.push(...r.ref.target.bytes())
+			}
+			refValues.push(v)
+		}
+		let refIndexPosition = 0
+		if refKeys.len() > 0 {
+			let (blocks, lastKeys) = rtBlocks(refKeys, refValues, header.len())
+			let positions int[] = []
+			for let (k, body) in blocks {
+				let start = k == 0 ?? (0, out.len())
+				positions.push(start)
+				let blockLen = (k == 0 ?? (header.len(), 0)) + 4 + body.len()
+				out.push(0x72)
+				putBe(out, int64(blockLen), 3)
+				out.push(...body)
+			}
+			if blocks.len() > 1 {
+				refIndexPosition = out.len()
+				let indexValues byte[][] = []
+				for let pos in positions {
+					let v byte[] = [0]
+					rtPutVarint(v, int64(pos))
+					indexValues.push(v)
+				}
+				// One level: the index may be larger than a block.
+				let (body, _) = rtSingleBlock(lastKeys, indexValues)
+				out.push(0x69)
+				putBe(out, int64(4 + body.len()), 3)
+				out.push(...body)
+			}
+		}
+		let logPosition = 0
+		let logIndexPosition = 0
+		if logs.len() > 0 {
+			logPosition = out.len()
+			let logKeys byte[][] = []
+			let logValues byte[][] = []
+			for let l in logs {
+				let key = l.name.bytes() + byte(0)
+				putBe(key, int64(-1) - l.updateIndex, 8)
+				logKeys.push(key)
+				let v byte[] = []
+				let e = l.entry
+				if l.deleted || e is none {
+					v.push(0)
+				} else {
+					v.push(1)
+					v.push(...e.oldId.bytes)
+					v.push(...e.newId.bytes)
+					rtPutVarint(v, int64(e.who.name.bytes().len()))
+					v.push(...e.who.name.bytes())
+					rtPutVarint(v, int64(e.who.email.bytes().len()))
+					v.push(...e.who.email.bytes())
+					rtPutVarint(v, e.who.date.unixNs() / 1000000000)
+					let tz = int(e.who.offset) / 60000000000
+					putBe(v, int64(tz < 0 ?? (tz + 65536, tz)), 2)
+					let text = e.message == "" ?? ("", e.message + "\n")
+					rtPutVarint(v, int64(text.bytes().len()))
+					v.push(...text.bytes())
+				}
+				logValues.push(v)
+			}
+			let (blocks, lastKeys) = rtBlocks(logKeys, logValues, 0)
+			let positions int[] = []
+			for let body in blocks {
+				positions.push(out.len())
+				let buffer = new bytes.Buffer()
+				let w = new zlib.Writer(buffer)
+				w.write(body) onerror recover 0
+				w.close() onerror recover none
+				out.push(0x67)
+				putBe(out, int64(4 + body.len()), 3)
+				out.push(...buffer.bytes())
+			}
+			if blocks.len() > 1 {
+				logIndexPosition = out.len()
+				let indexValues byte[][] = []
+				for let pos in positions {
+					let v byte[] = [0]
+					rtPutVarint(v, int64(pos))
+					indexValues.push(v)
+				}
+				let (body, _) = rtSingleBlock(lastKeys, indexValues)
+				out.push(0x69)
+				putBe(out, int64(4 + body.len()), 3)
+				out.push(...body)
+			}
+		}
+		let footer = header.clone()
+		putBe(footer, int64(refIndexPosition), 8)
+		putBe(footer, 0, 8)
+		putBe(footer, 0, 8)
+		putBe(footer, int64(logPosition), 8)
+		putBe(footer, int64(logIndexPosition), 8)
+		putBe(footer, int64(hash.crc32(footer)), 4)
+		out.push(...footer)
+		return out
+	}
+
+	// All records in one block body, however large: for an index, which
+	// may exceed the block size.
+	internal def rtSingleBlock(keys byte[][], values byte[][]) (byte[], int) {
+		let body byte[] = []
+		let restarts int[] = []
+		let prior byte[] = []
+		for let i = 0; i < keys.len(); i++ {
+			let key = keys[i]
+			let restart = i % rtRestartInterval == 0
+			let prefix = 0
+			if !restart {
+				let m = prior.len() < key.len() ?? (prior.len(), key.len())
+				for prefix < m && prior[prefix] == key[prefix] {
+					prefix++
+				}
+			}
+			restarts.push(4 + body.len()) when restart
+			rtPutVarint(body, int64(prefix))
+			rtPutVarint(body, (int64(key.len() - prefix) << 3) | int64(values[i][0]))
+			body.push(...key[prefix:])
+			body.push(...values[i][1:])
+			prior = key
+		}
+		for let r in restarts {
+			putBe(body, int64(r), 3)
+		}
+		putBe(body, int64(restarts.len()), 2)
+		return (body, restarts.len())
+	}
+
+	// The reference store of the `reftable` format: a stack of tables under
+	// `reftable/`, newest last, each transaction appending one.
+	internal type ReftableRefs {
+		gitDir    string
+		dir       string
+		format    ObjectFormat
+		listText  string      = ""
+		tables    Reftable[]  = []
+		merged    map<string, Reference> = {}
+		names     string[]    = []
+		// When to write logs, as FileRefs.logRefs.
+		logRefs   string      = "true"
+
+		def new(gitDir string, dir string, format ObjectFormat) {
+			self.gitDir = gitDir
+			self.dir = dir
+			self.format = format
+		}
+
+		// Reads the stack again when tables.list changed.
+		def refresh() !none {
+			for let attempt = 0; attempt < 5; attempt++ {
+				let text = string(os.readFile(os.join(dir, "tables.list")) onerror recover byte[])
+				return none when text == listText && attempt == 0 && tables.len() > 0
+				let loaded Reftable[] = []
+				let missing = false
+				for let line in text.split("\n") {
+					let n = line.trim()
+					continue when n == ""
+					let t = readReftable(os.join(dir, n), format) onerror (err error) {
+						missing = !(os.exists(os.join(dir, n)) onerror recover false)
+						fail err unless missing
+						recover new Reftable(n)
+					}
+					break when missing
+					loaded.push(t)
+				}
+				continue when missing
+				tables = loaded
+				listText = text
+				merge()
+				return none
+			}
+			fail "git: the reftable stack keeps changing under {dir}"
+		}
+
+		def merge() {
+			let m map<string, Reference> = {}
+			for let t in tables {
+				for let r in t.refs {
+					if r.deleted {
+						m.delete(r.name)
+					} else {
+						m[r.name] = r.ref
+					}
+				}
+			}
+			merged = m
+			let ns = m.keys()
+			ns.sort((a, b) => compareBytes(a, b))
+			names = ns
+		}
+
+		def read(name string) !?Reference {
+			try refresh()
+			return merged.get(name)
+		}
+
+		def list(prefix string) !Reference[] {
+			try refresh()
+			let out Reference[] = []
+			for let n in names {
+				continue unless n.startsWith(prefix) && n.startsWith("refs/")
+				out.push(merged[n])
+			}
+			return out
+		}
+
+		def commit(updates RefUpdate[], who Signature) !none {
+			let lock = try acquireLock(os.join(dir, "tables.list"))
+			let failure ?error = none
+			listText = ""
+			tables = []
+			try refresh()
+			let next = tables.len() == 0 ?? (int64(1), tables[tables.len() - 1].maxIndex + 1)
+			let refs RtRef[] = []
+			let logs RtLog[] = []
+			for let u0 in updates {
+				let u = derefUpdate(u0)
+				let current = merged.get(u.name)
+				let mismatch = checkExpected(u, current)
+				if mismatch != "" {
+					failure = error{message: mismatch}
+					break
+				}
+				let oldId = current is none ?? (zeroId(format), refIdOrZero(current, format))
+				if u.delete {
+					refs.push(RtRef{name: u.name, updateIndex: next, deleted: true, ref: Reference{name: u.name}})
+					// Deleting a reference deletes its log.
+					let seen map<int64, bool> = {}
+					for let t in tables {
+						for let l in t.logs {
+							if l.name == u.name && !seen.hasKey(l.updateIndex) {
+								seen[l.updateIndex] = true
+								logs.push(RtLog{name: l.name, updateIndex: l.updateIndex, deleted: true, entry: none})
+							}
+						}
+					}
+					continue
+				}
+				if u.newTarget != "" && u.message != "" && shouldLog(u.name) {
+					// A symbolic reference moved to another branch logs the
+					// commit it leads to now.
+					let before = resolveSymbolic(self, u.name, zeroId(format))
+					let target = resolveSymbolic(self, u.newTarget, zeroId(format))
+					logs.push(RtLog{name: u.name, updateIndex: next, deleted: false, entry: ReflogEntry{oldId: before, newId: target, who: who, message: u.message}})
+				}
+				let ref = u.newTarget != "" ?? (Reference{name: u.name, target: u.newTarget}, Reference{name: u.name, id: u.newId})
+				refs.push(RtRef{name: u.name, updateIndex: next, deleted: false, ref: ref})
+				let newId = u.newId
+				if !(newId is none) && shouldLog(u.name) {
+					let entry = ReflogEntry{oldId: oldId, newId: newId, who: who, message: u.message}
+					logs.push(RtLog{name: u.name, updateIndex: next, deleted: false, entry: entry})
+					let head = merged.get("HEAD")
+					if !(head is none) && head.target == u.name && u.name != "HEAD" {
+						logs.push(RtLog{name: "HEAD", updateIndex: next, deleted: false, entry: entry})
+					}
+				}
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			refs.sort((a, b) => compareBytes(a.name, b.name))
+			logs.sort((a, b) => compareRtLogs(a, b))
+			let data = encodeReftable(refs, logs, next, next, format)
+			let token = crypto.rand(4) onerror recover byte[]
+			let fileName = "{rtIndexName(next)}-{rtIndexName(next)}-{token.hex().lower()}.ref"
+			writeAtomically(os.join(dir, fileName), data) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is none {
+				let lines = tables.mapElem(t => t.name)
+				lines.push(fileName)
+				lock.write((lines.join("\n") + "\n").bytes()) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			try lock.commit()
+			listText = ""
+			try refresh()
+			compact() onerror recover none
+			return none
+		}
+
+		def shouldLog(name string) bool {
+			return false when logRefs == "false"
+			return true when logRefs == "always"
+			return name == "HEAD" || name.startsWith("refs/heads/") || name.startsWith("refs/remotes/") || name.startsWith("refs/notes/") || hasReflog(name)
+		}
+
+		def derefUpdate(u RefUpdate) RefUpdate {
+			return u unless u.deref && u.newTarget == ""
+			let name = u.name
+			for let depth = 0; depth < 5; depth++ {
+				let r = merged.get(name)
+				break when r is none || r.target == ""
+				name = r.target
+			}
+			return RefUpdate{...u, name: name}
+		}
+
+		// Merges the newest tables while one is not at least twice the size
+		// of everything newer, as git's geometric compaction keeps the stack
+		// short. Fails when the lock is held or a file cannot be written.
+		def compact() !none {
+			return none when tables.len() < 2
+			let start = tables.len() - 1
+			let newer = tables[start].size
+			for start > 0 && tables[start - 1].size < 2 * newer {
+				start--
+				newer += tables[start].size
+			}
+			return none when start == tables.len() - 1
+			try compactRange(start, tables.len())
+			return none
+		}
+
+		// Rewrites tables[from:to] as one table.
+		def compactRange(from int, to int) !none {
+			let lock = try acquireLock(os.join(dir, "tables.list"))
+			let refs map<string, RtRef> = {}
+			let logs map<string, RtLog> = {}
+			let keepTombstones = from > 0
+			for let i = from; i < to; i++ {
+				for let r in tables[i].refs {
+					refs[r.name] = r
+				}
+				for let l in tables[i].logs {
+					logs["{l.name}\n{l.updateIndex}"] = l
+				}
+			}
+			let outRefs RtRef[] = []
+			for let (_, r) in refs {
+				outRefs.push(r) unless r.deleted && !keepTombstones
+			}
+			let outLogs RtLog[] = []
+			for let (_, l) in logs {
+				outLogs.push(l) unless l.deleted && !keepTombstones
+			}
+			outRefs.sort((a, b) => compareBytes(a.name, b.name))
+			outLogs.sort((a, b) => compareRtLogs(a, b))
+			let minIndex = tables[from].minIndex
+			let maxIndex = tables[to - 1].maxIndex
+			let data = encodeReftable(outRefs, outLogs, minIndex, maxIndex, format)
+			let token = crypto.rand(4) onerror recover byte[]
+			let fileName = "{rtIndexName(minIndex)}-{rtIndexName(maxIndex)}-{token.hex().lower()}.ref"
+			let failure ?error = none
+			writeAtomically(os.join(dir, fileName), data) onerror (err error) {
+				failure = err
+				recover none
+			}
+			let stack string[] = []
+			for let i = 0; i < from; i++ {
+				stack.push(tables[i].name)
+			}
+			stack.push(fileName)
+			for let i = to; i < tables.len(); i++ {
+				stack.push(tables[i].name)
+			}
+			if failure is none {
+				lock.write((stack.join("\n") + "\n").bytes()) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			try lock.commit()
+			for let i = from; i < to; i++ {
+				os.remove(os.join(dir, tables[i].name)) onerror recover none
+			}
+			listText = ""
+			try refresh()
+			return none
+		}
+
+		def reflog(name string) !ReflogEntry[] {
+			try refresh()
+			let byIndex map<int64, RtLog> = {}
+			for let t in tables {
+				for let l in t.logs {
+					byIndex[l.updateIndex] = l when l.name == name
+				}
+			}
+			let indexes = byIndex.keys()
+			indexes.sort((a, b) => a < b ?? (-1, a > b ?? (1, 0)))
+			let out ReflogEntry[] = []
+			for let i in indexes {
+				let l = byIndex[i]
+				let e = l.entry
+				continue when l.deleted || e is none
+				// Zero ids on both sides mark a log that exists but is empty.
+				continue when e.oldId.isZero() && e.newId.isZero()
+				out.push(e)
+			}
+			return out
+		}
+
+		def hasReflog(name string) bool {
+			refresh() onerror recover none
+			for let t in tables {
+				for let l in t.logs {
+					return true when l.name == name && !l.deleted
+				}
+			}
+			return false
+		}
+
+		def rewriteReflog(name string, entries ReflogEntry[]) !none {
+			// One transaction: tombstones for every old record, then the kept
+			// entries under fresh update indexes.
+			let lock = try acquireLock(os.join(dir, "tables.list"))
+			listText = ""
+			tables = []
+			let failure ?error = none
+			refresh() onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			let next = tables.len() == 0 ?? (int64(1), tables[tables.len() - 1].maxIndex + 1)
+			let logs RtLog[] = []
+			for let t in tables {
+				for let l in t.logs {
+					logs.push(RtLog{name: name, updateIndex: l.updateIndex, deleted: true, entry: none}) when l.name == name
+				}
+			}
+			let maxIndex = next
+			for let (i, e) in entries {
+				maxIndex = next + int64(i)
+				logs.push(RtLog{name: name, updateIndex: next + int64(i), deleted: false, entry: e})
+			}
+			logs.sort((a, b) => compareRtLogs(a, b))
+			let data = encodeReftable([], logs, next, maxIndex, format)
+			let token = crypto.rand(4) onerror recover byte[]
+			let fileName = "{rtIndexName(next)}-{rtIndexName(maxIndex)}-{token.hex().lower()}.ref"
+			writeAtomically(os.join(dir, fileName), data) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if failure is none {
+				let lines = tables.mapElem(t => t.name)
+				lines.push(fileName)
+				lock.write((lines.join("\n") + "\n").bytes()) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			if !(failure is none) {
+				lock.release()
+				fail failure
+			}
+			try lock.commit()
+			listText = ""
+			try refresh()
+			return none
+		}
+	}
+
+	// Log records in table order: by name, then newest update first.
+	internal def compareRtLogs(a RtLog, b RtLog) int {
+		let c = compareBytes(a.name, b.name)
+		return c when c != 0
+		return 0 when a.updateIndex == b.updateIndex
+		return a.updateIndex > b.updateIndex ?? (-1, 1)
+	}
+
+	// An update index as table names write it: 0x and twelve hex digits.
+	internal def rtIndexName(index int64) string {
+		return "0x" + "%012x".format(index)
+	}
+
+	// The reftable store of a repository. Fails when its stack is unreadable.
+	internal def openReftable(gitDir string, commonDir string, format ObjectFormat) !ReftableRefs {
+		let r = new ReftableRefs(gitDir, os.join(commonDir, "reftable"), format)
+		try r.refresh()
+		return r
+	}
+
+	// Writes the first table of a new reftable repository: HEAD naming the
+	// initial branch.
+	internal def initReftable(gitDir string, format ObjectFormat, branch string) !none {
+		let dir = os.join(gitDir, "reftable")
+		let refs = [RtRef{name: "HEAD", updateIndex: 1, deleted: false, ref: Reference{name: "HEAD", target: branch}}]
+		let data = encodeReftable(refs, [], 1, 1, format)
+		let token = crypto.rand(4) onerror recover byte[]
+		let fileName = "{rtIndexName(1)}-{rtIndexName(1)}-{token.hex().lower()}.ref"
+		try writeAtomically(os.join(dir, fileName), data)
+		try os.writeFile(os.join(dir, "tables.list"), (fileName + "\n").bytes())
+		return none
+	}
+}

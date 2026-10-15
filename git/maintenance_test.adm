@@ -1,0 +1,65 @@
+// Repacking, bitmaps written, pruning and gc; checked by git when a binary
+// is given (ADM_TEST_GIT_BINARY).
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+		std.testing
+	)
+
+	check "Maintenance" {
+		@test()
+		def repacksEverything() !none {
+			let root = try fixtures()
+			let repo = try clone(os.join(root, "twopacks.git"), try scratch("repack"), bare = true)
+			let tip = try repo.resolve("main")
+			// Loose objects: a reachable commit and an unreachable blob.
+			let next = try addCommit(repo, "main", tip, "Loose commit")
+			let stray = try repo.writeBlob("nothing reaches this\n".bytes())
+			let before = try objectsToPack(repo, try reachableRoots(repo), [])
+			let sum = try repo.repack(RepackOptions{bitmap: true})
+			fail "nothing packed" when sum is none
+			let packs = (try os.readDir(os.join(repo.objects.dir, "pack"))).filter(e => e.path.endsWith(".pack"))
+			fail "{packs.len()} packs after repack" unless packs.len() == 1
+			let stem = packs[0].path.slice(0, packs[0].path.len() - 5)
+			fail "no bitmap written" unless try os.exists(stem + ".bitmap")
+			fail "multi-pack index left" when try os.exists(os.join(repo.objects.dir, "pack", "multi-pack-index"))
+			fail "next lost" unless repo.has(next)
+			fail "stray dropped before prune" unless repo.has(stray)
+			// The bitmap answers like the walk.
+			let b = repositoryBitmap(repo)
+			fail "bitmap not read" when b is none
+			let roots = try reachableRoots(repo)
+			let viaBitmap = sortedIds(try objectsToPack(repo, roots, []))
+			let walker = try open(repo.gitDir)
+			walker.bitmapLoaded = true
+			let walked = sortedIds(try objectsToPack(walker, roots, []))
+			walker.close()
+			fail "bitmap gives {viaBitmap.len()}, walk {walked.len()}" unless viaBitmap.equals(walked)
+			fail "repack lost objects" unless walked.equals(sortedIds(before))
+			// Pruning: old enough unreachable loose objects go.
+			let kept = try repo.prune(time.now() - 24h)
+			fail "fresh stray pruned" unless kept == 0 && repo.has(stray)
+			let pruned = try repo.prune(time.now() + 24h)
+			// The stray, and the README blob addCommit wrote for a tree without
+			// a README.
+			fail "pruned {pruned}" unless pruned == 2 && !repo.has(stray) && repo.has(next)
+			if gitBinary != "" {
+				let home = try scratch("repack-home")
+				let _ = try runGit(home, repo.gitDir, ["fsck", "--strict", "--no-dangling"])
+				let _ = try runGit(home, repo.gitDir, ["rev-list", "--test-bitmap", "main"])
+				let _ = try runGit(home, repo.gitDir, ["verify-pack", stem + ".idx"])
+			}
+			// gc on a repository with a working tree.
+			let work = try clone(os.join(root, "basic.git"), try scratch("gc"))
+			let head = try work.resolve("HEAD")
+			try work.gc()
+			fail "gc lost HEAD" unless (try work.resolve("HEAD")).equals(head)
+			let st = try work.status()
+			fail "gc changed the working tree" unless st.entries.len() == 0
+			work.close()
+			repo.close()
+			return none
+		}
+	}
+}

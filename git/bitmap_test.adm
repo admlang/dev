@@ -1,0 +1,66 @@
+// Reachability bitmaps (a pack's and a multi-pack index's) answer what git
+// rev-list --objects answers, and what the walk without them answers.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	// The wants and haves of a rev-list spec: names, `^name`, or `--all`.
+	internal def specTips(repo Repository, spec string) !(ObjectId[], ObjectId[]) {
+		let wants ObjectId[] = []
+		let haves ObjectId[] = []
+		for let word in spec.split(" ") {
+			if word == "--all" {
+				let head = try repo.headId()
+				wants.push(head) unless head is none
+				for let r in try repo.refs("refs/") {
+					let id = try repo.refTarget(r.name)
+					wants.push(id) unless id is none
+				}
+			} else if word.startsWith("^") {
+				haves.push(try repo.peel(try repo.resolve(word.slice(1)), ObjectKind.Commit))
+			} else {
+				wants.push(try repo.resolve(word))
+			}
+		}
+		return (wants, haves)
+	}
+
+	internal def sortedIds(items PackItem[]) string[] {
+		let ids = items.mapElem(it => it.id.str())
+		ids.sort((a, b) => a < b)
+		return ids
+	}
+
+	check "Bitmaps" {
+		@test()
+		def answersLikeRevList() !none {
+			let root = try fixtures()
+			for let name in string["bitmaps", "midxbitmaps"] {
+				let repo = try open(os.join(root, name + ".git"))
+				let b = repositoryBitmap(repo)
+				fail "{name}: no bitmap found" when b is none
+				fail "{name}: bitmap of the wrong kind" unless (name == "midxbitmaps") == !(b.midx is none)
+				let answers = string(try os.readFile(os.join(root, "expected", name + ".txt")))
+				for let line in answers.split("\n") {
+					continue when line == ""
+					let tab = line.indexOf("\t")
+					let spec = line.slice(0, tab)
+					let want = line.slice(tab + 1).trim().split(" ")
+					let (wants, haves) = try specTips(repo, spec)
+					let got = sortedIds(try objectsToPack(repo, wants, haves))
+					fail "{name} {spec}: bitmap gives {got.len()} objects, git {want.len()}" unless got.equals(want)
+					// The walk without the bitmap agrees.
+					let walker = try open(os.join(root, name + ".git"))
+					walker.bitmapLoaded = true
+					let walked = sortedIds(try objectsToPack(walker, wants, haves))
+					walker.close()
+					fail "{name} {spec}: walk gives {walked.len()} objects, git {want.len()}" unless walked.equals(want)
+				}
+				repo.close()
+			}
+			return none
+		}
+	}
+}

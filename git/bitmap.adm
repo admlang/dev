@@ -1,0 +1,456 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.simd
+		std.services.storage::(MapAccess)
+	)
+
+	// A reachability bitmap index (`pack-*.bitmap`, or the multi-pack
+	// index's): for selected commits, the set of objects each reaches, as
+	// bits in pack order. Objects outside the bitmapped pack get positions
+	// past its end as a walk meets them.
+	internal type PackBitmap {
+		internal data      byte[]
+		internal mapping   ?os.Mapping = none
+		// Objects the bitmapped pack (or multi-pack index) holds.
+		count              int
+		flags              int
+		commits            Bitset
+		trees              Bitset
+		blobs              Bitset
+		tags               Bitset
+		// Per entry: where its EWAH starts, its XOR base entry (-1), and the
+		// commit's bit.
+		internal entryAt   int[]  = []
+		internal entryXor  int[]  = []
+		internal entryBit  int[]  = []
+		// Commit bit → entry.
+		internal byBit     map<int, int> = {}
+		internal decoded   map<int, Bitset> = {}
+		// Bit position ↔ id: through the pack or the multi-pack index.
+		internal pack      ?Pack        = none
+		internal midx      ?MidxLayer   = none
+		// Index position → bit, and bit → index position.
+		internal bitOf     int[]        = []
+		internal indexAt   int[]        = []
+		// Name hashes by index position (the hash cache), empty without one.
+		internal names     uint32[]     = []
+		// Objects past the pack: ids by extra position, positions by id.
+		internal extra     ObjectId[]   = []
+		internal extraPos  map<string, int> = {}
+		internal extraPath string[]     = []
+
+		def new() {
+			commits = new Bitset()
+			trees = new Bitset()
+			blobs = new Bitset()
+			tags = new Bitset()
+		}
+
+		def close() {
+			let m = mapping
+			m.close() unless m is none
+			mapping = none
+		}
+
+		// Unmaps the file when the bitmap is released (the pack stays with
+		// its database).
+		def dispose() {
+			close()
+		}
+
+		// The bit of an object, -1 when it is neither in the pack nor met
+		// yet.
+		def bitOfId(id ObjectId) int {
+			let p = pack
+			if !(p is none) {
+				let n = p.find(id.bytes)
+				return bitOf[n] when n >= 0
+			} else {
+				let m = midx
+				if !(m is none) {
+					let n = m.position(id.bytes)
+					return bitOf[n] when n >= 0
+				}
+			}
+			let e = extraPos.get(id.str())
+			return e is none ?? (-1, count + e)
+		}
+
+		// The bit for an object outside the pack, given one the first time.
+		def bitForExtra(id ObjectId, path string) int {
+			let k = id.str()
+			let e = extraPos.get(k)
+			return count + e unless e is none
+			extraPos[k] = extra.len()
+			extra.push(id)
+			extraPath.push(path)
+			return count + extra.len() - 1
+		}
+
+		// The object at a bit.
+		def idAt(bit int) ObjectId {
+			return extra[bit - count] when bit >= count
+			let p = pack
+			return p.idAt(indexAt[bit]) unless p is none
+			let m = midx
+			return m.idAt(indexAt[bit]) unless m is none
+			return new ObjectId(byte[])
+		}
+
+		// The path hash of the object at a bit (`git`'s name hash), -1 when
+		// unknown.
+		def nameHashAt(bit int) int64 {
+			if bit >= count {
+				return nameHash(extraPath[bit - count])
+			}
+			return -1 when names.len() == 0
+			return int64(names[indexAt[bit]])
+		}
+
+		// The stored bitmap of the commit at a bit, none when it has none.
+		// Fails when the file is corrupt.
+		def stored(bit int) !?Bitset {
+			let e = byBit.get(bit)
+			return none when e is none
+			return try entryBitmap(e)
+		}
+
+		internal def entryBitmap(e int) !Bitset {
+			let cached = decoded.get(e)
+			return cached unless cached is none
+			let (bits, _) = try readEwah(data, entryAt[e])
+			let x = entryXor[e]
+			if x >= 0 {
+				let base = try entryBitmap(x)
+				xorWords(bits, base)
+			}
+			decoded[e] = bits
+			return bits
+		}
+	}
+
+	// `a ^= b`, word by word, four words a step.
+	internal def xorWords(a Bitset, b Bitset) {
+		if b.words.len() > a.words.len() {
+			let old = a.words.len()
+			a.words.len(b.words.len())
+			for let k = old; k < a.words.len(); k++ {
+				a.words[k] = 0
+			}
+		}
+		let n = b.words.len()
+		let k = 0
+		for k + 4 <= n {
+			simd.store4(a.words, k, simd.load4(a.words, k) ^ simd.load4(b.words, k))
+			k += 4
+		}
+		for k < n {
+			a.words[k] = a.words[k] ^ b.words[k]
+			k++
+		}
+	}
+
+	// `a |= b`, four words a step.
+	internal def orWords(a Bitset, b Bitset) {
+		if b.words.len() > a.words.len() {
+			let old = a.words.len()
+			a.words.len(b.words.len())
+			for let k = old; k < a.words.len(); k++ {
+				a.words[k] = 0
+			}
+		}
+		let n = b.words.len()
+		let k = 0
+		for k + 4 <= n {
+			simd.store4(a.words, k, simd.load4(a.words, k) | simd.load4(b.words, k))
+			k += 4
+		}
+		for k < n {
+			a.words[k] = a.words[k] | b.words[k]
+			k++
+		}
+	}
+
+	// `a &= ~b`, four words a step.
+	internal def andNotWords(a Bitset, b Bitset) {
+		let n = a.words.len().min(b.words.len())
+		let k = 0
+		for k + 4 <= n {
+			let va = simd.load4(a.words, k)
+			simd.store4(a.words, k, va ^ (va & simd.load4(b.words, k)))
+			k += 4
+		}
+		for k < n {
+			a.words[k] = a.words[k] & ~b.words[k]
+			k++
+		}
+	}
+
+	// The set bits of a word set, in increasing order: one de Bruijn lookup
+	// per bit.
+	internal def bitsOf(set Bitset) int[] {
+		let out int[] = []
+		for let k = 0; k < set.words.len(); k++ {
+			let x = set.words[k]
+			for x != 0 {
+				let low = x & (~x + 1)
+				out.push(k * 64 + debruijn64[int((low * 0x03F79D71B4CB0A89) >> 58)])
+				x = x & (x - 1)
+			}
+		}
+		return out
+	}
+
+	internal const debruijn64 = int[
+		0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4,
+		62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5,
+		63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11,
+		46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6,
+	]
+
+	// Reads a bitmap file for a pack (`pack` set) or a multi-pack index
+	// layer. Fails when it is malformed or belongs to another pack.
+	internal def loadBitmap(path string, count int, checksum byte[], hashLen int) !PackBitmap {
+		let b = new PackBitmap()
+		let m = try os.mapFile(path, MapAccess.Copy)
+		b.mapping = m
+		let data = try m.pages(0, m.length())
+		b.data = data
+		fail "git: {path} is not a bitmap index" when data.len() < 12 + hashLen || string(data[0:4]) != "BITM"
+		let version = (int(data[4]) << 8) | int(data[5])
+		fail "git: {path} has unsupported version {version}" unless version == 1
+		b.flags = (int(data[6]) << 8) | int(data[7])
+		fail "git: {path} is not a full-closure bitmap" when (b.flags & 1) == 0
+		let entries = be32(data, 8)
+		fail "git: {path} belongs to another pack" unless compareIdBytes(data, 12, checksum, 0, hashLen) == 0
+		b.count = count
+		let at = 12 + hashLen
+		let (c, a1) = try readEwah(data, at)
+		let (t, a2) = try readEwah(data, a1)
+		let (bl, a3) = try readEwah(data, a2)
+		let (tg, a4) = try readEwah(data, a3)
+		b.commits = c
+		b.trees = t
+		b.blobs = bl
+		b.tags = tg
+		at = a4
+		for let i = 0; i < entries; i++ {
+			fail "git: {path} is truncated" when at + 6 > data.len()
+			let indexPos = be32(data, at)
+			let xor = int(data[at + 4])
+			b.entryBit.push(indexPos)
+			b.entryXor.push(xor == 0 ?? (-1, i - xor))
+			fail "git: {path} has a bad XOR offset" when xor > i
+			b.entryAt.push(at + 6)
+			// Skip the EWAH: bit count, word count, words, RLW position.
+			let words = be32(data, at + 10)
+			at = at + 6 + 8 + words * 8 + 4
+		}
+		// The name-hash cache sits at the end, before the checksum.
+		if (b.flags & 0x4) != 0 {
+			let start = data.len() - hashLen - count * 4
+			fail "git: {path} is truncated" when start < at
+			b.names.len(count)
+			for let i = 0; i < count; i++ {
+				b.names[i] = uint32(be32(data, start + i * 4))
+			}
+		}
+		return b
+	}
+
+	// The repository's bitmap: the multi-pack index's when it has one (as
+	// git prefers), else the first pack's; none when there is none or it
+	// cannot be used.
+	internal def repositoryBitmap(repo Repository) ?PackBitmap {
+		if !repo.bitmapLoaded {
+			repo.bitmapLoaded = true
+			repo.bitmap = findBitmap(repo.objects) onerror recover none
+		}
+		return repo.bitmap
+	}
+
+	internal def findBitmap(odb ObjectDatabase) !?PackBitmap {
+		let hashLen = idLength(odb.format)
+		let m = odb.midx
+		if !(m is none) && m.layers.len() == 1 {
+			let layer = m.layers[0]
+			let checksum = layer.data[layer.data.len() - hashLen:]
+			let path = os.join(odb.dir, "pack", "multi-pack-index-{bytesHex(checksum)}.bitmap")
+			if try os.exists(path) {
+				let order = try midxPseudoOrder(odb, layer, checksum)
+				if !(order is none) {
+					let b = try loadBitmap(path, layer.count, checksum, hashLen)
+					b.midx = layer
+					b.indexAt = order
+					b.bitOf = inverseOrder(order)
+					return b
+				}
+			}
+		}
+		for let p in odb.packs {
+			let path = p.path.slice(0, p.path.len() - 5) + ".bitmap"
+			continue unless try os.exists(path)
+			let checksum = p.data[p.data.len() - hashLen:]
+			let b = try loadBitmap(path, p.count, checksum, hashLen)
+			b.pack = p
+			b.indexAt = p.reverse()
+			b.bitOf = inverseOrder(b.indexAt)
+			return b
+		}
+		return none
+	}
+
+	internal def inverseOrder(order int[]) int[] {
+		let out int[]
+		out.len(order.len())
+		for let (pos, n) in order {
+			out[n] = pos
+		}
+		return out
+	}
+
+	internal def bytesHex(data byte[]) string {
+		return data.hex().lower()
+	}
+
+	// The multi-pack index's pseudo-pack order (midx positions by bit):
+	// its RIDX chunk, else its `.rev` file; none without either.
+	internal def midxPseudoOrder(odb ObjectDatabase, layer MidxLayer, checksum byte[]) !?int[] {
+		let data = layer.data
+		let chunks = int(data[6])
+		for let i = 0; i < chunks; i++ {
+			let at = 12 + i * 12
+			if string(data[at:at + 4]) == "RIDX" {
+				let offset = int(be64(data, at + 4))
+				let out int[]
+				out.len(layer.count)
+				for let k = 0; k < layer.count; k++ {
+					out[k] = be32(data, offset + k * 4)
+				}
+				return out
+			}
+		}
+		let rev = os.join(odb.dir, "pack", "multi-pack-index-{bytesHex(checksum)}.rev")
+		return none unless try os.exists(rev)
+		let r = try os.readFile(rev)
+		fail "git: {rev} is not a reverse index" when r.len() < 12 + layer.count * 4 || string(r[0:4]) != "RIDX"
+		let out int[]
+		out.len(layer.count)
+		for let k = 0; k < layer.count; k++ {
+			out[k] = be32(r, 12 + k * 4)
+		}
+		return out
+	}
+
+	// The objects reachable from `tips` as bits: stored bitmaps where a
+	// commit has one, a walk elsewhere (commits, their trees and blobs) that
+	// stops at what is already set or at `stop`'s members.
+	internal def reachableBits(repo Repository, b PackBitmap, tips ObjectId[], stop ?Bitset) !Bitset {
+		let out = new Bitset()
+		let queue ObjectId[] = []
+		for let t in tips {
+			try addTip(repo, b, t, out, queue)
+		}
+		let head = 0
+		for head < queue.len() {
+			let id = queue[head]
+			head++
+			let bit = b.bitOfId(id)
+			if bit >= 0 {
+				continue when out.has(bit)
+				if !(stop is none) && stop.has(bit) {
+					continue
+				}
+				let stored = try b.stored(bit)
+				if !(stored is none) {
+					orWords(out, stored)
+					continue
+				}
+			}
+			let c = try repo.commitAt(id)
+			out.add(bit >= 0 ?? (bit, b.bitForExtra(id, "")))
+			try addTreeBits(repo, b, c.tree, "", out)
+			for let p in c.parents {
+				queue.push(p)
+			}
+		}
+		return out
+	}
+
+	internal def addTip(repo Repository, b PackBitmap, id ObjectId, out Bitset, queue ObjectId[]) !none {
+		let current = id
+		for let depth = 0; depth < 10; depth++ {
+			let (kind, _) = try repo.info(current)
+			switch kind {
+				case ObjectKind.Commit:
+					queue.push(current)
+					return none
+				case ObjectKind.Tag:
+					let bit = b.bitOfId(current)
+					out.add(bit >= 0 ?? (bit, b.bitForExtra(current, "")))
+					current = (try repo.tag(current)).target
+				case ObjectKind.Tree:
+					return try addTreeBits(repo, b, current, "", out)
+				default:
+					let bit = b.bitOfId(current)
+					out.add(bit >= 0 ?? (bit, b.bitForExtra(current, "")))
+					return none
+			}
+		}
+		return none
+	}
+
+	// Sets the bits of a tree and what it holds, not descending into trees
+	// already set.
+	internal def addTreeBits(repo Repository, b PackBitmap, id ObjectId, path string, out Bitset) !none {
+		let bit = b.bitOfId(id)
+		let at = bit >= 0 ?? (bit, b.bitForExtra(id, path))
+		return none when out.has(at)
+		out.add(at)
+		let t = try repo.tree(id)
+		for let e in t.entries {
+			let p = path == "" ?? (e.name, path + "/" + e.name)
+			if isTree(e.mode) {
+				try addTreeBits(repo, b, e.id, p, out)
+			} else if e.mode != EntryMode.Submodule {
+				let eb = b.bitOfId(e.id)
+				out.add(eb >= 0 ?? (eb, b.bitForExtra(e.id, p)))
+			}
+		}
+		return none
+	}
+
+	// What a pack for `wants` minus `haves` holds, from the bitmap: commits
+	// first, then the rest in pack order, with path hashes from the hash
+	// cache. Fails when an object is missing.
+	internal def objectsFromBitmap(repo Repository, b PackBitmap, wants ObjectId[], haves ObjectId[]) !PackItem[] {
+		let present = haves.filter(h => repo.has(h))
+		let haveBits ?Bitset = none
+		if present.len() > 0 {
+			haveBits = try reachableBits(repo, b, present, none)
+		}
+		let result = try reachableBits(repo, b, wants, haveBits)
+		if !(haveBits is none) {
+			andNotWords(result, haveBits)
+		}
+		let out PackItem[] = []
+		let rest PackItem[] = []
+		for let bit in bitsOf(result) {
+			let item = PackItem{id: b.idAt(bit), hash: b.nameHashAt(bit)}
+			if bit < b.count && b.commits.has(bit) {
+				out.push(item)
+			} else if bit >= b.count && try isCommitObject(repo, item.id) {
+				out.push(item)
+			} else {
+				rest.push(item)
+			}
+		}
+		return out + rest
+	}
+
+	internal def isCommitObject(repo Repository, id ObjectId) !bool {
+		let (kind, _) = try repo.info(id)
+		return kind == ObjectKind.Commit
+	}
+}

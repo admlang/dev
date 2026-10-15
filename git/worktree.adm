@@ -1,0 +1,443 @@
+partial module adm.dev.git {
+	use std.os
+
+	// What the working tree file of an index entry looks like now.
+	internal struct WorktreeFile {
+		exists bool
+		// The mode it would be staged with (0 when missing).
+		mode   int
+		stat   StatData
+		info   ?os.FileInfo
+	}
+
+	// The working tree file at path as git sees it (lstat).
+	internal def worktreeFile(repo Repository, path string) WorktreeFile {
+		let full = os.join(repo.workDir, path)
+		let info = statOrNone(full, false)
+		return WorktreeFile{exists: false, mode: 0, stat: StatData{}, info: none} when info is none
+		let mode = 0
+		let kinds = int(info.mode)
+		if (kinds & int(os.FileMode.Symlink)) != 0 {
+			mode = 0o120000
+		} else if info.isDir {
+			// A folder where the index has a file is a submodule's checkout
+			// or a type change; staged as a gitlink only when it holds a
+			// repository.
+			mode = (os.exists(os.join(full, ".git")) onerror recover false) ?? (0o160000, 0o40000)
+		} else {
+			mode = (kinds & 0o100) != 0 ?? (0o100755, 0o100644)
+		}
+		return WorktreeFile{exists: true, mode: mode, stat: statDataOf(info), info: info}
+	}
+
+	// The mode git stages a working tree file with, honoring core.fileMode
+	// (an untrusted executable bit keeps the index's) and core.symlinks.
+	internal def stagedMode(repo Repository, file WorktreeFile, previous int) int {
+		let trustExec = repo.config.getBool("core.filemode", true) onerror recover true
+		if file.mode == 0o100755 || file.mode == 0o100644 {
+			if !trustExec && (previous == 0o100755 || previous == 0o100644) {
+				return previous
+			}
+		}
+		return file.mode
+	}
+
+	// How stat data is compared (core.checkStat, core.trustctime).
+	internal struct StatPolicy {
+		checkStat  bool
+		trustCtime bool
+		trustExec  bool
+	}
+
+	internal def statPolicy(repo Repository) StatPolicy {
+		let checkStat = repo.config.get("core.checkstat", "default").lower() != "minimal"
+		let ctime = repo.config.getBool("core.trustctime", true) onerror recover true
+		let exec = repo.config.getBool("core.filemode", true) onerror recover true
+		return StatPolicy{checkStat: checkStat, trustCtime: ctime, trustExec: exec}
+	}
+
+	// Whether the file's stat data and type match what the index recorded,
+	// so its content need not be read (git's ce_match_stat, without the
+	// racy check).
+	internal def statMatches(e IndexEntry, file WorktreeFile, policy StatPolicy) bool {
+		return false unless file.exists
+		let kind = e.mode & 0o170000
+		switch kind {
+			case 0o100000:
+				return false unless file.mode == 0o100644 || file.mode == 0o100755
+				return false when policy.trustExec && ((e.mode ^ file.mode) & 0o100) != 0
+			case 0o120000:
+				return false unless file.mode == 0o120000
+			case 0o160000:
+				// A submodule's checkout: compared by its HEAD elsewhere.
+				return file.mode == 0o160000 || file.mode == 0o40000
+		}
+		let a = e.stat
+		let b = file.stat
+		return false when (a.mtimeSeconds & 0xFFFFFFFF) != (b.mtimeSeconds & 0xFFFFFFFF)
+		return false when policy.checkStat && a.mtimeNanos != b.mtimeNanos
+		if policy.trustCtime && policy.checkStat {
+			return false when (a.ctimeSeconds & 0xFFFFFFFF) != (b.ctimeSeconds & 0xFFFFFFFF) || a.ctimeNanos != b.ctimeNanos
+		}
+		if policy.checkStat {
+			return false when (a.uid & 0xFFFFFFFF) != (b.uid & 0xFFFFFFFF) || (a.gid & 0xFFFFFFFF) != (b.gid & 0xFFFFFFFF)
+			return false when (a.inode & 0xFFFFFFFF) != (b.inode & 0xFFFFFFFF)
+		}
+		return false when (a.size & 0xFFFFFFFF) != (b.size & 0xFFFFFFFF)
+		// An entry with size 0 whose blob is not empty was smudged as racy.
+		return false when a.size == 0 && !e.id.equals(hashObject(ObjectKind.Blob, [], e.id.format()))
+		return true
+	}
+
+	// Whether the entry was written in the same instant as the index or
+	// after it, so a file changed right after staging could still match
+	// its stat data.
+	internal def racy(idx Index, e IndexEntry) bool {
+		return false when idx.fileTime == 0 || (e.mode & 0o170000) == 0o160000
+		let indexSec = idx.fileTime / 1000000000
+		let indexNs = idx.fileTime % 1000000000
+		return indexSec < e.stat.mtimeSeconds || (indexSec == e.stat.mtimeSeconds && indexNs <= e.stat.mtimeNanos)
+	}
+
+	// The id the working tree file would be staged with: its content through
+	// the clean conversions, a link's target, or a submodule's HEAD (the
+	// zero id when it has none).
+	internal def worktreeId(repo Repository, path string, file WorktreeFile, idx Index) !ObjectId {
+		if file.mode == 0o160000 {
+			let sub = openOrNone(os.join(repo.workDir, path))
+			if sub is none {
+				return zeroId(repo.format)
+			}
+			let head = sub.headId() onerror recover none
+			sub.close()
+			return head is none ?? (zeroId(repo.format), head)
+		}
+		let data = try worktreeContent(repo, path, idx)
+		return hashObject(ObjectKind.Blob, data, repo.format)
+	}
+
+	// The repository at path, none when there is none or it cannot be
+	// opened.
+	internal def openOrNone(path string) ?Repository {
+		return tryOpen(path) onerror recover none
+	}
+
+	internal def tryOpen(path string) !?Repository {
+		return try open(path)
+	}
+
+	// The changes from the index (stage 0) to the working tree, unmerged
+	// paths reported as such. Files whose stat data match are taken as
+	// unchanged without reading them, unless racily clean. `refresh` gets
+	// the stat data of files that turned out unchanged, to write back.
+	internal def worktreeChanges(repo Repository, idx Index, spec Pathspec, refresh ?map<string, StatData> = none) !FileChange[] {
+		fail "git: the repository is bare" when repo.workDir == ""
+		let policy = statPolicy(repo)
+		let zero = zeroId(repo.format)
+		let out FileChange[] = []
+		let i = 0
+		let entries = idx.entries
+		for i < entries.len() {
+			let e = entries[i]
+			if e.stage > 0 {
+				// Every stage of an unmerged path is one change.
+				let path = e.path
+				let j = i
+				for j < entries.len() && entries[j].path == path {
+					j++
+				}
+				out.push(FileChange{kind: ChangeKind.Unmerged, oldPath: path, newPath: path, oldMode: 0, newMode: 0, oldId: zero, newId: zero}) when spec.matches(path)
+				i = j
+				continue
+			}
+			i++
+			continue unless spec.matches(e.path)
+			continue when e.skipWorktree || e.assumeValid
+			// A sparse folder entry stands for a tree that is not checked out.
+			continue when e.mode == 0o40000
+			let file = worktreeFile(repo, e.path)
+			if !file.exists {
+				out.push(FileChange{kind: ChangeKind.Deleted, oldPath: e.path, newPath: e.path, oldMode: e.mode, newMode: 0, oldId: e.id, newId: zero})
+				continue
+			}
+			let mode = stagedMode(repo, file, e.mode)
+			if e.intentToAdd {
+				let id = try worktreeId(repo, e.path, file, idx)
+				out.push(FileChange{kind: ChangeKind.Added, oldPath: e.path, newPath: e.path, oldMode: 0, newMode: mode, oldId: zero, newId: id, inWorktree: true})
+				continue
+			}
+			if (e.mode & 0o170000) != (mode & 0o170000) && !((e.mode & 0o170000) == 0o160000 && mode == 0o40000) {
+				let id = try worktreeId(repo, e.path, file, idx)
+				out.push(FileChange{kind: ChangeKind.TypeChanged, oldPath: e.path, newPath: e.path, oldMode: e.mode, newMode: mode, oldId: e.id, newId: id, inWorktree: true})
+				continue
+			}
+			if (e.mode & 0o170000) == 0o160000 {
+				let id = try worktreeId(repo, e.path, file, idx)
+				if !id.equals(e.id) && !id.isZero() {
+					out.push(FileChange{kind: ChangeKind.Modified, oldPath: e.path, newPath: e.path, oldMode: e.mode, newMode: e.mode, oldId: e.id, newId: id})
+				}
+				continue
+			}
+			if statMatches(e, file, policy) && !racy(idx, e) {
+				continue
+			}
+			let id = try worktreeId(repo, e.path, file, idx)
+			if id.equals(e.id) && mode == e.mode {
+				let r = refresh
+				r[e.path] = file.stat unless r is none
+				continue
+			}
+			out.push(FileChange{kind: ChangeKind.Modified, oldPath: e.path, newPath: e.path, oldMode: e.mode, newMode: mode, oldId: e.id, newId: id, inWorktree: true})
+		}
+		return out
+	}
+
+	// How untracked files are listed.
+	enum UntrackedMode {
+		// Not at all (`-uno`).
+		No,
+		// A folder with nothing tracked in it as the folder (`-unormal`).
+		Normal,
+		// Every file (`-uall`).
+		All
+	}
+
+	// The untracked paths of the working tree (folders end in `/` in
+	// Normal mode), and with `ignored` the ignored ones as well, each list
+	// sorted. A nested repository is reported as a folder.
+	internal def untrackedPaths(repo Repository, idx Index, mode UntrackedMode, spec Pathspec, wantIgnored bool) !(string[], string[]) {
+		let untracked string[] = []
+		let ignored string[] = []
+		return (untracked, ignored) when mode == UntrackedMode.No && !wantIgnored
+		let tracked map<string, bool> = {}
+		let trackedDirs map<string, bool> = {}
+		for let e in idx.entries {
+			tracked[e.path] = true
+			let parts = e.path.split("/")
+			let prefix = ""
+			for let k = 0; k < parts.len() - 1; k++ {
+				prefix = prefix == "" ?? (parts[k], prefix + "/" + parts[k])
+				trackedDirs[prefix] = true
+			}
+		}
+		let rules = ignoreRulesOf(repo)
+		try walkUntracked(repo, "", tracked, trackedDirs, rules, mode, spec, wantIgnored, untracked, ignored)
+		untracked.sort((a, b) => compareBytes(a, b))
+		ignored.sort((a, b) => compareBytes(a, b))
+		return (untracked, ignored)
+	}
+
+	internal def walkUntracked(repo Repository, dir string, tracked map<string, bool>, trackedDirs map<string, bool>, rules IgnoreRules, mode UntrackedMode, spec Pathspec, wantIgnored bool, untracked string[], ignored string[]) !none {
+		let full = dir == "" ?? (repo.workDir, os.join(repo.workDir, dir))
+		let entries = os.readDir(full) onerror recover os.DirEntry[]
+		for let e in entries {
+			let name = e.info.name
+			continue when name == ".git"
+			let path = dir == "" ?? (name, dir + "/" + name)
+			let isLink = (int(e.info.mode) & int(os.FileMode.Symlink)) != 0
+			let isDir = e.info.isDir && !isLink
+			if isDir {
+				continue when tracked.hasKey(path)
+				let nested = os.exists(os.join(e.path, ".git")) onerror recover false
+				continue unless spec.mayMatchDir(path) || spec.matches(path)
+				if rules.ignored(path, true) {
+					ignored.push(path + "/") when wantIgnored
+					continue
+				}
+				if trackedDirs.hasKey(path) && !nested {
+					try walkUntracked(repo, path, tracked, trackedDirs, rules, mode, spec, wantIgnored, untracked, ignored)
+					continue
+				}
+				if nested {
+					untracked.push(path + "/") unless mode == UntrackedMode.No
+					continue
+				}
+				// A folder with nothing tracked in it.
+				if mode == UntrackedMode.All {
+					try walkUntracked(repo, path, tracked, trackedDirs, rules, mode, spec, wantIgnored, untracked, ignored)
+					continue
+				}
+				if mode == UntrackedMode.Normal && hasUntrackedFile(repo, path, rules) {
+					untracked.push(path + "/")
+				}
+				if wantIgnored {
+					// Only the ignored paths inside are collected.
+					let none0 string[] = []
+					try walkUntracked(repo, path, tracked, trackedDirs, rules, UntrackedMode.No, spec, true, none0, ignored)
+				}
+				continue
+			}
+			continue when tracked.hasKey(path)
+			continue unless spec.matches(path)
+			if rules.ignored(path, false) {
+				ignored.push(path) when wantIgnored
+				continue
+			}
+			untracked.push(path) unless mode == UntrackedMode.No
+		}
+		return none
+	}
+
+	// Whether a folder holds a file that is not ignored (an empty folder,
+	// or one with only ignored content, is not shown as untracked).
+	internal def hasUntrackedFile(repo Repository, dir string, rules IgnoreRules) bool {
+		let entries = os.readDir(os.join(repo.workDir, dir)) onerror recover os.DirEntry[]
+		for let e in entries {
+			let path = dir + "/" + e.info.name
+			let isLink = (int(e.info.mode) & int(os.FileMode.Symlink)) != 0
+			if e.info.isDir && !isLink {
+				continue when rules.ignored(path, true)
+				return true when os.exists(os.join(e.path, ".git")) onerror recover false
+				return true when hasUntrackedFile(repo, path, rules)
+				continue
+			}
+			return true unless rules.ignored(path, false)
+		}
+		return false
+	}
+
+	// ---- status ---------------------------------------------------------------------
+
+	// One path of `git status`: what changed between HEAD and the index
+	// (staged) and between the index and the working tree (unstaged); none
+	// for a side without change.
+	struct StatusEntry {
+		path     string
+		// The path before a rename or copy in the index.
+		origPath string      = ""
+		staged   ?ChangeKind = none
+		unstaged ?ChangeKind = none
+		untracked bool       = false
+		ignored  bool        = false
+		// For an unmerged path, the stages present: "UU" (both modified),
+		// "AA" (both added), "DU", "UD", "AU", "UA", "DD", as git prints
+		// them.
+		conflict string      = ""
+	}
+
+	// Options for `status`.
+	struct StatusOptions {
+		untracked UntrackedMode = UntrackedMode.Normal
+		ignored   bool          = false
+		// Find renames between HEAD and the index (status.renames).
+		renames   bool          = true
+		paths     string[]      = []
+	}
+
+	// Status is the state of the working tree and index against HEAD.
+	struct Status {
+		// The branch HEAD is on; empty when detached.
+		branch  string
+		head    ?ObjectId
+		entries StatusEntry[]
+	}
+
+	// Whether the status shows no change, staged or not, and no untracked
+	// path.
+	def isClean(s Status) bool {
+		for let e in s.entries {
+			return false unless e.ignored
+		}
+		return true
+	}
+
+	// The status as `git status --porcelain` (version 1) prints it: `XY
+	// path` per line, `XY orig -> path` for a rename or copy, `??` for
+	// untracked and `!!` for ignored paths, paths quoted as git quotes
+	// them.
+	def porcelain(s Status) string {
+		let out string[] = []
+		for let e in s.entries {
+			let x = " "
+			let y = " "
+			if e.untracked {
+				x = "?"
+				y = "?"
+			} else if e.ignored {
+				x = "!"
+				y = "!"
+			} else if e.conflict != "" {
+				x = e.conflict.slice(0, 1)
+				y = e.conflict.slice(1, 2)
+			} else {
+				let st = e.staged
+				x = changeLetter(st) unless st is none
+				let un = e.unstaged
+				y = changeLetter(un) unless un is none
+			}
+			let path = quotePath(e.path)
+			if e.origPath != "" {
+				out.push("{x}{y} {quotePath(e.origPath)} -> {path}")
+			} else {
+				out.push("{x}{y} {path}")
+			}
+		}
+		return out.len() == 0 ?? ("", out.join("\n") + "\n")
+	}
+
+	// The letter git prints for a change kind.
+	def changeLetter(kind ChangeKind) string {
+		switch kind {
+			case ChangeKind.Added:
+				return "A"
+			case ChangeKind.Deleted:
+				return "D"
+			case ChangeKind.Renamed:
+				return "R"
+			case ChangeKind.Copied:
+				return "C"
+			case ChangeKind.TypeChanged:
+				return "T"
+			case ChangeKind.Unmerged:
+				return "U"
+		}
+		return "M"
+	}
+
+	// A path as git prints it (core.quotePath on): in double quotes with
+	// C escapes when it holds a quote, backslash, control character or a
+	// byte above 0x7F (as three octal digits); as it is otherwise.
+	def quotePath(path string) string {
+		let b = path.bytes()
+		let needs = false
+		for let c in b {
+			if c < 0x20 || c == 0x22 || c == 0x5C || c >= 0x7F {
+				needs = true
+				break
+			}
+		}
+		return path unless needs
+		let out byte[] = [0x22]
+		for let c in b {
+			switch int(c) {
+				case 0x07:
+					out.push(..."\\a".bytes())
+				case 0x08:
+					out.push(..."\\b".bytes())
+				case 0x09:
+					out.push(..."\\t".bytes())
+				case 0x0A:
+					out.push(..."\\n".bytes())
+				case 0x0B:
+					out.push(..."\\v".bytes())
+				case 0x0C:
+					out.push(..."\\f".bytes())
+				case 0x0D:
+					out.push(..."\\r".bytes())
+				case 0x22:
+					out.push(..."\\\"".bytes())
+				case 0x5C:
+					out.push(..."\\\\".bytes())
+				default:
+					if c < 0x20 || c >= 0x7F {
+						out.push(0x5C)
+						out.push(byte(0x30 + (int(c) >> 6)), byte(0x30 + ((int(c) >> 3) & 7)), byte(0x30 + (int(c) & 7)))
+					} else {
+						out.push(c)
+					}
+			}
+		}
+		out.push(0x22)
+		return string(out)
+	}
+}

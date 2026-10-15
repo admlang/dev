@@ -1,0 +1,483 @@
+partial module adm.dev.git {
+	use std.os
+
+	// ---- status -----------------------------------------------------------------------
+
+	internal def statusOf(repo Repository, options StatusOptions) !Status {
+		let spec = try newPathspec(options.paths)
+		let idx = try repo.index()
+		let head = try repo.headId()
+		let headTree ?ObjectId = none
+		if !(head is none) {
+			headTree = (try repo.commitAt(head)).tree
+		}
+		// HEAD to index.
+		let a SnapshotEntry[] = []
+		try treeFiles(repo, headTree, spec, "", a)
+		let b SnapshotEntry[] = []
+		for let e in idx.entries {
+			continue unless e.stage == 0 && spec.matches(e.path) && !e.intentToAdd
+			b.push(SnapshotEntry{path: e.path, mode: e.mode, id: e.id})
+		}
+		let staged = try compareSnapshots(repo, a, b, ChangeOptions{renames: options.renames}, false)
+		let byPath map<string, StatusEntry> = {}
+		let order string[] = []
+		for let c in staged {
+			let path = c.newPath
+			// An unmerged path shows as unmerged only.
+			continue when idx.conflicted(path)
+			let moved = c.kind := ChangeKind.Renamed || ChangeKind.Copied
+			byPath[path] = StatusEntry{path: path, origPath: moved ?? (c.oldPath, ""), staged: c.kind}
+			order.push(path)
+		}
+		// Index to working tree.
+		let refresh map<string, StatData> = {}
+		let unstaged = repo.isBare() ?? (FileChange[], try worktreeChanges(repo, idx, spec, refresh))
+		for let c in unstaged {
+			let path = c.newPath
+			if c.kind == ChangeKind.Unmerged {
+				byPath[path] = StatusEntry{path: path, conflict: conflictCode(idx, path)}
+				order.push(path) unless order.includes(path)
+				continue
+			}
+			let known = byPath.get(path)
+			if known is none {
+				byPath[path] = StatusEntry{path: path, unstaged: c.kind}
+				order.push(path)
+			} else {
+				byPath[path] = StatusEntry{...known, unstaged: c.kind}
+			}
+		}
+		// Files git found unchanged after reading them get their stat data
+		// written back, as `git status` does when it can take the lock.
+		if refresh.len() > 0 {
+			for let (k, e) in idx.entries {
+				let st = refresh.get(e.path)
+				continue when st is none || e.stage != 0
+				idx.entries[k] = IndexEntry{...e, stat: st}
+			}
+			idx.write() onerror recover none
+		}
+		if !repo.isBare() {
+			let (untracked, ignored) = try untrackedPaths(repo, idx, options.untracked, spec, options.ignored)
+			for let p in untracked {
+				byPath[p] = StatusEntry{path: p, untracked: true}
+				order.push(p)
+			}
+			for let p in ignored {
+				byPath[p] = StatusEntry{path: p, ignored: true}
+				order.push(p)
+			}
+		}
+		order.sort((x, y) => compareBytes(x, y))
+		let entries StatusEntry[] = []
+		for let p in order {
+			entries.push(byPath[p])
+		}
+		return Status{branch: try repo.branch(), head: head, entries: entries}
+	}
+
+	// git's two-letter code for an unmerged path from the stages present.
+	internal def conflictCode(idx Index, path string) string {
+		let has1 = false
+		let has2 = false
+		let has3 = false
+		for let e in idx.stages(path) {
+			has1 = true when e.stage == 1
+			has2 = true when e.stage == 2
+			has3 = true when e.stage == 3
+		}
+		return "DD" when has1 && !has2 && !has3
+		return "AU" when !has1 && has2 && !has3
+		return "UD" when has1 && has2 && !has3
+		return "UA" when !has1 && !has2 && has3
+		return "DU" when has1 && !has2 && has3
+		return "AA" when !has1 && has2 && has3
+		return "UU"
+	}
+
+	// ---- trees from the index ------------------------------------------------------
+
+	// Writes the trees the index describes and returns the root's id,
+	// reusing the trees the cache-tree extension knows and recording the
+	// ones it writes. Fails when the index has conflicts.
+	internal def indexTree(repo Repository, idx Index) !ObjectId {
+		fail "git: cannot write a tree: the index has conflicts ({idx.conflicts().join(", ")})" when idx.conflicts().len() > 0
+		let entries = idx.entries.filter(e => !e.intentToAdd)
+		let (id, tree, _) = try writeTreeLevel(repo, entries, 0, "", idx.tree)
+		idx.tree = tree
+		return id
+	}
+
+	// Writes the tree of the entries under `prefix` starting at `start`:
+	// returns its id, its cache-tree node, and where its entries end.
+	internal def writeTreeLevel(repo Repository, entries IndexEntry[], start int, prefix string, cached ?CacheTree) !(ObjectId, CacheTree, int) {
+		// The end of this folder's entries.
+		let end = start
+		for end < entries.len() && entries[end].path.startsWith(prefix) {
+			end++
+		}
+		let known = cached
+		if !(known is none) && known.entryCount == end - start {
+			let kid = known.id
+			if !(kid is none) {
+				return (kid, known, end)
+			}
+		}
+		let items TreeEntry[] = []
+		let children CacheTree[] = []
+		let i = start
+		for i < end {
+			let e = entries[i]
+			let rest = e.path.slice(prefix.len())
+			let slash = rest.indexOf("/")
+			if slash < 0 || e.mode == 0o40000 {
+				// A sparse folder entry ends in `/` and names a tree.
+				let name = rest.endsWith("/") ?? (rest.slice(0, rest.len() - 1), rest)
+				items.push(TreeEntry{name: name, mode: canonicalMode(e.mode), id: e.id})
+				i++
+				continue
+			}
+			let name = rest.slice(0, slash)
+			let sub = prefix + name + "/"
+			let child = childTree(known, name)
+			let (id, node, next) = try writeTreeLevel(repo, entries, i, sub, child)
+			items.push(TreeEntry{name: name, mode: EntryMode.Tree, id: id})
+			children.push(CacheTree{...node, name: name})
+			i = next
+		}
+		let t = new Tree(zeroId(repo.format), sortEntries(items))
+		let id = try repo.write(ObjectKind.Tree, t.encode())
+		return (id, CacheTree{name: "", entryCount: end - start, id: id, children: children}, end)
+	}
+
+	internal def childTree(t ?CacheTree, name string) ?CacheTree {
+		return none when t is none
+		for let c in t.children {
+			return c when c.name == name
+		}
+		return none
+	}
+
+	// ---- add, rm, mv ------------------------------------------------------------------
+
+	// Options for `add`.
+	struct AddOptions {
+		// Add ignored files too (`-f`).
+		force       bool = false
+		// Stage modifications and removals of tracked files only (`-u`).
+		update      bool = false
+		// Record that the files will be added, without their content (`-N`).
+		intentToAdd bool = false
+	}
+
+	// Stages what the pathspecs select, as `git add` does: new and changed
+	// files, and the removal of tracked files that are gone. Fails when a
+	// pathspec selects nothing, a file is ignored (without force), or a
+	// file cannot be read.
+	internal def addPaths(repo Repository, specs string[], options AddOptions) !none {
+		fail "git: the repository is bare" when repo.isBare()
+		let spec = try newPathspec(specs)
+		let idx = try repo.index()
+		let lock = try acquireLock(idx.path)
+		let failure ?error = none
+		addInto(repo, idx, spec, specs, options) onerror (err error) {
+			failure = err
+			recover false
+		}
+		if !(failure is none) {
+			lock.release()
+			fail failure
+		}
+		lock.write(encodeIndex(idx)) onerror (err error) {
+			failure = err
+			recover none
+		}
+		if !(failure is none) {
+			lock.release()
+			fail failure
+		}
+		try lock.commit()
+		return none
+	}
+
+	internal def addInto(repo Repository, idx Index, spec Pathspec, specs string[], options AddOptions) !bool {
+		let matched = false
+		let policy = statPolicy(repo)
+		// Tracked paths: changes and removals.
+		let tracked IndexEntry[] = idx.entries.filter(e => e.stage == 0 || true)
+		let seen map<string, bool> = {}
+		for let e in tracked {
+			continue when seen.hasKey(e.path)
+			seen[e.path] = true
+			continue unless spec.matches(e.path)
+			matched = true
+			let file = worktreeFile(repo, e.path)
+			if !file.exists {
+				idx.remove(e.path)
+				continue
+			}
+			if e.stage == 0 && statMatches(e, file, policy) && !racy(idx, e) && !e.intentToAdd {
+				continue
+			}
+			try stageFile(repo, idx, e.path, file, e.mode, options.intentToAdd && e.intentToAdd)
+		}
+		if !options.update {
+			let (untracked, ignoredPaths) = try untrackedPaths(repo, idx, UntrackedMode.All, spec, options.force)
+			for let p in untracked {
+				matched = true
+				try stageFile(repo, idx, p, worktreeFile(repo, p), 0, options.intentToAdd)
+			}
+			if options.force {
+				for let p in ignoredPaths {
+					continue when p.endsWith("/")
+					matched = true
+					try stageFile(repo, idx, p, worktreeFile(repo, p), 0, options.intentToAdd)
+				}
+			} else if !matched && ignoredPaths.len() > 0 {
+				fail "git: the following paths are ignored by one of your .gitignore files: {ignoredPaths.join(", ")}"
+			}
+		}
+		if !matched {
+			for let s in specs {
+				fail "git: pathspec '{s}' did not match any files" unless spec.isEmpty()
+			}
+		}
+		return matched
+	}
+
+	// Stages one working tree file: its blob written and its entry updated
+	// with the file's mode and stat data.
+	internal def stageFile(repo Repository, idx Index, path string, file WorktreeFile, previousMode int, intentOnly bool) !none {
+		let mode = stagedMode(repo, file, previousMode)
+		let zero = zeroId(repo.format)
+		if mode == 0o40000 {
+			// An empty folder or one git does not track: nothing to stage.
+			return none
+		}
+		if intentOnly {
+			// The entry names the empty blob, which must exist for fsck.
+			let emptyBlob = try repo.write(ObjectKind.Blob, [])
+			try idx.add(IndexEntry{path: path, id: emptyBlob, mode: mode, intentToAdd: true})
+			return none
+		}
+		let id = zero
+		if mode == 0o160000 {
+			id = try worktreeId(repo, path, file, idx)
+		} else {
+			let data = try worktreeContent(repo, path, idx)
+			id = try repo.write(ObjectKind.Blob, data)
+		}
+		try idx.add(IndexEntry{path: path, id: id, mode: mode, stat: file.stat})
+		return none
+	}
+
+	// The entry at a path of a tree, none when it has none or cannot be
+	// read.
+	internal def entryOrNone(tree Tree, path string) ?TreeEntry {
+		return tryFindEntry(tree, path) onerror recover none
+	}
+
+	internal def tryFindEntry(tree Tree, path string) !?TreeEntry {
+		return try tree.find(path)
+	}
+
+	// Unstages and (unless `cached`) deletes what the pathspecs select.
+	// Without `force` it keeps work from being lost, as `git rm` does: it
+	// fails when a file's staged content differs from both HEAD and the
+	// file, and, unless `cached`, when the file has changes staged or not.
+	// Fails too when a pathspec matches nothing tracked.
+	internal def removePaths(repo Repository, specs string[], cached bool, force bool) !none {
+		let spec = try newPathspec(specs)
+		let idx = try repo.index()
+		let headTree ?Tree = none
+		let head = try repo.headId()
+		headTree = try repo.tree((try repo.commitAt(head)).tree) unless head is none
+		let gone string[] = []
+		for let e in idx.entries {
+			continue unless spec.matches(e.path)
+			gone.push(e.path) unless gone.includes(e.path)
+		}
+		fail "git: pathspec '{specs.join(" ")}' did not match any files" when gone.len() == 0
+		if !force {
+			let policy = statPolicy(repo)
+			for let path in gone {
+				let e = idx.entry(path)
+				continue when e is none
+				// Staged: the index holds something HEAD does not.
+				let inHead = headTree is none ?? (none, entryOrNone(headTree, path))
+				let staged = inHead is none || !inHead.id.equals(e.id) || inHead.mode != entryModeOf(e.mode)
+				// Local: the file differs from the index (a deleted file does not).
+				let local = false
+				if !repo.isBare() {
+					let file = worktreeFile(repo, path)
+					local = file.exists && !statMatches(e, file, policy) && !(try worktreeId(repo, path, file, idx)).equals(e.id)
+				}
+				if local && staged && !(cached && e.intentToAdd) {
+					fail "git: the following file has staged content different from both the file and the HEAD: {path} (use -f to force removal)"
+				}
+				continue when cached
+				fail "git: the following file has changes staged in the index: {path} (use --cached to keep the file, or -f to force removal)" when staged
+				fail "git: the following file has local modifications: {path} (use --cached to keep the file, or -f to force removal)" when local
+			}
+		}
+		let lock = try acquireLock(idx.path)
+		for let path in gone {
+			idx.remove(path)
+			if !cached && !repo.isBare() {
+				let full = os.join(repo.workDir, path)
+				os.remove(full) onerror recover none
+				removeEmptyParents(os.dir(full), repo.workDir)
+			}
+		}
+		lock.write(encodeIndex(idx)) onerror (err error) {
+			lock.release()
+			fail err
+		}
+		try lock.commit()
+		return none
+	}
+
+	// Renames a tracked file or folder in the working tree and the index.
+	// Fails when the source is not tracked or the destination exists.
+	internal def movePath(repo Repository, from string, to string) !none {
+		fail "git: the repository is bare" when repo.isBare()
+		let idx = try repo.index()
+		let prefix = from + "/"
+		let moving = idx.entries.filter(e => e.path == from || e.path.startsWith(prefix))
+		fail "git: not under version control, source={from}, destination={to}" when moving.len() == 0
+		let dst = os.join(repo.workDir, to)
+		fail "git: destination exists, source={from}, destination={to}" when os.exists(dst) onerror recover false
+		try os.mkdir(os.dir(dst), true)
+		try os.rename(os.join(repo.workDir, from), dst)
+		let lock = try acquireLock(idx.path)
+		for let e in moving {
+			idx.remove(e.path)
+		}
+		for let e in moving {
+			let newPath = to + e.path.slice(from.len())
+			idx.add(IndexEntry{...e, path: newPath}) onerror (err error) {
+				lock.release()
+				fail err
+			}
+		}
+		lock.write(encodeIndex(idx)) onerror (err error) {
+			lock.release()
+			fail err
+		}
+		try lock.commit()
+		return none
+	}
+
+	// ---- commit -------------------------------------------------------------------------
+
+	// Options for `commit`.
+	struct CommitOptions {
+		// Who wrote the change; the configured identity when none.
+		author     ?Signature = none
+		// Who committed it; the configured identity when none.
+		committer  ?Signature = none
+		// Replace the commit HEAD is at instead of adding one on top.
+		amend      bool       = false
+		// Record a commit that changes nothing.
+		allowEmpty bool       = false
+		// Stage changes and removals of tracked files first (`-a`).
+		all        bool       = false
+		// Sign the commit with this signer (`-S`).
+		signer     ?Signer    = none
+	}
+
+	internal def commitIndex(repo Repository, message string, options CommitOptions) !ObjectId {
+		if options.all {
+			try addPaths(repo, [], AddOptions{update: true})
+		}
+		let idx = try repo.index()
+		let tree = try indexTree(repo, idx)
+		let head = try repo.headId()
+		let parents ObjectId[] = []
+		let previous ?Commit = none
+		if options.amend {
+			fail "git: there is no commit to amend" when head is none
+			let c = try repo.commitAt(head)
+			parents = c.parents
+			previous = c
+		} else if !(head is none) {
+			parents.push(head)
+		}
+		// A merge in progress adds its other heads.
+		let mergeHead = os.join(repo.gitDir, "MERGE_HEAD")
+		if !options.amend && (os.exists(mergeHead) onerror recover false) {
+			for let line in string(try os.readFile(mergeHead)).split("\n") {
+				let t = line.trim()
+				parents.push(try parseId(t)) unless t == ""
+			}
+		}
+		if !options.allowEmpty && parents.len() <= 1 {
+			let parentTree ?ObjectId = none
+			if parents.len() == 1 {
+				parentTree = (try repo.commitAt(parents[0])).tree
+			}
+			let same = !(parentTree is none) && parentTree.equals(tree)
+			let emptyRoot = parentTree is none && idx.entries.len() == 0
+			fail "git: nothing to commit" when same || emptyRoot
+		}
+		// Concluding a cherry-pick keeps the picked commit's author.
+		let picked ?Commit = none
+		let pickHead = os.join(repo.gitDir, "CHERRY_PICK_HEAD")
+		if os.exists(pickHead) onerror recover false {
+			picked = try repo.commitAt(string(try os.readFile(pickHead)).trim())
+		}
+		let author = try commitAuthor(repo, options.author, previous is none ?? (picked, previous))
+		let committer = try commitSigner(repo, options.committer)
+		let c = new Commit(zeroId(repo.format), tree, parents, author, committer, cleanMessage(message))
+		let signer = options.signer
+		if !(signer is none) {
+			try signCommit(c, signer)
+		}
+		let id = try repo.write(ObjectKind.Commit, c.encode())
+		try idx.write()
+		let what = options.amend ?? ("commit (amend)", head is none ?? ("commit (initial)", parents.len() > 1 ?? ("commit (merge)", "commit")))
+		let expected ?ObjectId = head is none ?? (zeroId(repo.format), head)
+		try repo.setRef("HEAD", id, "{what}: {c.summary}", expected)
+		for let name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG", "AUTO_MERGE", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+			os.remove(os.join(repo.gitDir, name)) onerror recover none
+		}
+		return id
+	}
+
+	// The author of a new commit: the one given, else an amended commit's,
+	// else the configured identity.
+	internal def commitAuthor(repo Repository, given ?Signature, amended ?Commit) !Signature {
+		return given unless given is none
+		return amended.author unless amended is none
+		return try repo.identity("author")
+	}
+
+	// The committer of a new commit: the one given, else the configured
+	// identity now.
+	internal def commitSigner(repo Repository, given ?Signature) !Signature {
+		return given unless given is none
+		return try repo.identity("committer")
+	}
+
+	// A commit message as `git commit` stores it with the default cleanup
+	// mode: `#` comment lines, trailing spaces, and leading and trailing
+	// blank lines removed, runs of blank lines collapsed, and a final
+	// newline. Empty when nothing is left.
+	def cleanMessage(message string) string {
+		let lines string[] = []
+		let blank = false
+		for let raw in message.split("\n") {
+			let line = raw.trimEnd()
+			continue when line.startsWith("#")
+			if line == "" {
+				blank = lines.len() > 0
+				continue
+			}
+			lines.push("") when blank
+			blank = false
+			lines.push(line)
+		}
+		return lines.len() == 0 ?? ("", lines.join("\n") + "\n")
+	}
+}

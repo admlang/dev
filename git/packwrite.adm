@@ -1,0 +1,834 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto
+		std.crypto.hash
+		std.data.compress.zlib
+	)
+
+	// One object to pack, with the path it was reached by (for grouping
+	// similar files as delta candidates).
+	internal struct PackItem {
+		id    ObjectId
+		path  string = ""
+		// The path's name hash when known without the path (a bitmap's hash
+		// cache); -1 to hash `path`.
+		hash  int64  = -1
+	}
+
+	// git's path hash for delta ordering: the last sixteen non-blank bytes
+	// of the path weigh most, so files with the same ending sort together.
+	internal def nameHash(path string) int64 {
+		let h = uint32(0)
+		for let c in path.bytes() {
+			continue when c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0x0B || c == 0x0C
+			h = (h >> 2) + (uint32(c) << 24)
+		}
+		return int64(h)
+	}
+
+	// The objects reachable from `wants` and not from `haves`, commits
+	// first, then each commit's new trees and blobs with their paths; the
+	// trees of the `haves` commits next to the wanted ones are not sent, as
+	// git marks them. `filter` limits blobs and trees (partial clone).
+	internal def objectsToPack(repo Repository, wants ObjectId[], haves ObjectId[], filter ObjectFilter = ObjectFilter{}) !PackItem[] {
+		// A reachability bitmap answers without walking every tree.
+		if !filter.noBlobs && filter.blobLimit < 0 && filter.treeDepth < 0 && shallowCommits(repo).len() == 0 {
+			let b = repositoryBitmap(repo)
+			return try objectsFromBitmap(repo, b, wants, haves) unless b is none
+		}
+		// Tags among the wants go with the objects they name (tags of tags
+		// too).
+		let tagWants ObjectId[] = []
+		let direct ObjectId[] = []
+		for let w in wants {
+			let current = w
+			for let depth = 0; depth < 10; depth++ {
+				let (kind, _) = try repo.info(current)
+				if kind != ObjectKind.Tag {
+					direct.push(current)
+					break
+				}
+				tagWants.push(current)
+				current = (try repo.tag(current)).target
+			}
+		}
+		let walk = new RevWalk(repo)
+		for let w in direct {
+			let (kind, _) = try repo.info(w)
+			if kind == ObjectKind.Commit {
+				try walk.push(w)
+			}
+		}
+		for let h in haves {
+			if repo.has(h) {
+				let (kind, _) = try repo.info(h)
+				try walk.hide(h) when kind == ObjectKind.Commit
+			}
+		}
+		let commits Commit[] = try walk.all()
+		let seen map<string, bool> = {}
+		// What the other side has: the trees of hidden commits that are
+		// parents of the commits sent, and everything below them.
+		let excluded map<string, bool> = {}
+		let sending map<string, bool> = {}
+		for let c in commits {
+			sending[c.id.str()] = true
+		}
+		for let c in commits {
+			for let p in c.parents {
+				continue when sending.hasKey(p.str())
+				let pc = commitOrNone(repo, p)
+				continue when pc is none
+				try markTree(repo, pc.tree, excluded)
+			}
+		}
+		let out PackItem[] = []
+		for let t in tagWants {
+			if !seen.hasKey(t.str()) {
+				seen[t.str()] = true
+				out.push(PackItem{id: t})
+			}
+		}
+		for let c in commits {
+			seen[c.id.str()] = true
+			out.push(PackItem{id: c.id})
+		}
+		for let c in commits {
+			try addTree(repo, c.tree, "", seen, excluded, out, filter, 0)
+		}
+		// Trees and blobs wanted directly (a fetch of a single object).
+		for let w in direct {
+			let (kind, _) = try repo.info(w)
+			if kind == ObjectKind.Tree {
+				try addTree(repo, w, "", seen, excluded, out, filter, 0)
+			} else if kind == ObjectKind.Blob && !seen.hasKey(w.str()) {
+				seen[w.str()] = true
+				out.push(PackItem{id: w})
+			}
+		}
+		return out
+	}
+
+	internal def commitOrNone(repo Repository, id ObjectId) ?Commit {
+		return tryCommit(repo, id) onerror recover none
+	}
+
+	internal def tryCommit(repo Repository, id ObjectId) !?Commit {
+		return try repo.commitAt(id)
+	}
+
+	// Marks a tree and everything below it as present on the other side.
+	internal def markTree(repo Repository, id ObjectId, marked map<string, bool>) !none {
+		let key = id.str()
+		return none when marked.hasKey(key)
+		marked[key] = true
+		let t = treeOrNone(repo, id)
+		return none when t is none
+		for let e in t.entries {
+			if isTree(e.mode) {
+				try markTree(repo, e.id, marked)
+			} else {
+				marked[e.id.str()] = true
+			}
+		}
+		return none
+	}
+
+	internal def treeOrNone(repo Repository, id ObjectId) ?Tree {
+		return tryTree(repo, id) onerror recover none
+	}
+
+	internal def tryTree(repo Repository, id ObjectId) !?Tree {
+		return try repo.tree(id)
+	}
+
+	internal def addTree(repo Repository, id ObjectId, path string, seen map<string, bool>, excluded map<string, bool>, out PackItem[], filter ObjectFilter, depth int) !none {
+		let key = id.str()
+		return none when seen.hasKey(key) || excluded.hasKey(key)
+		return none unless filterKeepsTree(filter, depth)
+		seen[key] = true
+		out.push(PackItem{id: id, path: path})
+		let t = try repo.tree(id)
+		for let e in t.entries {
+			let p = path == "" ?? (e.name, path + "/" + e.name)
+			if isTree(e.mode) {
+				try addTree(repo, e.id, p, seen, excluded, out, filter, depth + 1)
+				continue
+			}
+			// Submodule commits live in another repository.
+			continue when e.mode == EntryMode.Submodule
+			let bk = e.id.str()
+			continue when seen.hasKey(bk) || excluded.hasKey(bk)
+			if !(try filterKeepsBlob(repo, filter, e.id)) {
+				continue
+			}
+			seen[bk] = true
+			out.push(PackItem{id: e.id, path: p})
+		}
+		return none
+	}
+
+	// Which objects a partial clone leaves out (`--filter=`).
+	internal struct ObjectFilter {
+		// `blob:none`: no blobs.
+		noBlobs   bool = false
+		// `blob:limit=<n>`: blobs of n bytes or more are left out (-1: no
+		// limit).
+		blobLimit int64 = -1
+		// `tree:<depth>`: trees deeper than depth are left out (-1: no
+		// limit).
+		treeDepth int  = -1
+	}
+
+	// The filter `git clone --filter=` names: `blob:none`,
+	// `blob:limit=<n>[kmg]` or `tree:<depth>`. Fails on any other.
+	internal def parseFilter(spec string) !ObjectFilter {
+		return ObjectFilter{noBlobs: true} when spec == "blob:none"
+		if spec.startsWith("blob:limit=") {
+			return ObjectFilter{blobLimit: int64(try parseConfigInt(spec.slice(11)))}
+		}
+		if spec.startsWith("tree:") {
+			return ObjectFilter{treeDepth: spec.slice(5).toInt<int>()}
+		}
+		fail "git: unsupported object filter '{spec}'"
+	}
+
+	internal def filterKeepsTree(f ObjectFilter, depth int) bool {
+		return f.treeDepth < 0 || depth < f.treeDepth
+	}
+
+	internal def filterKeepsBlob(repo Repository, f ObjectFilter, id ObjectId) !bool {
+		return false when f.noBlobs
+		return true when f.blobLimit < 0
+		let (_, size) = try repo.info(id)
+		return int64(size) < f.blobLimit
+	}
+
+	// ---- writing a pack -----------------------------------------------------------
+
+	// An object being written: where it is stored now, what it deltas
+	// against, and where it lands in the new pack.
+	internal type PackSlot {
+		item     PackItem
+		kind     ObjectKind
+		size     int
+		hash     int64
+		// A delta base among the objects written (index), or -1.
+		base     int    = -1
+		delta    byte[] = []
+		depth    int    = 0
+		// Reused as stored: the entry's raw bytes from a pack.
+		reuse    ?PackedEntry = none
+		offset   int    = -1
+		crc      uint32 = 0
+		written  bool   = false
+		// A base the receiver has (a thin pack): deltas may point at it by
+		// id, and it is not written.
+		preferred bool  = false
+
+		def new(item PackItem, kind ObjectKind, size int) {
+			self.item = item
+			self.kind = kind
+			self.size = size
+			hash = item.hash >= 0 ?? (item.hash, nameHash(item.path))
+		}
+	}
+
+	// A stored pack entry that can be copied: its pack, its offset, and
+	// for a delta the offset (or id) of its base.
+	internal struct PackedEntry {
+		pack     Pack
+		offset   int
+		kind     int
+		baseAt   int = -1
+		baseId   ?ObjectId = none
+		// Where the compressed data starts and the entry ends.
+		dataAt   int
+		end      int
+	}
+
+	// Options for writing packs.
+	internal struct PackOptions {
+		// Objects compared as delta bases (pack.window).
+		window      int  = 10
+		// Longest delta chain made (pack.depth).
+		depth       int  = 50
+		// Copy objects and deltas as stored in packs.
+		reuse       bool = true
+		// zlib level (pack.compression).
+		level       int  = 6
+		// Deltas name their base by its offset in the pack; false names it
+		// by id, for readers without `ofs-delta`.
+		ofsDelta    bool = true
+	}
+
+	// The stored entry of a packed object, none for a loose one.
+	internal def storedEntry(repo Repository, id ObjectId) !?PackedEntry {
+		let found = repo.objects.findPacked(id)
+		return none when found is none
+		let (p, offset) = found
+		let (kind, _, dataAt) = try p.entryHeader(offset)
+		let end = p.entryEnd(offset)
+		if kind == packOfsDelta {
+			let (back, after) = p.ofsDeltaDistance(dataAt)
+			return PackedEntry{pack: p, offset: offset, kind: kind, baseAt: offset - back, dataAt: after, end: end}
+		}
+		if kind == packRefDelta {
+			let base = new ObjectId(p.data[dataAt:dataAt + p.hashLen].clone())
+			return PackedEntry{pack: p, offset: offset, kind: kind, baseId: base, dataAt: dataAt + p.hashLen, end: end}
+		}
+		return PackedEntry{pack: p, offset: offset, kind: kind, dataAt: dataAt, end: end}
+	}
+
+	// The type-and-size header of a pack entry.
+	internal def entryHeaderBytes(kind int, size int) byte[] {
+		let out byte[] = []
+		let c = (kind << 4) | (size & 15)
+		let rest = size >> 4
+		for rest > 0 {
+			out.push(byte(c | 0x80))
+			c = rest & 0x7F
+			rest >>= 7
+		}
+		out.push(byte(c))
+		return out
+	}
+
+	// An OFS_DELTA distance in git's encoding.
+	internal def ofsBytes(distance int) byte[] {
+		let tmp byte[] = [byte(distance & 0x7F)]
+		let d = distance >> 7
+		for d > 0 {
+			d--
+			tmp.push(byte(0x80 | (d & 0x7F)))
+			d >>= 7
+		}
+		return tmp.reverse()
+	}
+
+	internal def compressBytes(data byte[], level int) byte[] {
+		let buffer = new bytes.Buffer()
+		let w = new zlib.Writer(buffer, zlib.Level(level))
+		w.write(data) onerror recover 0
+		w.close() onerror recover none
+		return buffer.bytes()
+	}
+
+	// A pack being written to a stream: entries after a header, the
+	// checksum of all of it at the end.
+	internal type PackStream {
+		out    io.Writer
+		hasher hash.Hasher
+		count  int = 0
+
+		def new(out io.Writer, format ObjectFormat) {
+			self.out = out
+			hasher = newHasher(format)
+		}
+
+		def write(data byte[]) !none {
+			hasher.write(data)
+			let at = 0
+			for at < data.len() {
+				let n = try out.write(data[at:])
+				fail "git: short write" when n <= 0
+				at += n
+			}
+			count += data.len()
+			return none
+		}
+	}
+
+	// Writes a pack of the objects to a stream: deltas reused from packs
+	// where their base goes too, new deltas found among similar objects
+	// (same kind, similar path, a window of candidates, chains no longer
+	// than `depth`), every base before its deltas. Returns the pack's
+	// checksum and, per object, its id, offset and CRC for an index.
+	internal def writePackStream(repo Repository, items PackItem[], sink io.Writer, options PackOptions = PackOptions{}, bases PackItem[] = []) !(ObjectId, PackSlot[]) {
+		let slots PackSlot[] = []
+		let byId map<string, int> = {}
+		for let it in items {
+			let key = it.id.str()
+			continue when byId.hasKey(key)
+			let (kind, size) = try repo.info(it.id)
+			let s = new PackSlot(it, kind, size)
+			byId[key] = slots.len()
+			slots.push(s)
+		}
+		// Bases for a thin pack: searched as delta bases, never written.
+		for let it in bases {
+			let key = it.id.str()
+			continue when byId.hasKey(key) || !repo.has(it.id)
+			let (kind, size) = try repo.info(it.id)
+			let s = new PackSlot(it, kind, size)
+			s.preferred = true
+			s.written = true
+			byId[key] = slots.len()
+			slots.push(s)
+		}
+		// Reuse stored entries: whole objects always, deltas when their base
+		// is packed too.
+		if options.reuse {
+			for let s in slots {
+				continue when s.preferred
+				let e = try storedEntry(repo, s.item.id)
+				continue when e is none
+				if e.kind >= 1 && e.kind <= 4 {
+					s.reuse = e
+					continue
+				}
+				let baseId = e.baseId
+				let base = -1
+				if baseId is none {
+					let n = e.pack.positionOfOffset(e.baseAt)
+					if n >= 0 {
+						let bid = e.pack.idAt(n)
+						let found = byId.get(bid.str())
+						base = found is none ?? (-1, found)
+					}
+				} else {
+					let found = byId.get(baseId.str())
+					base = found is none ?? (-1, found)
+				}
+				if base >= 0 {
+					s.reuse = e
+					s.base = base
+				}
+			}
+		}
+		try findDeltas(repo, slots, options)
+		let stream = new PackStream(sink, repo.format)
+		let header byte[] = "PACK".bytes()
+		putBe(header, 2, 4)
+		let written = slots.filter(x => !x.preferred)
+		putBe(header, int64(written.len()), 4)
+		try stream.write(header)
+		try writeSlots(repo, slots, stream, options)
+		let sum = stream.hasher.hash()
+		let at = 0
+		for at < sum.len() {
+			let n = try sink.write(sum[at:])
+			at += n
+		}
+		return (new ObjectId(sum), written)
+	}
+
+	// The order slots are written in: every base before its deltas, the
+	// rest as they came.
+	internal def writeOrder(slots PackSlot[]) int[] {
+		let out int[] = []
+		let placed bool[]
+		placed.len(slots.len())
+		placed.fill(false, 0, slots.len())
+		for let i = 0; i < slots.len(); i++ {
+			continue when placed[i] || slots[i].preferred
+			// The chain down to a base already placed, written base first.
+			let chain int[] = []
+			let at = i
+			for at >= 0 && !placed[at] && !slots[at].preferred {
+				chain.push(at)
+				placed[at] = true
+				at = slots[at].base
+			}
+			for let k = chain.len() - 1; k >= 0; k-- {
+				out.push(chain[k])
+			}
+		}
+		return out
+	}
+
+	// Writes every slot not reused as stored: objects read here, compressed
+	// on tasks a batch at a time, then written in order (offsets and delta
+	// headers need the entries before them).
+	internal def writeSlots(repo Repository, slots PackSlot[], stream PackStream, options PackOptions) !none {
+		let order = writeOrder(slots)
+		let at = 0
+		for at < order.len() {
+			let batch int[] = []
+			let bytes = 0
+			for at < order.len() && batch.len() < 1024 && bytes < 64 << 20 {
+				let i = order[at]
+				batch.push(i)
+				bytes += slots[i].size
+				at++
+			}
+			// What each needs compressed: a delta made here or a whole object.
+			let inputs byte[][] = []
+			for let i in batch {
+				let s = slots[i]
+				if !(s.reuse is none) {
+					inputs.push(byte[])
+				} else if s.base >= 0 {
+					inputs.push(s.delta)
+				} else {
+					let (_, data) = try repo.raw(s.item.id)
+					inputs.push(data)
+				}
+			}
+			let compressed = compressAll(inputs, batch.mapElem(i => slots[i].reuse is none), options.level)
+			for let (k, i) in batch {
+				try writeEntry(slots, i, compressed[k], stream, options)
+			}
+		}
+		return none
+	}
+
+	// Compresses the inputs marked, on tasks of about a megabyte each.
+	internal def compressAll(inputs byte[][], wanted bool[], level int) byte[][] {
+		let out byte[][] = []
+		out.len(inputs.len())
+		let starts int[] = [0]
+		let size = 0
+		for let k = 0; k < inputs.len(); k++ {
+			size += inputs[k].len()
+			if size >= 1 << 20 && k + 1 < inputs.len() {
+				starts.push(k + 1)
+				size = 0
+			}
+		}
+		starts.push(inputs.len())
+		let tasks (async byte[][])[] = []
+		for let t = 0; t + 1 < starts.len(); t++ {
+			tasks.push(async compressRange(inputs, wanted, starts[t], starts[t + 1], level))
+		}
+		for let (t, task) in tasks {
+			let part = await task
+			for let (k, data) in part {
+				out[starts[t] + k] = data
+			}
+		}
+		return out
+	}
+
+	internal def compressRange(inputs byte[][], wanted bool[], from int, to int, level int) byte[][] {
+		let out byte[][] = []
+		for let k = from; k < to; k++ {
+			out.push(wanted[k] ?? (compressBytes(inputs[k], level), byte[]))
+		}
+		return out
+	}
+
+	// Writes one slot whose base (if any) is written: its header, then the
+	// stored bytes or `body`, compressed already.
+	internal def writeEntry(slots PackSlot[], i int, body byte[], stream PackStream, options PackOptions) !none {
+		let s = slots[i]
+		s.offset = stream.count
+		let entry byte[] = []
+		let reuse = s.reuse
+		if !(reuse is none) {
+			let raw = reuse.pack.data[reuse.dataAt:reuse.end]
+			let (_, size, _) = try reuse.pack.entryHeader(reuse.offset)
+			if reuse.kind >= 1 && reuse.kind <= 4 {
+				entry = entryHeaderBytes(reuse.kind, size) + raw
+			} else {
+				let base = slots[s.base]
+				if base.preferred || !options.ofsDelta {
+					entry = entryHeaderBytes(packRefDelta, size) + base.item.id.bytes + raw
+				} else {
+					entry = entryHeaderBytes(packOfsDelta, size) + ofsBytes(s.offset - base.offset) + raw
+				}
+			}
+		} else if s.base >= 0 {
+			let base = slots[s.base]
+			if base.preferred || !options.ofsDelta {
+				entry = entryHeaderBytes(packRefDelta, s.delta.len()) + base.item.id.bytes + body
+			} else {
+				entry = entryHeaderBytes(packOfsDelta, s.delta.len()) + ofsBytes(s.offset - base.offset) + body
+			}
+			// The delta is written; its memory can go.
+			s.delta = []
+		} else {
+			entry = entryHeaderBytes(int(s.kind), s.size) + body
+		}
+		s.crc = hash.crc32(entry)
+		try stream.write(entry)
+		s.written = true
+		return none
+	}
+
+	// Finds deltas for the objects not reused: candidates sorted by kind,
+	// path hash and size, each compared with the `window` before it. The
+	// sorted list is cut into segments where the path hash changes, each
+	// searched on a task of its own with its own reader, so the result does
+	// not depend on timing.
+	internal def findDeltas(repo Repository, slots PackSlot[], options PackOptions) !none {
+		let order int[] = []
+		for let (i, s) in slots {
+			continue unless s.reuse is none
+			continue unless s.kind == ObjectKind.Blob || s.kind == ObjectKind.Tree
+			continue when s.size < 50
+			order.push(i)
+		}
+		return none when order.len() < 2
+		order.sort((a, b) => compareDeltaOrder(slots[a], slots[b]))
+		let segments int[][] = []
+		let target = (order.len() / deltaTasks).max(deltaSegmentMin)
+		let at = 0
+		for at < order.len() {
+			let end = (at + target).min(order.len())
+			// Keep objects of one path together.
+			for end < order.len() && end > at && slots[order[end]].hash == slots[order[end - 1]].hash {
+				end++
+			}
+			segments.push(order[at:end].clone())
+			at = end
+		}
+		if segments.len() == 1 {
+			return try searchDeltas(repo.objects, slots, segments[0], options)
+		}
+		let tasks (async !none)[] = []
+		for let seg in segments {
+			tasks.push(async searchSegment(repo.objects.dir, repo.format, slots, seg, options))
+		}
+		let failure ?error = none
+		for let t in tasks {
+			await t onerror (err error) {
+				failure = err
+				recover none
+			}
+		}
+		fail failure unless failure is none
+		return none
+	}
+
+	// Tasks a delta search is spread over, and the smallest segment worth a
+	// task of its own.
+	internal const deltaTasks = 16
+	internal const deltaSegmentMin = 512
+
+	// Searches one segment with a reader of its own (packs keep caches that
+	// are not shared between tasks).
+	internal def searchSegment(dir string, format ObjectFormat, slots PackSlot[], segment int[], options PackOptions) !none {
+		let odb = new ObjectDatabase(dir, format)
+		try odb.open()
+		let failure ?error = none
+		searchDeltas(odb, slots, segment, options) onerror (err error) {
+			failure = err
+			recover none
+		}
+		odb.close()
+		fail failure unless failure is none
+		return none
+	}
+
+	internal def searchDeltas(odb ObjectDatabase, slots PackSlot[], segment int[], options PackOptions) !none {
+		let window = options.window
+		// The window: slot index and the delta index of its content.
+		let winIds int[] = []
+		let winIndex DeltaIndex[] = []
+		for let i in segment {
+			let s = slots[i]
+			let (_, data) = try odb.readRaw(s.item.id)
+			if !s.preferred {
+				let best ?byte[] = none
+				let bestBase = -1
+				for let k = winIds.len() - 1; k >= 0; k-- {
+					let b = slots[winIds[k]]
+					continue unless b.kind == s.kind
+					continue when b.depth >= options.depth
+					// Sizes too far apart never make a useful delta.
+					continue when b.size < s.size / 32
+					let limit0 = best is none ?? (s.size / 2, best.len())
+					let limit = limit0 * (options.depth - b.depth) / (options.depth + 1)
+					continue when limit < 20
+					let d = makeDelta(winIndex[k], data, limit)
+					if !(d is none) {
+						best = d
+						bestBase = winIds[k]
+					}
+				}
+				if !(best is none) {
+					s.base = bestBase
+					s.delta = best
+					s.depth = slots[bestBase].depth + 1
+				}
+			}
+			winIds.push(i)
+			winIndex.push(new DeltaIndex(data))
+			if winIds.len() > window {
+				winIds.shift()
+				winIndex.shift()
+			}
+		}
+		return none
+	}
+
+	// Objects the receiver of a pack already has that make good delta
+	// bases (a thin pack, as `--thin` picks them): the trees and blobs of
+	// the commits just outside what is sent, at the paths the pack sends.
+	internal def thinBases(repo Repository, items PackItem[]) !PackItem[] {
+		let sending map<string, bool> = {}
+		let paths map<string, bool> = {}
+		let dirs map<string, bool> = {}
+		let commits ObjectId[] = []
+		for let it in items {
+			sending[it.id.str()] = true
+			if it.path != "" {
+				paths[it.path] = true
+				let p = it.path
+				let slash = p.lastIndexOf("/")
+				for slash > 0 {
+					p = p.slice(0, slash)
+					dirs[p] = true
+					slash = p.lastIndexOf("/")
+				}
+			}
+		}
+		for let it in items {
+			let (kind, _) = try repo.info(it.id)
+			commits.push(it.id) when kind == ObjectKind.Commit
+		}
+		let out PackItem[] = []
+		let seen map<string, bool> = {}
+		for let c in commits {
+			let commit = try repo.commitAt(c)
+			for let p in commit.parents {
+				continue when sending.hasKey(p.str()) || seen.hasKey(p.str()) || !repo.has(p)
+				seen[p.str()] = true
+				let pc = commitOrNone(repo, p)
+				continue when pc is none
+				let rk = pc.tree.str()
+				if !seen.hasKey(rk) && !sending.hasKey(rk) {
+					seen[rk] = true
+					out.push(PackItem{id: pc.tree, path: ""})
+				}
+				try addBaseTree(repo, pc.tree, "", paths, dirs, sending, seen, out)
+			}
+		}
+		return out
+	}
+
+	internal def addBaseTree(repo Repository, id ObjectId, path string, paths map<string, bool>, dirs map<string, bool>, sending map<string, bool>, seen map<string, bool>, out PackItem[]) !none {
+		let t = treeOrNone(repo, id)
+		return none when t is none
+		for let e in t.entries {
+			let p = path == "" ?? (e.name, path + "/" + e.name)
+			let k = e.id.str()
+			continue when seen.hasKey(k) || sending.hasKey(k)
+			if isTree(e.mode) {
+				if paths.hasKey(p) {
+					seen[k] = true
+					out.push(PackItem{id: e.id, path: p})
+				}
+				try addBaseTree(repo, e.id, p, paths, dirs, sending, seen, out) when dirs.hasKey(p) || paths.hasKey(p)
+			} else if e.mode != EntryMode.Submodule && paths.hasKey(p) {
+				seen[k] = true
+				out.push(PackItem{id: e.id, path: p})
+			}
+		}
+		return none
+	}
+
+	internal def compareDeltaOrder(a PackSlot, b PackSlot) int {
+		return int(a.kind) - int(b.kind) when a.kind != b.kind
+		return a.hash < b.hash ?? (-1, 1) when a.hash != b.hash
+		return 0 when a.size == b.size
+		return a.size > b.size ?? (-1, 1)
+	}
+
+	// An index (version 2) for written pack entries: the ids sorted, their
+	// CRCs and offsets (64-bit ones in a table of their own), the pack's
+	// checksum, then the index's.
+	internal def encodeIdx(slots PackSlot[], packSum ObjectId, format ObjectFormat) byte[] {
+		let order int[] = []
+		for let i = 0; i < slots.len(); i++ {
+			order.push(i)
+		}
+		order.sort((a, b) => slots[a].item.id.compare(slots[b].item.id))
+		let out byte[] = byte[0xFF, 0x74, 0x4F, 0x63]
+		putBe(out, 2, 4)
+		let fanout int[]
+		fanout.len(256)
+		fanout.fill(0)
+		for let i in order {
+			fanout[int(slots[i].item.id.bytes[0])] = fanout[int(slots[i].item.id.bytes[0])] + 1
+		}
+		let total = 0
+		for let b = 0; b < 256; b++ {
+			total += fanout[b]
+			putBe(out, int64(total), 4)
+		}
+		for let i in order {
+			out.push(...slots[i].item.id.bytes)
+		}
+		for let i in order {
+			putBe(out, int64(slots[i].crc), 4)
+		}
+		let large int64[] = []
+		for let i in order {
+			let off = int64(slots[i].offset)
+			if off < 0x80000000 {
+				putBe(out, off, 4)
+			} else {
+				putBe(out, int64(0x80000000) | int64(large.len()), 4)
+				large.push(off)
+			}
+		}
+		for let off in large {
+			putBe(out, off, 8)
+		}
+		out.push(...packSum.bytes)
+		let h = newHasher(format)
+		return out + h.hash(out)
+	}
+
+	// The reverse index (`.rev`): index positions in pack order.
+	internal def encodeRev(slots PackSlot[], packSum ObjectId, format ObjectFormat) byte[] {
+		let order int[] = []
+		for let i = 0; i < slots.len(); i++ {
+			order.push(i)
+		}
+		order.sort((a, b) => slots[a].item.id.compare(slots[b].item.id))
+		let position int[]
+		position.len(slots.len())
+		for let (p, i) in order {
+			position[i] = p
+		}
+		let byOffset int[] = []
+		for let i = 0; i < slots.len(); i++ {
+			byOffset.push(i)
+		}
+		byOffset.sort((a, b) => slots[a].offset < slots[b].offset ?? (-1, slots[a].offset > slots[b].offset ?? (1, 0)))
+		let out byte[] = "RIDX".bytes()
+		putBe(out, 1, 4)
+		putBe(out, format == ObjectFormat.Sha256 ?? (int64(2), int64(1)), 4)
+		for let i in byOffset {
+			putBe(out, int64(position[i]), 4)
+		}
+		out.push(...packSum.bytes)
+		let h = newHasher(format)
+		return out + h.hash(out)
+	}
+
+	// Writes the objects as a new pack in the repository (pack, index and
+	// reverse index under objects/pack) and returns its checksum. Fails
+	// when a file cannot be written.
+	internal def writePackFiles(repo Repository, items PackItem[], options PackOptions = PackOptions{}) !ObjectId {
+		let dir = os.join(repo.objects.dir, "pack")
+		try os.mkdir(dir, true)
+		let token = crypto.rand(8) onerror recover byte[]
+		let temp = os.join(dir, "tmp_pack_{token.hex().lower()}")
+		let f = try os.open(temp, "w")
+		let failure ?error = none
+		let result = writePackStream(repo, items, f, options) onerror (err error) {
+			failure = err
+			recover (zeroId(repo.format), PackSlot[])
+		}
+		f.close() onerror recover none
+		if !(failure is none) {
+			os.remove(temp) onerror recover none
+			fail failure
+		}
+		let (sum, slots) = result
+		let base = os.join(dir, "pack-{sum.str()}")
+		try writeAtomically(base + ".idx", encodeIdx(slots, sum, repo.format), 0o444)
+		try writeAtomically(base + ".rev", encodeRev(slots, sum, repo.format), 0o444)
+		try os.chmod(temp, 0o444)
+		try os.rename(temp, base + ".pack")
+		try repo.objects.scanPacks()
+		return sum
+	}
+}

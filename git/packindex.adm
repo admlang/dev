@@ -1,0 +1,429 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.services.storage::(MapAccess)
+		std.crypto.hash
+		std.data.compress.zlib
+	)
+
+	// One entry of a pack being indexed.
+	internal type IndexedEntry {
+		offset   int
+		end      int
+		kind     int
+		size     int
+		dataAt   int
+		baseAt   int       = -1
+		baseId   ?ObjectId = none
+		id       ?ObjectId = none
+		// The kind of the object it resolves to.
+		realKind ObjectKind = ObjectKind.Blob
+		crc      uint32    = 0
+
+		def new(offset int, kind int, size int, dataAt int) {
+			self.offset = offset
+			self.kind = kind
+			self.size = size
+			self.dataAt = dataAt
+		}
+	}
+
+	// Reads every entry of a pack: offsets, kinds, delta bases and the ids
+	// of whole objects. Entries are found in order (each one's end is known
+	// only once it is inflated); whole objects are hashed meanwhile on
+	// tasks of their own. Fails when an entry is corrupt or the pack's
+	// checksum is wrong.
+	internal def scanPack(data byte[], format ObjectFormat) !IndexedEntry[] {
+		let hashLen = idLength(format)
+		fail "git: not a packfile" when data.len() < 12 + hashLen || string(data[0:4]) != "PACK"
+		let version = be32(data, 4)
+		fail "git: unsupported pack version {version}" unless version == 2 || version == 3
+		let checksum = async packChecksumMatches(data, format)
+		let jobs = new channel<HashBatch>(size = 4)
+		let workers (async none)[] = []
+		for let w = 0; w < hashWorkers; w++ {
+			workers.push(async hashBatches(data, jobs, format))
+		}
+		let out IndexedEntry[] = []
+		let failure ?error = none
+		scanEntries(data, hashLen, out, jobs) onerror (err error) {
+			failure = err
+			recover none
+		}
+		for let w = 0; w < hashWorkers; w++ {
+			jobs <- HashBatch{last: true}
+		}
+		for let t in workers {
+			await t
+		}
+		let intact = await checksum
+		fail "git: pack checksum mismatch" unless intact
+		fail failure unless failure is none
+		return out
+	}
+
+	// Whether the pack's trailing checksum is the hash of what precedes it.
+	internal def packChecksumMatches(data byte[], format ObjectFormat) bool {
+		let hashLen = idLength(format)
+		let h = newHasher(format)
+		let sum = h.hash(data[0:data.len() - hashLen])
+		return compareIdBytes(sum, 0, data, data.len() - hashLen, hashLen) == 0
+	}
+
+	// Tasks hashing the whole objects of a pack while it is scanned.
+	internal const hashWorkers = 4
+
+	// Entries scanned: each gets its CRC, and the whole objects among them
+	// (with their inflated contents in `data`) their ids; `last` tells a
+	// worker to stop.
+	internal struct HashBatch {
+		entries IndexedEntry[] = []
+		whole   IndexedEntry[] = []
+		data    byte[][]       = []
+		bytes   int            = 0
+		last    bool           = false
+	}
+
+	internal def hashBatches(pack byte[], jobs channel<HashBatch>, format ObjectFormat) {
+		for {
+			let batch = <-jobs
+			return when batch.last
+			for let e in batch.entries {
+				e.crc = hash.crc32(pack[e.offset:e.end])
+			}
+			for let (i, e) in batch.whole {
+				e.id = hashObject(e.realKind, batch.data[i], format)
+			}
+		}
+	}
+
+	internal def scanEntries(data byte[], hashLen int, out IndexedEntry[], jobs channel<HashBatch>) !none {
+		let count = be32(data, 8)
+		out.cap(count)
+		let batch = HashBatch{}
+		let p = 12
+		for let n = 0; n < count; n++ {
+			fail "git: pack is truncated" when p >= data.len() - hashLen
+			let start = p
+			let c = int(data[p])
+			let kind = (c >> 4) & 7
+			let size = c & 15
+			let shift = 4
+			p++
+			for (c & 0x80) != 0 {
+				fail "git: pack is truncated" when p >= data.len() - hashLen
+				c = int(data[p])
+				p++
+				size += (c & 0x7F) << shift
+				shift += 7
+			}
+			let e = new IndexedEntry(start, kind, size, p)
+			if kind == packOfsDelta {
+				fail "git: pack is truncated" when p >= data.len() - hashLen
+				c = int(data[p])
+				p++
+				let back = c & 0x7F
+				for (c & 0x80) != 0 {
+					fail "git: pack is truncated" when p >= data.len() - hashLen
+					c = int(data[p])
+					p++
+					back = ((back + 1) << 7) | (c & 0x7F)
+				}
+				fail "git: bad delta base offset in pack" when back <= 0 || back > start
+				e.baseAt = start - back
+				e.dataAt = p
+			} else if kind == packRefDelta {
+				fail "git: pack is truncated" when p + hashLen > data.len() - hashLen
+				e.baseId = new ObjectId(data[p:p + hashLen].clone())
+				p += hashLen
+				e.dataAt = p
+			} else {
+				fail "git: unknown pack entry type {kind}" unless kind >= 1 && kind <= 4
+			}
+			let (inflated, used) = try zlib.inflate(data, e.dataAt, size)
+			fail "git: pack entry at {start} has the wrong size" unless inflated.len() == size
+			p = e.dataAt + used
+			e.end = p
+			batch.entries.push(e)
+			batch.bytes += used
+			if kind >= 1 && kind <= 4 {
+				e.realKind = ObjectKind(kind)
+				batch.whole.push(e)
+				batch.data.push(inflated)
+				batch.bytes += size
+			}
+			if batch.bytes >= hashBatchBytes {
+				jobs <- batch
+				batch = HashBatch{}
+			}
+			out.push(e)
+		}
+		jobs <- batch when batch.entries.len() > 0
+		fail "git: pack has data after its last object" unless p == data.len() - hashLen
+		return none
+	}
+
+	// About how many bytes (stored, and inflated for whole objects) go to a
+	// hashing task at once.
+	internal const hashBatchBytes = 1 << 20
+
+	// Gives every delta its id and kind by applying it to its base. Each
+	// tree of deltas under one base resolves on a task of its own; a
+	// REF_DELTA base outside the pack comes from `repo` (a thin pack).
+	// Returns the ids of the bases that came from the repository and are not
+	// in the pack. Fails when a base is missing or a delta is corrupt.
+	internal def resolvePackDeltas(repo Repository, data byte[], entries IndexedEntry[]) !ObjectId[] {
+		let format = repo.format
+		let byOffset map<int, int> = {}
+		for let (i, e) in entries {
+			byOffset[e.offset] = i
+		}
+		let tree = new DeltaChildren()
+		for let (i, e) in entries {
+			if e.kind == packOfsDelta {
+				let base = byOffset.get(e.baseAt)
+				fail "git: delta at {e.offset} points at no object" when base is none
+				tree.addOfs(base, i)
+			} else if e.kind == packRefDelta {
+				let bid = e.baseId
+				tree.addRef(bid is none ?? ("", bid.str()), i)
+			}
+		}
+		// Every whole object with deltas under it.
+		let roots int[] = []
+		for let (i, e) in entries {
+			continue unless e.kind >= 1 && e.kind <= 4
+			let id = e.id
+			roots.push(i) when tree.ofs.hasKey(i) || (!(id is none) && tree.ref.hasKey(id.str()))
+		}
+		let tasks (async !none)[] = []
+		for let part in splitWork(roots) {
+			tasks.push(async resolveRoots(data, entries, part, tree, format))
+		}
+		for let t in tasks {
+			try await t
+		}
+		// What is left hangs off bases outside the pack, or off deltas that
+		// resolve only once those are in.
+		let external ObjectId[] = []
+		let progress = true
+		for progress {
+			progress = false
+			let bases ExternalBase[] = []
+			for let (key, children) in tree.ref {
+				continue unless children.filter(c => entries[c].id is none).len() > 0
+				let bid = try parseId(key)
+				continue unless repo.has(bid)
+				let (kind, raw) = try repo.raw(bid)
+				bases.push(ExternalBase{id: bid, kind: kind, data: raw})
+			}
+			break when bases.len() == 0
+			let more (async !none)[] = []
+			for let b in bases {
+				more.push(async resolveExternal(data, entries, b, tree, format))
+			}
+			for let t in more {
+				try await t
+			}
+			for let b in bases {
+				external.push(b.id)
+			}
+			progress = true
+		}
+		let inPack map<string, bool> = {}
+		for let e in entries {
+			let id = e.id
+			fail "git: delta at {e.offset} has no base" when id is none
+			inPack[id.str()] = true
+		}
+		return external.filter(id => !inPack.hasKey(id.str()))
+	}
+
+	// The deltas of a pack under each base: OFS_DELTA ones by the base's
+	// entry index, REF_DELTA ones by the base's id.
+	internal type DeltaChildren {
+		ofs map<int, int[]>    = {}
+		ref map<string, int[]> = {}
+
+		def addOfs(base int, child int) {
+			let known = ofs.get(base)
+			if known is none {
+				ofs[base] = [child]
+			} else {
+				known.push(child)
+			}
+		}
+
+		def addRef(base string, child int) {
+			let known = ref.get(base)
+			if known is none {
+				ref[base] = [child]
+			} else {
+				known.push(child)
+			}
+		}
+	}
+
+	// A delta base read from the repository for a thin pack.
+	internal struct ExternalBase {
+		id   ObjectId
+		kind ObjectKind
+		data byte[]
+	}
+
+	// Splits root indexes into at most 64 interleaved parts, so the tasks
+	// get a similar mix of large and small trees.
+	internal def splitWork(roots int[]) int[][] {
+		let parts = roots.len() < 64 ?? (roots.len(), 64)
+		let out int[][] = []
+		for let p = 0; p < parts; p++ {
+			let part int[] = []
+			for let i = p; i < roots.len(); i += parts {
+				part.push(roots[i])
+			}
+			out.push(part)
+		}
+		return out
+	}
+
+	internal def resolveRoots(data byte[], entries IndexedEntry[], roots int[], tree DeltaChildren, format ObjectFormat) !none {
+		for let r in roots {
+			let e = entries[r]
+			let (raw, _) = try zlib.inflate(data, e.dataAt, e.size)
+			try resolveChildren(data, entries, r, raw, e.realKind, tree, format)
+		}
+		return none
+	}
+
+	internal def resolveExternal(data byte[], entries IndexedEntry[], base ExternalBase, tree DeltaChildren, format ObjectFormat) !none {
+		let kids = tree.ref.get(base.id.str())
+		return none when kids is none
+		for let c in kids {
+			continue unless entries[c].id is none
+			try resolveOne(data, entries, c, base.data, base.kind, tree, format)
+		}
+		return none
+	}
+
+	// Resolves the deltas under entry `parent`, whose content is `parentData`.
+	internal def resolveChildren(data byte[], entries IndexedEntry[], parent int, parentData byte[], kind ObjectKind, tree DeltaChildren, format ObjectFormat) !none {
+		let o = tree.ofs.get(parent)
+		if !(o is none) {
+			for let c in o {
+				try resolveOne(data, entries, c, parentData, kind, tree, format)
+			}
+		}
+		let pid = entries[parent].id
+		return none when pid is none
+		let r = tree.ref.get(pid.str())
+		return none when r is none
+		for let c in r {
+			continue unless entries[c].id is none
+			try resolveOne(data, entries, c, parentData, kind, tree, format)
+		}
+		return none
+	}
+
+	internal def resolveOne(data byte[], entries IndexedEntry[], c int, baseData byte[], kind ObjectKind, tree DeltaChildren, format ObjectFormat) !none {
+		let e = entries[c]
+		let (delta, _) = try zlib.inflate(data, e.dataAt, e.size)
+		let result = try applyDelta(baseData, delta)
+		e.realKind = kind
+		e.id = hashObject(kind, result, format)
+		try resolveChildren(data, entries, c, result, kind, tree, format)
+		return none
+	}
+
+	// Indexes a pack file received from elsewhere and moves it into the
+	// repository as pack-<checksum>.pack with its .idx and .rev. A thin pack
+	// gets the bases it lacks appended from the repository first. Returns
+	// the pack's checksum. Fails when the pack is corrupt or a base is
+	// missing.
+	internal def indexPackFile(repo Repository, path string) !ObjectId {
+		let hashLen = idLength(repo.format)
+		let m = try os.mapFile(path, MapAccess.Copy)
+		let entries IndexedEntry[] = []
+		let external ObjectId[] = []
+		let sum = zeroId(repo.format)
+		let body byte[] = []
+		let failure ?error = none
+		let scanned = scanAndResolve(repo, m) onerror (err error) {
+			failure = err
+			recover (IndexedEntry[], ObjectId[], byte[])
+		}
+		if failure is none {
+			let (es, ex, trailer) = scanned
+			entries = es
+			external = ex
+			sum = new ObjectId(trailer)
+			if external.len() > 0 {
+				let data = m.pages(0, m.length()) onerror recover byte[]
+				body = data[0:data.len() - hashLen].clone()
+			}
+		}
+		m.close()
+		fail failure unless failure is none
+		let final = path
+		if external.len() > 0 {
+			// Complete the thin pack: the bases go at the end as whole objects,
+			// and the count and checksum are rewritten.
+			putBeAt(body, 8, entries.len() + external.len())
+			for let id in external {
+				let (kind, raw) = try repo.raw(id)
+				let at = body.len()
+				let entry = entryHeaderBytes(int(kind), raw.len()) + compressBytes(raw, 6)
+				body.push(...entry)
+				let e = new IndexedEntry(at, int(kind), raw.len(), at)
+				e.end = body.len()
+				e.id = id
+				e.realKind = kind
+				e.crc = hash.crc32(entry)
+				entries.push(e)
+			}
+			let h = newHasher(repo.format)
+			let digest = h.hash(body)
+			body.push(...digest)
+			sum = new ObjectId(digest)
+			final = path + ".fixed"
+			try os.writeFile(final, body)
+		}
+		let slots PackSlot[] = []
+		for let e in entries {
+			let id = e.id
+			let s = new PackSlot(PackItem{id: id is none ?? (zeroId(repo.format), id)}, e.realKind, e.size)
+			s.offset = e.offset
+			s.crc = e.crc
+			slots.push(s)
+		}
+		let dir = os.join(repo.objects.dir, "pack")
+		try os.mkdir(dir, true)
+		let base = os.join(dir, "pack-{sum.str()}")
+		try writeAtomically(base + ".idx", encodeIdx(slots, sum, repo.format), 0o444)
+		try writeAtomically(base + ".rev", encodeRev(slots, sum, repo.format), 0o444)
+		try os.chmod(final, 0o444)
+		try os.rename(final, base + ".pack")
+		if final != path {
+			os.remove(path) onerror recover none
+		}
+		try repo.objects.scanPacks()
+		return sum
+	}
+
+	// Scans and resolves the mapped pack: its entries, the bases a thin
+	// pack lacks, and its checksum.
+	internal def scanAndResolve(repo Repository, m os.Mapping) !(IndexedEntry[], ObjectId[], byte[]) {
+		let data = try m.pages(0, m.length())
+		let entries = try scanPack(data, repo.format)
+		let external = try resolvePackDeltas(repo, data, entries)
+		let hashLen = idLength(repo.format)
+		return (entries, external, data[data.len() - hashLen:].clone())
+	}
+
+	// Overwrites four bytes at `at` with a big-endian number.
+	internal def putBeAt(out byte[], at int, value int) {
+		out[at] = byte((value >> 24) & 0xFF)
+		out[at + 1] = byte((value >> 16) & 0xFF)
+		out[at + 2] = byte((value >> 8) & 0xFF)
+		out[at + 3] = byte(value & 0xFF)
+	}
+}

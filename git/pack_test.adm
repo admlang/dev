@@ -1,0 +1,189 @@
+// Packs written and indexed by this library: git's own packs index to the
+// same .idx and .rev git wrote, packs this library writes read back object
+// for object, and git's thin packs are completed from the repository.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	// A pack file to index as well (git's own .idx beside it is the answer);
+	// empty: none. For timing against `git index-pack`.
+	@env("ADM_TEST_GIT_PACK")
+	internal const packCorpus string
+
+	// The single pack of a fixture repository (its .pack path).
+	internal def fixturePack(repo Repository) !string {
+		let dir = os.join(repo.objects.dir, "pack")
+		for let e in try os.readDir(dir) {
+			return e.path when e.path.endsWith(".pack")
+		}
+		fail "no pack in {dir}"
+	}
+
+	// An empty bare repository of `format` and a path in its pack folder to
+	// put an incoming pack at.
+	internal def receiving(name string, format ObjectFormat) !(Repository, string) {
+		let repo = try init(try scratch(name), InitOptions{bare: true, format: format})
+		let dir = os.join(repo.objects.dir, "pack")
+		try os.mkdir(dir, true)
+		return (repo, os.join(dir, "incoming.pack"))
+	}
+
+	// Fails unless every object of `ids` reads the same in both repositories.
+	internal def sameObjects(from Repository, to Repository, ids ObjectId[]) !none {
+		for let id in ids {
+			fail "{id.str()} is missing" unless to.has(id)
+			let (wantKind, want) = try from.raw(id)
+			let (kind, got) = try to.raw(id)
+			fail "{id.str()} reads differently" unless kind == wantKind && got.equals(want)
+		}
+		return none
+	}
+
+	// Writes `items` of `from` as a pack and indexes it into `to`; returns
+	// the slots the writer made and the pack's checksum.
+	internal def sendPack(from Repository, to Repository, path string, items PackItem[]) !(PackSlot[], ObjectId) {
+		let f = try os.open(path, "w")
+		let result = writePackStream(from, items, f) onerror (err error) {
+			f.close() onerror recover none
+			fail err
+		}
+		try f.close()
+		let (written, slots) = result
+		let sum = try indexPackFile(to, path)
+		fail "index-pack named it {sum.str()}, the writer {written.str()}" unless sum.equals(written)
+		return (slots, sum)
+	}
+
+	// Whether the writer stored the slot as a delta, made or reused.
+	internal def isDeltaSlot(s PackSlot) bool {
+		return true when s.base >= 0
+		let r = s.reuse
+		return !(r is none) && r.kind >= packOfsDelta
+	}
+
+	check "Packs" {
+		@test()
+		def indexesGitPacks() !none {
+			for let name in string["basic", "sha256"] {
+				let (src, _) = try fixture(name)
+				let pack = try fixturePack(src)
+				let (dst, incoming) = try receiving("index-" + name, src.format)
+				try os.writeFile(incoming, try os.readFile(pack))
+				let sum = try indexPackFile(dst, incoming)
+				let stem = pack.slice(0, pack.len() - 5)
+				let ours = os.join(dst.objects.dir, "pack", "pack-{sum.str()}")
+				fail "{name}: .idx differs from git's" unless (try os.readFile(ours + ".idx")).equals(try os.readFile(stem + ".idx"))
+				if try os.exists(stem + ".rev") {
+					fail "{name}: .rev differs from git's" unless (try os.readFile(ours + ".rev")).equals(try os.readFile(stem + ".rev"))
+				}
+				fail "{name}: incoming pack left behind" when try os.exists(incoming)
+				let p = new Pack(pack, src.format)
+				try p.load()
+				let ids ObjectId[] = []
+				for let i = 0; i < p.count; i++ {
+					ids.push(p.idAt(i))
+				}
+				p.close()
+				try sameObjects(src, dst, ids)
+			}
+			return none
+		}
+
+		@test()
+		def indexesLargePacks() !none {
+			return none when packCorpus == ""
+			let (dst, incoming) = try receiving("index-corpus", ObjectFormat.Sha1)
+			try os.writeFile(incoming, try os.readFile(packCorpus))
+			let sum = try indexPackFile(dst, incoming)
+			let ours = try os.readFile(os.join(dst.objects.dir, "pack", "pack-{sum.str()}.idx"))
+			fail ".idx differs from git's" unless ours.equals(try os.readFile(packCorpus.slice(0, packCorpus.len() - 5) + ".idx"))
+			return none
+		}
+
+		@test()
+		def writesPacks() !none {
+			for let name in fixtureNames {
+				let (src, _) = try fixture(name)
+				let tips ObjectId[] = []
+				for let r in try src.refs() {
+					let id = r.id
+					tips.push(id) unless id is none
+				}
+				let items = try objectsToPack(src, tips, [])
+				let (dst, incoming) = try receiving("write-" + name, src.format)
+				let (slots, sum) = try sendPack(src, dst, incoming, items)
+				let deltas = slots.filter(s => isDeltaSlot(s)).len()
+				fail "{name}: no deltas among {slots.len()} objects" when deltas == 0
+				// The writer's index and index-pack's agree on every offset and CRC.
+				let idx = try os.readFile(os.join(dst.objects.dir, "pack", "pack-{sum.str()}.idx"))
+				fail "{name}: writer and index-pack disagree" unless idx.equals(encodeIdx(slots, sum, src.format))
+				let ids ObjectId[] = []
+				for let it in items {
+					ids.push(it.id)
+				}
+				try sameObjects(src, dst, ids)
+				// Everything reachable is there: walking it again finds no gap.
+				let again = try objectsToPack(dst, tips, [])
+				fail "{name}: {again.len()} objects reachable, {items.len()} sent" unless again.len() == items.len()
+			}
+			return none
+		}
+
+		@test()
+		def fixesThinPacks() !none {
+			let (src, _) = try fixture("basic")
+			let root = try fixtures()
+			let (dst, incoming) = try receiving("thin", src.format)
+			let old = try src.resolve("main~2")
+			let _ = try sendPack(src, dst, incoming, try objectsToPack(src, [old], []))
+			try os.writeFile(incoming, try os.readFile(os.join(root, "thin.pack")))
+			let before = dst.objects.packs.len()
+			let sum = try indexPackFile(dst, incoming)
+			fail "the thin pack was not added" unless dst.objects.packs.len() == before + 1
+			let thin ObjectId[] = []
+			for let line in string(try os.readFile(os.join(root, "expected", "thin.txt"))).split("\n") {
+				thin.push(try parseId(line)) when line != ""
+			}
+			try sameObjects(src, dst, thin)
+			let p = new Pack(os.join(dst.objects.dir, "pack", "pack-{sum.str()}.pack"), dst.format)
+			try p.load()
+			let count = p.count
+			p.close()
+			fail "the completed pack holds {count} objects for {thin.len()} sent" unless count > thin.len()
+			// The completed pack stands alone: every delta's base is inside it.
+			let (alone, aloneIncoming) = try receiving("thin-alone", src.format)
+			try os.writeFile(aloneIncoming, try os.readFile(os.join(dst.objects.dir, "pack", "pack-{sum.str()}.pack")))
+			let _ = try indexPackFile(alone, aloneIncoming)
+			try sameObjects(src, alone, thin)
+			let main = try src.resolve("main")
+			try sameObjects(src, dst, (try objectsToPack(src, [main], [])).mapElem(it => it.id))
+			return none
+		}
+
+		@test()
+		def rejectsDamagedPacks() !none {
+			let (src, _) = try fixture("basic")
+			let data = try os.readFile(try fixturePack(src))
+			let (dst, incoming) = try receiving("damaged", src.format)
+			data[data.len() / 2] = data[data.len() / 2] ^ 0x5A
+			try os.writeFile(incoming, data)
+			let failed = indexPackFile(dst, incoming) onerror (err error) {
+				fail "damage reported as: {err.message}" unless err.message.contains("checksum")
+				recover zeroId(src.format)
+			}
+			fail "a damaged pack was indexed" unless failed.isZero()
+			fail "a pack was added" unless dst.objects.packs.len() == 0
+			// A thin pack without its bases names what is missing.
+			let root = try fixtures()
+			try os.writeFile(incoming, try os.readFile(os.join(root, "thin.pack")))
+			let missing = indexPackFile(dst, incoming) onerror (err error) {
+				fail "missing base reported as: {err.message}" unless err.message.contains("base")
+				recover zeroId(src.format)
+			}
+			fail "a thin pack indexed without its bases" unless missing.isZero()
+			return none
+		}
+	}
+}

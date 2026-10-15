@@ -1,0 +1,443 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto
+	)
+
+	// What a forced update may overwrite: the remote reference must still
+	// hold `expected` (`--force-with-lease=<ref>:<expected>`); none takes
+	// the remote-tracking reference's value.
+	struct Lease {
+		name     string
+		expected ?ObjectId = none
+	}
+
+	// The settings of a push (`Repository.push`'s parameters).
+	internal struct PushOptions {
+		remote      RemoteOptions = RemoteOptions{}
+		// Refspecs to push instead of `remote.<name>.push` (or the current
+		// branch, as `push.default=simple` does).
+		refspecs    string[]      = []
+		// Update references even when it is not a fast-forward.
+		force       bool          = false
+		// Forced updates allowed only while the remote still holds what is
+		// expected.
+		leases      Lease[]       = []
+		// All references or none (`--atomic`).
+		allOrNone   bool          = false
+		// Strings passed to the remote's hooks (`--push-option`).
+		pushOptions string[]      = []
+		// Annotated tags pointing at pushed commits go along
+		// (`--follow-tags`).
+		followTags  bool          = false
+		// Every local tag goes along (`--tags`).
+		tags        bool          = false
+		// Record the remote branch as the upstream of the local one
+		// (`--set-upstream`).
+		setUpstream bool          = false
+	}
+
+	// What a push did.
+	struct PushResult {
+		url     string
+		changes RefChange[] = []
+	}
+
+	// One reference a push updates.
+	internal struct PushPlan {
+		local  string
+		remote string
+		before ObjectId
+		after  ObjectId
+		force  bool
+		// A lease's expected value, checked against `before`.
+		lease  ?ObjectId = none
+	}
+
+	// The full remote name a refspec's destination stands for: as given
+	// when it starts with `refs/`, else what the remote already has under
+	// that short name, else the kind of the local source.
+	internal def pushDestination(dst string, local string, remoteRefs RemoteRef[]) !string {
+		return dst when dst.startsWith("refs/")
+		for let prefix in string["refs/heads/", "refs/tags/"] {
+			return prefix + dst when remoteRefs.filter(r => r.name == prefix + dst).len() > 0
+		}
+		return "refs/tags/" + dst when local.startsWith("refs/tags/")
+		return "refs/heads/" + dst when local.startsWith("refs/heads/") || local == ""
+		fail "git: cannot tell which remote reference {dst} means; name it in full"
+	}
+
+	// The updates the refspecs ask for.
+	internal def planPush(repo Repository, specs Refspec[], remoteRefs RemoteRef[], options PushOptions) !PushPlan[] {
+		let remoteValue map<string, ObjectId> = {}
+		for let r in remoteRefs {
+			let id = r.id
+			remoteValue[r.name] = id unless id is none
+		}
+		let zero = zeroId(repo.format)
+		let out PushPlan[] = []
+		let add = def (local string, remote string, after ObjectId, force bool) {
+			let before = remoteValue.get(remote)
+			out.push(PushPlan{local: local, remote: remote, before: before is none ?? (zero, before), after: after, force: force || options.force})
+		}
+		for let spec in specs {
+			continue when spec.negative
+			if spec.matching {
+				for let r in try repo.refs("refs/heads/") {
+					let id = r.id
+					continue when id is none || !remoteValue.hasKey(r.name)
+					add(r.name, r.name, id, spec.force)
+				}
+				continue
+			}
+			if spec.pattern {
+				let prefix = spec.source.slice(0, spec.source.indexOf("*"))
+				for let r in try repo.refs(prefix) {
+					let dst = mapSource(spec, r.name)
+					continue when dst is none || excludedBy(specs, r.name)
+					let id = try repo.refTarget(r.name)
+					add(r.name, dst, id, spec.force) unless id is none
+				}
+				continue
+			}
+			if spec.source == "" {
+				// `:dst` deletes.
+				let dst = try pushDestination(spec.target, "", remoteRefs)
+				add("", dst, zero, spec.force)
+				continue
+			}
+			let local = try repo.expandRef(spec.source)
+			let id = try repo.resolve(spec.source)
+			let localName = local is none ?? ("", local)
+			let target = spec.target != "" ?? (spec.target, localName)
+			fail "git: {spec.source} is not a reference; say where it goes ({spec.source}:refs/heads/<name>)" when target == ""
+			add(localName, try pushDestination(target, localName, remoteRefs), id, spec.force)
+		}
+		if options.tags || options.followTags {
+			let pushed map<string, bool> = {}
+			for let p in out {
+				pushed[p.remote] = true
+			}
+			let reach ObjectId[] = []
+			for let p in out {
+				reach.push(p.after) unless p.after.isZero()
+			}
+			for let r in try repo.refs("refs/tags/") {
+				let id = r.id
+				continue when id is none || pushed.hasKey(r.name) || remoteValue.hasKey(r.name)
+				if options.followTags {
+					let (kind, _) = try repo.info(id)
+					continue unless kind == ObjectKind.Tag
+					let target = repo.peel(id, ObjectKind.Commit) onerror recover zero
+					continue when target.isZero()
+					let reached = false
+					for let tip in reach {
+						let tc = repo.peel(tip, ObjectKind.Commit) onerror recover zero
+						continue when tc.isZero()
+						if try isAncestor(repo, target, tc) {
+							reached = true
+							break
+						}
+					}
+					continue unless reached || options.tags
+				}
+				add(r.name, r.name, id, false)
+			}
+		}
+		for let lease in options.leases {
+			for let p in out {
+				continue unless p.remote == lease.name || p.local == lease.name
+				p.force = true
+				let expected = lease.expected
+				p.lease = expected is none ?? (try trackingValue(repo, p.remote), expected)
+			}
+		}
+		return out
+	}
+
+	// What the remote-tracking reference for a remote reference holds, the
+	// zero id when there is none (a lease that expects it absent).
+	internal def trackingValue(repo Repository, remoteName string) !ObjectId {
+		for let name in repo.config.subsections("remote") {
+			for let text in repo.config.all("remote.{name}.fetch") {
+				let spec = refspecOrNone(text)
+				continue when spec is none
+				let local = mapSource(spec, remoteName)
+				continue when local is none
+				let id = try repo.refTarget(local)
+				return id unless id is none
+			}
+		}
+		return zeroId(repo.format)
+	}
+
+	// Pushes to a remote (a configured name or a URL): sends the objects
+	// the updates need and reports what the remote did with each. Fails
+	// when the remote cannot be reached or refuses the whole push; a
+	// reference that is not updated is reported as rejected.
+	internal def pushRemote(repo Repository, name string, options PushOptions) !PushResult {
+		let remote = try remoteConfig(repo, name)
+		let texts = options.refspecs.len() > 0 ?? (options.refspecs, remote.push)
+		if texts.len() == 0 {
+			let branch = try repo.branch()
+			fail "git: HEAD is detached; say what to push" when branch == ""
+			texts = ["refs/heads/{branch}:refs/heads/{branch}"]
+		}
+		let specs Refspec[] = []
+		for let t in texts {
+			specs.push(try parseRefspec(t))
+		}
+		let session = try openSession(remote.pushUrl, "git-receive-pack", options.remote, repo.config)
+		let result = doPush(repo, session, remote, specs, options) onerror (err error) {
+			session.close()
+			fail err
+		}
+		session.wire.close()
+		return result
+	}
+
+	internal def doPush(repo Repository, session RemoteSession, remote RemoteConfig, specs Refspec[], options PushOptions) !PushResult {
+		let result = PushResult{url: remote.pushUrl}
+		fail "git: the remote uses {formatName(session.format)} and the repository {formatName(repo.format)}" when session.format != repo.format
+		let plans = try planPush(repo, specs, session.advertised, options)
+		let sending PushPlan[] = []
+		for let p in plans {
+			let change = RefChange{name: p.remote, source: p.local, before: p.before.isZero() ?? (none, p.before), after: p.after.isZero() ?? (none, p.after), kind: RefChangeKind.UpToDate}
+			result.changes.push(change)
+			continue when p.before.equals(p.after)
+			if p.after.isZero() {
+				if p.before.isZero() {
+					change.kind = RefChangeKind.Rejected
+					change.reason = "remote ref does not exist"
+					continue
+				}
+				change.kind = RefChangeKind.Deleted
+			} else if p.before.isZero() {
+				change.kind = RefChangeKind.Created
+			} else if p.remote.startsWith("refs/tags/") && !p.force {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "already exists"
+				continue
+			} else if !repo.has(p.before) && !p.force {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "fetch first"
+				continue
+			} else if repo.has(p.before) && try fastForwards(repo, p.before, p.after) {
+				change.kind = RefChangeKind.FastForward
+			} else if p.force {
+				change.kind = RefChangeKind.Forced
+			} else {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "non-fast-forward"
+				continue
+			}
+			let lease = p.lease
+			if !(lease is none) && !lease.equals(p.before) {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "stale info"
+				continue
+			}
+			sending.push(p)
+		}
+		let rejected = result.changes.filter(c => c.kind == RefChangeKind.Rejected)
+		if options.allOrNone && rejected.len() > 0 {
+			for let c in result.changes {
+				if c.kind != RefChangeKind.Rejected && c.kind != RefChangeKind.UpToDate {
+					c.kind = RefChangeKind.Rejected
+					c.reason = "atomic push failed"
+				}
+			}
+			session.wire.request(session.program, new bytes.Reader(pktFlush.bytes())) onerror recover new PktReader(new bytes.Reader([]))
+			return result
+		}
+		if sending.len() == 0 {
+			// Nothing to send: an empty request ends the exchange.
+			session.wire.request(session.program, new bytes.Reader(pktFlush.bytes())) onerror recover new PktReader(new bytes.Reader([]))
+			return result
+		}
+		fail "git: the remote does not take atomic pushes" when options.allOrNone && !session.caps.hasKey("atomic")
+		fail "git: the remote does not take push options" when options.pushOptions.len() > 0 && !session.caps.hasKey("push-options")
+		let want string[] = []
+		for let c in string["report-status-v2", "report-status", "side-band-64k", "quiet", "atomic", "push-options", "object-format", "agent"] {
+			continue unless session.caps.hasKey(c)
+			continue when c == "report-status" && session.caps.hasKey("report-status-v2")
+			continue when c == "atomic" && !options.allOrNone
+			continue when c == "push-options" && options.pushOptions.len() == 0
+			if c == "object-format" {
+				want.push("object-format={formatName(repo.format)}")
+			} else if c == "agent" {
+				want.push("agent={gitAgent}")
+			} else {
+				want.push(c)
+			}
+		}
+		let body byte[] = []
+		for let (i, p) in sending {
+			let line = "{p.before.str()} {p.after.str()} {p.remote}".bytes()
+			if i == 0 {
+				line.push(0)
+				line = line + want.join(" ").bytes()
+			}
+			body = body + try pktLine(line)
+		}
+		body = body + pktFlush.bytes()
+		if options.pushOptions.len() > 0 {
+			for let o in options.pushOptions {
+				body = body + try pktLine(o)
+			}
+			body = body + pktFlush.bytes()
+		}
+		// The pack, unless every update deletes.
+		let wants ObjectId[] = []
+		for let p in sending {
+			wants.push(p.after) unless p.after.isZero()
+		}
+		let parts io.Reader[] = [new bytes.Reader(body)]
+		let temp = ""
+		if wants.len() > 0 {
+			let haves ObjectId[] = []
+			for let r in session.advertised {
+				let id = r.id
+				haves.push(id) unless id is none || !repo.has(id)
+			}
+			let items = try objectsToPack(repo, wants, haves)
+			let token = crypto.rand(8) onerror recover byte[]
+			temp = os.join(repo.objects.dir, "pack", "tmp_push_{token.hex().lower()}")
+			try os.mkdir(os.dir(temp), true)
+			let f = try os.open(temp, "w")
+			let failure ?error = none
+			// A shallow repository may lack the parents a thin pack leans on.
+			let thin = !session.caps.hasKey("no-thin") && shallowCommits(repo).len() == 0
+			let bases = thin ?? (try thinBases(repo, items), PackItem[])
+			writePackStream(repo, items, f, PackOptions{}, bases) onerror (err error) {
+				failure = err
+				recover (zeroId(repo.format), PackSlot[])
+			}
+			f.close() onerror recover none
+			if !(failure is none) {
+				os.remove(temp) onerror recover none
+				fail failure
+			}
+			parts.push(try os.open(temp, "r"))
+		}
+		let r = session.wire.request(session.program, new ConcatReader(parts)) onerror (err error) {
+			if temp != "" {
+				os.remove(temp) onerror recover none
+			}
+			fail err
+		}
+		if temp != "" {
+			os.remove(temp) onerror recover none
+		}
+		let statuses = try readPushReport(session, r, want.includes("side-band-64k"))
+		for let c in result.changes {
+			continue when c.kind == RefChangeKind.Rejected || c.kind == RefChangeKind.UpToDate
+			let status = statuses.get(c.name)
+			if status is none {
+				c.kind = RefChangeKind.Rejected
+				c.reason = "the remote did not report on it"
+			} else if status != "" {
+				c.kind = RefChangeKind.Rejected
+				c.reason = status
+			}
+		}
+		try updateTracking(repo, remote, result.changes, options)
+		return result
+	}
+
+	// Reads report-status: `unpack ok` and an `ok`/`ng` line per
+	// reference, on side-band channel 1 when asked. Returns each
+	// reference's refusal reason, empty for those updated. Fails when the
+	// remote could not unpack.
+	internal def readPushReport(session RemoteSession, r PktReader, sideBand bool) !map<string, string> {
+		let inner = r
+		if sideBand {
+			let buffer = new bytes.Buffer()
+			let _ = try copySideBand(session, r, buffer)
+			inner = new PktReader(new bytes.Reader(buffer.bytes()))
+		}
+		let out map<string, string> = {}
+		let first = try inner.read()
+		let unpack = pktText(first)
+		fail "git: bad push report: {unpack}" unless unpack.startsWith("unpack ")
+		fail "git: the remote could not unpack the pack: {unpack.slice(7)}" unless unpack == "unpack ok"
+		for {
+			let p = inner.read() onerror recover Pkt{kind: PktKind.Flush}
+			break unless p.kind == PktKind.Data
+			let line = pktText(p)
+			if line.startsWith("ok ") {
+				out[line.slice(3)] = ""
+			} else if line.startsWith("ng ") {
+				let rest = line.slice(3)
+				let space = rest.indexOf(" ")
+				if space < 0 {
+					out[rest] = "rejected"
+				} else {
+					out[rest.slice(0, space)] = rest.slice(space + 1)
+				}
+			}
+		}
+		return out
+	}
+
+	// After a push, the remote-tracking references follow what the remote
+	// now holds, and `setUpstream` records the upstream.
+	internal def updateTracking(repo Repository, remote RemoteConfig, changes RefChange[], options PushOptions) !none {
+		return none when remote.name == ""
+		let specs Refspec[] = []
+		for let t in remote.fetch {
+			let s = refspecOrNone(t)
+			specs.push(s) unless s is none
+		}
+		let who = try repo.identity("committer")
+		for let c in changes {
+			continue when c.kind == RefChangeKind.Rejected || c.kind == RefChangeKind.UpToDate
+			for let s in specs {
+				let local = mapSource(s, c.name)
+				continue when local is none
+				let u = c.kind == RefChangeKind.Deleted ?? (RefUpdate{name: local, delete: true, deref: false}, RefUpdate{name: local, newId: c.after, message: "update by push"})
+				repo.refStore.commit([u], who) onerror recover none
+			}
+			if options.setUpstream && c.source.startsWith("refs/heads/") && c.name.startsWith("refs/heads/") && c.kind != RefChangeKind.Deleted {
+				let branch = c.source.slice(11)
+				try repo.config.set("branch.{branch}.remote", remote.name)
+				try repo.config.set("branch.{branch}.merge", c.name)
+			}
+		}
+		return none
+	}
+
+	internal def refspecOrNone(text string) ?Refspec {
+		return tryRefspec(text) onerror recover none
+	}
+
+	internal def tryRefspec(text string) !?Refspec {
+		return try parseRefspec(text)
+	}
+
+	// Reads its readers one after another.
+	internal type ConcatReader {
+		internal parts io.Reader[]
+		internal at    int = 0
+
+		def new(parts io.Reader[]) {
+			self.parts = parts
+		}
+
+		def read(into byte[]) !int {
+			for at < parts.len() {
+				let n = try parts[at].read(into)
+				return n when n > 0
+				let part = parts[at]
+				if part is os.File {
+					let f os.File = part
+					f.close() onerror recover none
+				}
+				at++
+			}
+			return 0
+		}
+	}
+}

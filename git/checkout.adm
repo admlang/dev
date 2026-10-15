@@ -1,0 +1,338 @@
+partial module adm.dev.git {
+	use std.os
+
+	// Options for `checkout`.
+	struct CheckoutOptions {
+		// Throw away local changes and untracked files in the way (`-f`).
+		force   bool = false
+		// Detach HEAD at the commit even when the name is a branch.
+		detach  bool = false
+		// Create this branch at the revision and switch to it (`-b`); with
+		// `force`, reset it if it exists (`-B`).
+		create  string = ""
+	}
+
+	// The files of a tree as index entries, sorted.
+	internal def treeEntries(repo Repository, tree ?ObjectId) !map<string, SnapshotEntry> {
+		let out map<string, SnapshotEntry> = {}
+		let list SnapshotEntry[] = []
+		try treeFiles(repo, tree, new Pathspec(), "", list)
+		for let e in list {
+			out[e.path] = e
+		}
+		return out
+	}
+
+	// Whether the working tree file of an index entry has changes not in
+	// the index.
+	internal def locallyModified(repo Repository, idx Index, e IndexEntry, policy StatPolicy) !bool {
+		return false when e.skipWorktree
+		let file = worktreeFile(repo, e.path)
+		return true unless file.exists
+		return false when statMatches(e, file, policy) && !racy(idx, e)
+		let id = try worktreeId(repo, e.path, file, idx)
+		return !id.equals(e.id) || stagedMode(repo, file, e.mode) != e.mode
+	}
+
+	// Moves the index and working tree from the `from` tree to the `to`
+	// tree as git's two-way merge does: a path the same in both keeps its
+	// local state; a path that changes is replaced, unless it has staged or
+	// unstaged changes (then nothing is done and this fails, unless
+	// `force`); an untracked file in the way of a new path also stops it.
+	// Returns the new index, written.
+	internal def switchTrees(repo Repository, from ?ObjectId, to ?ObjectId, force bool) !Index {
+		let idx = try repo.index()
+		let lock = try acquireLock(idx.path)
+		let failure ?error = none
+		let result = switchTreesLocked(repo, idx, from, to, force) onerror (err error) {
+			failure = err
+			recover idx
+		}
+		if !(failure is none) {
+			lock.release()
+			fail failure
+		}
+		lock.write(encodeIndex(result)) onerror (err error) {
+			lock.release()
+			fail err
+		}
+		try lock.commit()
+		return result
+	}
+
+	internal def switchTreesLocked(repo Repository, idx Index, from ?ObjectId, to ?ObjectId, force bool) !Index {
+		let oldTree = try treeEntries(repo, from)
+		let newTree = try treeEntries(repo, to)
+		let policy = statPolicy(repo)
+		fail "git: you need to resolve your current index first" when !force && idx.conflicts().len() > 0
+		// Paths that change between the trees, and whether each is clear to
+		// replace.
+		let paths string[] = []
+		for let (p, _) in oldTree {
+			paths.push(p)
+		}
+		for let (p, _) in newTree {
+			paths.push(p) unless oldTree.hasKey(p)
+		}
+		paths.sort((a, b) => compareBytes(a, b))
+		let dirty string[] = []
+		let blocked string[] = []
+		let plan (string, int)[] = []
+		for let p in paths {
+			let o = oldTree.get(p)
+			let n = newTree.get(p)
+			let same = !(o is none) && !(n is none) && o.id.equals(n.id) && o.mode == n.mode
+			continue when same
+			let e = idx.entry(p)
+			if !force {
+				if !(e is none) {
+					// Staged change: the index differs from the old tree.
+					let staged = o is none || !e.id.equals(o.id) || e.mode != o.mode
+					// The index already holds the new side: nothing to do there.
+					let already = !(n is none) && e.id.equals(n.id) && e.mode == n.mode
+					if staged && !already {
+						dirty.push(p)
+						continue
+					}
+					if !already && (try locallyModified(repo, idx, e, policy)) {
+						dirty.push(p)
+						continue
+					}
+				} else if !(n is none) && !repo.isBare() {
+					// An untracked file where a new file goes.
+					let file = worktreeFile(repo, p)
+					if file.exists && file.mode != 0o40000 {
+						let id = try worktreeId(repo, p, file, idx)
+						blocked.push(p) unless id.equals(n.id)
+					}
+				}
+			}
+			plan.push((p, n is none ?? (0, 1)))
+		}
+		if dirty.len() > 0 {
+			fail "git: your local changes to the following files would be overwritten by checkout: {dirty.join(", ")}"
+		}
+		if blocked.len() > 0 {
+			fail "git: the following untracked working tree files would be overwritten by checkout: {blocked.join(", ")}"
+		}
+		// Deletions first, so a file can become a folder and back.
+		for let step in plan {
+			let (p, keep) = step
+			continue unless keep == 0
+			idx.remove(p)
+			if !repo.isBare() {
+				let full = os.join(repo.workDir, p)
+				os.remove(full) onerror recover none
+				removeEmptyParents(os.dir(full), repo.workDir)
+			}
+		}
+		for let step in plan {
+			let (p, keep) = step
+			continue unless keep == 1
+			let n = newTree[p]
+			let st = StatData{}
+			if !repo.isBare() {
+				st = try checkoutFile(repo, p, n.id, n.mode)
+			}
+			try idx.add(IndexEntry{path: p, id: n.id, mode: n.mode, stat: st})
+		}
+		if force {
+			// Paths the same in both trees go back to the tree's version too.
+			for let (p, n) in newTree {
+				let e = idx.entry(p)
+				let restore = true
+				if !(e is none) {
+					restore = !e.id.equals(n.id) || e.mode != n.mode
+					if !restore && !repo.isBare() {
+						restore = try locallyModified(repo, idx, e, policy)
+					}
+				}
+				continue unless restore
+				let st = repo.isBare() ?? (StatData{}, try checkoutFile(repo, p, n.id, n.mode))
+				idx.remove(p)
+				try idx.add(IndexEntry{path: p, id: n.id, mode: n.mode, stat: st})
+			}
+			for let e in idx.entries.clone() {
+				idx.remove(e.path) unless newTree.hasKey(e.path)
+			}
+		}
+		idx.tree = none
+		return idx
+	}
+
+	// Writes one blob (or submodule folder) of a tree into the working tree
+	// and returns the stat data the index records for it.
+	internal def checkoutFile(repo Repository, path string, id ObjectId, mode int) !StatData {
+		if (mode & 0o170000) == 0o160000 {
+			// A submodule: its folder, filled by a submodule update.
+			try os.mkdir(os.join(repo.workDir, path), true)
+			return StatData{}
+		}
+		let (_, data) = try repo.raw(id)
+		try writeWorktreeFile(repo, path, data, mode, false)
+		let info = try os.stat(os.join(repo.workDir, path), false)
+		return statDataOf(info)
+	}
+
+	// Switches to a branch (or detaches at a commit): updates the index
+	// and working tree, then HEAD with a `checkout: moving from A to B`
+	// reflog entry.
+	internal def checkoutRevision(repo Repository, target string, options CheckoutOptions) !none {
+		let fromName = try headName(repo)
+		let head = try repo.headId()
+		let fromTree ?ObjectId = none
+		fromTree = (try repo.commitAt(head)).tree unless head is none
+		// Without an index file yet (a clone made without a checkout) every
+		// file is written, as git's initial checkout does.
+		fromTree = none unless try os.exists(os.join(repo.gitDir, "index"))
+		let id = try repo.peel(try repo.resolve(target), ObjectKind.Commit)
+		let toTree = (try repo.commitAt(id)).tree
+		let branchName = ""
+		if options.create != "" {
+			let ref = "refs/heads/" + options.create
+			fail "git: a branch named '{options.create}' already exists" unless options.force || (try repo.ref(ref)) is none
+			branchName = options.create
+		} else if !options.detach {
+			let full = "refs/heads/" + target
+			branchName = (try repo.ref(full)) is none ?? ("", target)
+		}
+		try switchTrees(repo, fromTree, toTree, options.force)
+		let toName = branchName == "" ?? (id.str(), branchName)
+		let message = "checkout: moving from {fromName} to {toName}"
+		if options.create != "" {
+			try repo.setRef("refs/heads/" + branchName, id, "branch: Created from {target}")
+		}
+		if branchName == "" {
+			// A detached HEAD holds the commit itself.
+			let u = RefUpdate{name: "HEAD", newId: id, message: message, deref: false}
+			try repo.refStore.commit([u], try repo.identity("committer"))
+		} else {
+			let u = RefUpdate{name: "HEAD", newTarget: "refs/heads/" + branchName, message: message, deref: false}
+			try repo.refStore.commit([u], try repo.identity("committer"))
+		}
+		return none
+	}
+
+	// What reflog messages call the current HEAD: the branch, or the
+	// commit when detached.
+	internal def headName(repo Repository) !string {
+		let b = try repo.branch()
+		return b unless b == ""
+		let id = try repo.headId()
+		return id is none ?? ("", id.str())
+	}
+
+	// ---- reset and restore ---------------------------------------------------------
+
+	// How far `reset` goes.
+	enum ResetMode {
+		// HEAD only.
+		Soft,
+		// HEAD and the index.
+		Mixed,
+		// HEAD, the index and the working tree.
+		Hard
+	}
+
+	// Moves the current branch (or detached HEAD) to a revision, and with
+	// Mixed or Hard the index (and working tree) with it. Writes
+	// `reset: moving to <rev>` to the reflogs and records ORIG_HEAD.
+	internal def resetTo(repo Repository, rev string, mode ResetMode) !none {
+		let id = try repo.peel(try repo.resolve(rev), ObjectKind.Commit)
+		let head = try repo.headId()
+		let tree = (try repo.commitAt(id)).tree
+		if mode == ResetMode.Hard && !repo.isBare() {
+			let fromTree ?ObjectId = none
+			fromTree = (try repo.commitAt(head)).tree unless head is none
+			try switchTrees(repo, fromTree, tree, true)
+		} else if mode == ResetMode.Mixed {
+			try resetIndexTo(repo, tree, [])
+		}
+		if !(head is none) {
+			try os.writeFile(os.join(repo.gitDir, "ORIG_HEAD"), "{head.str()}\n".bytes())
+		}
+		try repo.setRef("HEAD", id, "reset: moving to {rev}")
+		return none
+	}
+
+	// Sets the index entries of the paths (all when empty) to a tree's,
+	// keeping the stat data of entries that do not change.
+	internal def resetIndexTo(repo Repository, tree ?ObjectId, specs string[]) !none {
+		let spec = try newPathspec(specs)
+		let target = try treeEntries(repo, tree)
+		let idx = try repo.index()
+		let lock = try acquireLock(idx.path)
+		let failure ?error = none
+		for let e in idx.entries.clone() {
+			continue unless spec.matches(e.path)
+			let t = target.get(e.path)
+			if t is none {
+				idx.remove(e.path)
+				continue
+			}
+			if e.stage != 0 || !t.id.equals(e.id) || t.mode != e.mode {
+				idx.remove(e.path)
+				idx.add(IndexEntry{path: e.path, id: t.id, mode: t.mode}) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+		}
+		for let (p, t) in target {
+			continue unless spec.matches(p)
+			if idx.entry(p) is none {
+				idx.add(IndexEntry{path: p, id: t.id, mode: t.mode}) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+		}
+		if !(failure is none) {
+			lock.release()
+			fail failure
+		}
+		idx.tree = none
+		lock.write(encodeIndex(idx)) onerror (err error) {
+			lock.release()
+			fail err
+		}
+		try lock.commit()
+		return none
+	}
+
+	// Puts paths back as `git restore` does: the index from `source` (HEAD
+	// by default) when `staged`, the working tree from the index (or from
+	// `source` when given and not staged) when `worktree`. Fails when a
+	// pathspec matches nothing.
+	internal def restorePaths(repo Repository, specs string[], source string, staged bool, worktree bool) !none {
+		fail "git: you must specify path(s) to restore" when specs.len() == 0
+		let spec = try newPathspec(specs)
+		if staged {
+			let head = try repo.headId()
+			let src = source == "" ?? ("HEAD", source)
+			let tree ?ObjectId = none
+			tree = try repo.peel(try repo.resolve(src), ObjectKind.Tree) unless head is none && src == "HEAD"
+			try resetIndexTo(repo, tree, specs)
+		}
+		if worktree {
+			fail "git: the repository is bare" when repo.isBare()
+			let entries map<string, SnapshotEntry> = {}
+			if source != "" && !staged {
+				entries = try treeEntries(repo, try repo.peel(try repo.resolve(source), ObjectKind.Tree))
+			} else {
+				let idx = try repo.index()
+				for let e in idx.entries {
+					entries[e.path] = SnapshotEntry{path: e.path, mode: e.mode, id: e.id} when e.stage == 0
+				}
+			}
+			let matched = false
+			for let (p, e) in entries {
+				continue unless spec.matches(p)
+				matched = true
+				try checkoutFile(repo, p, e.id, e.mode)
+			}
+			fail "git: pathspec '{specs.join(" ")}' did not match any file(s) known to git" unless matched
+		}
+		return none
+	}
+}

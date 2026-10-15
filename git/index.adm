@@ -1,0 +1,597 @@
+partial module adm.dev.git {
+	use std.os
+
+	// What stat reports about a file, as the index keeps it to tell whether
+	// the file changed since it was hashed.
+	struct StatData {
+		ctimeSeconds int64 = 0
+		ctimeNanos   int64 = 0
+		mtimeSeconds int64 = 0
+		mtimeNanos   int64 = 0
+		device       int64 = 0
+		inode        int64 = 0
+		uid          int64 = 0
+		gid          int64 = 0
+		size         int64 = 0
+	}
+
+	// The stat data of a file as the index records it.
+	internal def statDataOf(info os.FileInfo) StatData {
+		let m = info.modTime.unixNs()
+		let c = info.changeTime.unixNs()
+		return StatData{
+			ctimeSeconds: c / 1000000000,
+			ctimeNanos: c % 1000000000,
+			mtimeSeconds: m / 1000000000,
+			mtimeNanos: m % 1000000000,
+			device: info.device,
+			inode: info.inode,
+			uid: int64(info.uid),
+			gid: int64(info.gid),
+			size: info.size,
+		}
+	}
+
+	// IndexEntry is one path in the index: its mode, the blob (or for a
+	// submodule the commit) staged for it, and the stat data of the file it
+	// was taken from.
+	struct IndexEntry {
+		path         string
+		id           ObjectId
+		// 0o100644, 0o100755, 0o120000 (symbolic link), 0o160000
+		// (submodule), or 0o40000 for a sparse folder.
+		mode         int
+		// 0 normally; 1 (base), 2 (ours) and 3 (theirs) during a conflict.
+		stage        int       = 0
+		stat         StatData  = StatData{}
+		assumeValid  bool      = false
+		skipWorktree bool      = false
+		intentToAdd  bool      = false
+	}
+
+	// The entry mode a file mode is staged with: executable or not,
+	// symbolic link, submodule.
+	internal def entryModeOf(mode int) EntryMode {
+		return canonicalMode(mode)
+	}
+
+	// One node of the TREE extension: a folder whose tree is known (or
+	// invalid: entryCount -1).
+	internal struct CacheTree {
+		name       string
+		entryCount int
+		id         ?ObjectId
+		children   CacheTree[] = []
+	}
+
+	// One path of the REUC extension: the conflict stages a resolution
+	// removed.
+	struct ResolveUndo {
+		path  string
+		// Modes and ids of stages 1 to 3; mode 0 (and the zero id) for a
+		// missing stage.
+		modes int[]
+		ids   ObjectId[]
+	}
+
+	// Index is the staging area (`.git/index`): every tracked path with what
+	// the next commit will hold for it.
+	type Index {
+		path     string
+		format   ObjectFormat
+		version  int          = 2
+		entries  IndexEntry[] = []
+		// The cache-tree extension, none when it was absent or dropped.
+		internal tree    ?CacheTree    = none
+		resolveUndo   ResolveUndo[]   = []
+		// Folders kept as one entry (a sparse index).
+		sparse   bool         = false
+		internal skipHash bool        = false
+		// The time the index file was written, to spot racily clean
+		// entries.
+		internal fileTime int64       = 0
+
+		def new(path string, format ObjectFormat) {
+			self.path = path
+			self.format = format
+		}
+
+		// The position of the entry for path and stage, or -(insert point)-1.
+		def position(path string, stage int = 0) int {
+			let lo = 0
+			let hi = entries.len()
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let e = entries[mid]
+				let c = compareBytes(e.path, path)
+				c = (e.stage < stage ?? (-1, e.stage > stage ?? (1, 0))) when c == 0
+				return mid when c == 0
+				if c < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return -lo - 1
+		}
+
+		// The entry for path at the stage, none when there is none.
+		def entry(path string, stage int = 0) ?IndexEntry {
+			let i = position(path, stage)
+			return i < 0 ?? (none, entries[i])
+		}
+
+		// The entries for the path at any stage.
+		def stages(path string) IndexEntry[] {
+			let i = position(path, 0)
+			let start = i < 0 ?? (-i - 1, i)
+			let out IndexEntry[] = []
+			for let k = start; k < entries.len() && entries[k].path == path; k++ {
+				out.push(entries[k])
+			}
+			return out
+		}
+
+		// Whether a path has conflict stages.
+		def conflicted(path string) bool {
+			for let e in stages(path) {
+				return true when e.stage > 0
+			}
+			return false
+		}
+
+		// Every path with conflict stages.
+		def conflicts() string[] {
+			let out string[] = []
+			for let e in entries {
+				out.push(e.path) when e.stage > 0 && (out.len() == 0 || out[out.len() - 1] != e.path)
+			}
+			return out
+		}
+
+		// Puts the entry in place of any entry for its path at the same
+		// stage; a stage 0 entry also replaces the path's conflict stages
+		// (recording them for resolve-undo), and a path cannot be both a file
+		// and a folder. Fails when it collides with a folder or file.
+		def add(e IndexEntry) !none {
+			fail "git: invalid path '{e.path}'" unless validIndexPath(e.path)
+			invalidate(e.path)
+			if e.stage == 0 && conflicted(e.path) {
+				recordResolveUndo(e.path)
+				entries = entries.filter(x => x.path != e.path)
+			}
+			try removeConflictingPaths(e.path)
+			let i = position(e.path, e.stage)
+			if i >= 0 {
+				entries[i] = e
+				return none
+			}
+			let at = -i - 1
+			if at >= entries.len() {
+				entries.push(e)
+				return none
+			}
+			let moved IndexEntry[] = entries.slice(0, at).clone()
+			moved.push(e)
+			moved.push(...entries.slice(at, entries.len() - at))
+			entries = moved
+			return none
+		}
+
+		// A file at `path` replaces anything under `path/`, and the folders
+		// above it replace files of their names.
+		internal def removeConflictingPaths(path string) !none {
+			let prefix = path + "/"
+			let parts = path.split("/")
+			let above string[] = []
+			let dir = ""
+			for let k = 0; k < parts.len() - 1; k++ {
+				dir = dir == "" ?? (parts[k], dir + "/" + parts[k])
+				above.push(dir)
+			}
+			entries = entries.filter(x => !x.path.startsWith(prefix) && !above.includes(x.path))
+			return none
+		}
+
+		// Removes the path at every stage. Returns whether it was there.
+		def remove(path string) bool {
+			let before = entries.len()
+			invalidate(path)
+			entries = entries.filter(x => x.path != path)
+			return entries.len() != before
+		}
+
+		// Removes every path under a folder. Returns how many went.
+		def removeFolder(dir string) int {
+			let before = entries.len()
+			let prefix = dir.endsWith("/") ?? (dir, dir + "/")
+			invalidate(prefix + "x")
+			entries = entries.filter(x => !x.path.startsWith(prefix))
+			return before - entries.len()
+		}
+
+		internal def recordResolveUndo(path string) {
+			let modes int[] = [0, 0, 0]
+			let ids ObjectId[] = [zeroId(format), zeroId(format), zeroId(format)]
+			for let e in stages(path) {
+				continue unless e.stage >= 1 && e.stage <= 3
+				modes[e.stage - 1] = e.mode
+				ids[e.stage - 1] = e.id
+			}
+			resolveUndo = resolveUndo.filter(r => r.path != path)
+			resolveUndo.push(ResolveUndo{path: path, modes: modes, ids: ids})
+		}
+
+		// Marks the cache-tree nodes of the folders above a path as unknown.
+		internal def invalidate(path string) {
+			let t = tree
+			return when t is none
+			let parts = path.split("/")
+			tree = invalidateTree(t, parts, 0)
+		}
+
+		// Writes the index to its file under `index.lock`. Fails when the
+		// lock is held or the file cannot be written.
+		def write() !none {
+			let lock = try acquireLock(path)
+			let data = encodeIndex(self)
+			lock.write(data) onerror (err error) {
+				lock.release()
+				fail err
+			}
+			try lock.commit()
+			let info = statOrNone(path)
+			fileTime = info is none ?? (0, info.modTime.unixNs())
+			return none
+		}
+	}
+
+	internal def invalidateTree(t CacheTree, parts string[], depth int) CacheTree {
+		let kids CacheTree[] = []
+		for let c in t.children {
+			if depth < parts.len() - 1 && c.name == parts[depth] {
+				kids.push(invalidateTree(c, parts, depth + 1))
+			} else {
+				kids.push(c)
+			}
+		}
+		return CacheTree{name: t.name, entryCount: -1, id: none, children: kids}
+	}
+
+	// Whether a path may be in the index: relative, no empty, `.`, `..` or
+	// `.git` component, no NUL.
+	def validIndexPath(path string) bool {
+		return false when path == "" || path.startsWith("/") || path.endsWith("/")
+		for let part in path.split("/") {
+			return false when part == "" || part == "." || part == ".."
+			return false when part.lower() == ".git"
+		}
+		return true
+	}
+
+	// Reads an index file; an empty index when there is none. Fails when it
+	// is corrupt or uses an extension this library does not know that git
+	// marks required.
+	internal def readIndexFile(path string, format ObjectFormat, gitDir string) !Index {
+		let idx = new Index(path, format)
+		let info = statOrNone(path)
+		return idx when info is none
+		idx.fileTime = info.modTime.unixNs()
+		let data = try os.readFile(path)
+		let hashLen = idLength(format)
+		fail "git: {path} is too short" when data.len() < 12 + hashLen
+		fail "git: {path} is not an index file" when string(data[0:4]) != "DIRC"
+		let version = be32(data, 4)
+		fail "git: index version {version} is not supported" unless version >= 2 && version <= 4
+		idx.version = version
+		let count = be32(data, 8)
+		let end = data.len() - hashLen
+		// The checksum is zero when written with index.skipHash.
+		let zero = true
+		for let k = end; k < data.len(); k++ {
+			zero = false when data[k] != 0
+		}
+		idx.skipHash = zero
+		if !zero {
+			let h = newHasher(format)
+			let sum = h.hash(data[0:end])
+			fail "git: {path} has a bad checksum" unless compareIdBytes(sum, 0, data, end, hashLen) == 0
+		}
+		let p = 12
+		let prior byte[] = []
+		let entries IndexEntry[] = []
+		entries.cap(count)
+		for let n = 0; n < count; n++ {
+			let (e, next, name) = try readIndexEntry(data, p, version, hashLen, prior, path)
+			entries.push(e)
+			prior = name
+			p = next
+		}
+		idx.entries = entries
+		let shared ?(ObjectId, Bitset, Bitset) = none
+		for p + 8 <= end {
+			let sig = string(data[p:p + 4])
+			let size = be32(data, p + 4)
+			let body = p + 8
+			fail "git: {path} has a truncated extension {sig}" when body + size > end
+			switch sig {
+				case "TREE":
+					let (t, _) = try readCacheTree(data, body, body + size, hashLen)
+					idx.tree = t
+				case "REUC":
+					idx.resolveUndo = try readResolveUndo(data, body, body + size, hashLen)
+				case "link":
+					let sharedId = new ObjectId(data[body:body + hashLen].clone())
+					let (deleted, after) = try readEwah(data, body + hashLen)
+					let (replaced, _) = try readEwah(data, after)
+					shared = (sharedId, deleted, replaced)
+				case "sdir":
+					idx.sparse = true
+				default:
+					let first = data[p]
+					fail "git: {path} needs index extension {sig}, which is not supported" unless first >= 0x41 && first <= 0x5A
+			}
+			p = body + size
+		}
+		if !(shared is none) {
+			let (sharedId, deleted, replaced) = shared
+			if !sharedId.isZero() {
+				let base = try readIndexFile(os.join(gitDir, "sharedindex.{sharedId.str()}"), format, gitDir)
+				idx.entries = mergeSplitIndex(base.entries, idx.entries, deleted, replaced)
+			}
+		}
+		return idx
+	}
+
+	// The entries of a split index: the shared ones with replacements put
+	// in and deletions taken out, then the entries added on top, sorted.
+	internal def mergeSplitIndex(base IndexEntry[], local IndexEntry[], deleted Bitset, replaced Bitset) IndexEntry[] {
+		let out IndexEntry[] = []
+		let k = 0
+		for let (i, e) in base {
+			if replaced.has(i) {
+				let r = local[k]
+				k++
+				// A replacement may leave its name empty to mean the same path.
+				out.push(r.path == "" ?? (IndexEntry{...r, path: e.path}, r))
+				continue
+			}
+			continue when deleted.has(i)
+			out.push(e)
+		}
+		for k < local.len() {
+			out.push(local[k])
+			k++
+		}
+		out.sort((a, b) => compareIndexEntries(a, b))
+		return out
+	}
+
+	internal def compareIndexEntries(a IndexEntry, b IndexEntry) int {
+		let c = compareBytes(a.path, b.path)
+		return c when c != 0
+		return a.stage < b.stage ?? (-1, a.stage > b.stage ?? (1, 0))
+	}
+
+	// One entry at `p`: the entry, where the next starts, and its name as
+	// bytes (for version 4's prefix compression).
+	internal def readIndexEntry(data byte[], p int, version int, hashLen int, prior byte[], path string) !(IndexEntry, int, byte[]) {
+		fail "git: {path} is truncated" when p + 40 + hashLen + 2 > data.len()
+		let st = StatData{
+			ctimeSeconds: int64(be32(data, p)),
+			ctimeNanos: int64(be32(data, p + 4)),
+			mtimeSeconds: int64(be32(data, p + 8)),
+			mtimeNanos: int64(be32(data, p + 12)),
+			device: int64(be32(data, p + 16)),
+			inode: int64(be32(data, p + 20)),
+			uid: int64(be32(data, p + 28)),
+			gid: int64(be32(data, p + 32)),
+			size: int64(be32(data, p + 36)),
+		}
+		let mode = be32(data, p + 24)
+		let id = new ObjectId(data[p + 40:p + 40 + hashLen].clone())
+		let flags = (int(data[p + 40 + hashLen]) << 8) | int(data[p + 41 + hashLen])
+		let q = p + 42 + hashLen
+		let extended = 0
+		if (flags & 0x4000) != 0 {
+			fail "git: {path} has extended flags in a version 2 index" when version < 3
+			extended = (int(data[q]) << 8) | int(data[q + 1])
+			q += 2
+		}
+		let nameLen = flags & 0xFFF
+		let name byte[] = []
+		let next = 0
+		if version == 4 {
+			let (strip, after) = rtVarint(data, q) onerror recover (int64(0), -1)
+			fail "git: {path} has a corrupt entry" when after < 0 || int(strip) > prior.len()
+			let nul = indexByte(data, 0, after, data.len())
+			fail "git: {path} has a corrupt entry" when nul < 0
+			name = prior[0:prior.len() - int(strip)].clone() + data[after:nul]
+			next = nul + 1
+		} else {
+			let nul = nameLen < 0xFFF ?? (q + nameLen, indexByte(data, 0, q + 0xFFF, data.len()))
+			fail "git: {path} has a corrupt entry" when nul < 0 || nul >= data.len()
+			name = data[q:nul].clone()
+			// Entries are padded with 1 to 8 NULs to a multiple of 8 bytes.
+			let length = nul - p
+			next = p + ((length + 8) / 8) * 8
+		}
+		let e = IndexEntry{
+			path: string(name),
+			id: id,
+			mode: mode,
+			stage: (flags >> 12) & 3,
+			stat: st,
+			assumeValid: (flags & 0x8000) != 0,
+			skipWorktree: (extended & 0x4000) != 0,
+			intentToAdd: (extended & 0x2000) != 0,
+		}
+		return (e, next, name)
+	}
+
+	// The TREE extension from `p`: a node and where its subtree ends.
+	internal def readCacheTree(data byte[], p int, end int, hashLen int) !(CacheTree, int) {
+		let nul = indexByte(data, 0, p, end)
+		fail "git: corrupt cache tree" when nul < 0
+		let name = string(data[p:nul])
+		let nl = indexByte(data, 0x0A, nul + 1, end)
+		fail "git: corrupt cache tree" when nl < 0
+		let nums = string(data[nul + 1:nl]).split(" ")
+		fail "git: corrupt cache tree" unless nums.len() == 2
+		let count = nums[0].toInt<int>()
+		let subtrees = nums[1].toInt<int>()
+		let q = nl + 1
+		let id ?ObjectId = none
+		if count >= 0 {
+			fail "git: corrupt cache tree" when q + hashLen > end
+			id = new ObjectId(data[q:q + hashLen].clone())
+			q += hashLen
+		}
+		let kids CacheTree[] = []
+		for let k = 0; k < subtrees; k++ {
+			let (child, after) = try readCacheTree(data, q, end, hashLen)
+			kids.push(child)
+			q = after
+		}
+		return (CacheTree{name: name, entryCount: count < 0 ?? (-1, count), id: id, children: kids}, q)
+	}
+
+	internal def readResolveUndo(data byte[], p0 int, end int, hashLen int) !ResolveUndo[] {
+		let out ResolveUndo[] = []
+		let p = p0
+		for p < end {
+			let nul = indexByte(data, 0, p, end)
+			fail "git: corrupt resolve-undo" when nul < 0
+			let path = string(data[p:nul])
+			p = nul + 1
+			let modes int[] = []
+			for let k = 0; k < 3; k++ {
+				let z = indexByte(data, 0, p, end)
+				fail "git: corrupt resolve-undo" when z < 0
+				let m = 0
+				for let b in data[p:z] {
+					m = m * 8 + int(b - 0x30)
+				}
+				modes.push(m)
+				p = z + 1
+			}
+			let ids ObjectId[] = []
+			for let k = 0; k < 3; k++ {
+				if modes[k] == 0 {
+					let z byte[]
+					z.len(hashLen)
+					ids.push(new ObjectId(z))
+					continue
+				}
+				ids.push(new ObjectId(data[p:p + hashLen].clone()))
+				p += hashLen
+			}
+			out.push(ResolveUndo{path: path, modes: modes, ids: ids})
+		}
+		return out
+	}
+
+	// The bytes of an index file: its version (3 when an entry has extended
+	// flags and the version was 2), entries, TREE and REUC extensions, and
+	// the checksum (zeros with index.skipHash).
+	internal def encodeIndex(idx Index) byte[] {
+		let hashLen = idLength(idx.format)
+		let version = idx.version
+		let extendedNeeded = false
+		for let e in idx.entries {
+			extendedNeeded = true when e.skipWorktree || e.intentToAdd
+		}
+		version = 3 when version == 2 && extendedNeeded
+		let out byte[] = "DIRC".bytes()
+		putBe(out, int64(version), 4)
+		putBe(out, int64(idx.entries.len()), 4)
+		let prior byte[] = []
+		for let e in idx.entries {
+			let start = out.len()
+			let s = e.stat
+			putBe(out, s.ctimeSeconds & 0xFFFFFFFF, 4)
+			putBe(out, s.ctimeNanos & 0xFFFFFFFF, 4)
+			putBe(out, s.mtimeSeconds & 0xFFFFFFFF, 4)
+			putBe(out, s.mtimeNanos & 0xFFFFFFFF, 4)
+			putBe(out, s.device & 0xFFFFFFFF, 4)
+			putBe(out, s.inode & 0xFFFFFFFF, 4)
+			putBe(out, int64(e.mode), 4)
+			putBe(out, s.uid & 0xFFFFFFFF, 4)
+			putBe(out, s.gid & 0xFFFFFFFF, 4)
+			putBe(out, s.size & 0xFFFFFFFF, 4)
+			out.push(...e.id.bytes)
+			let name = e.path.bytes()
+			let flags = (name.len() < 0xFFF ?? (name.len(), 0xFFF)) | (e.stage << 12)
+			flags = flags | 0x8000 when e.assumeValid
+			let extended = (e.skipWorktree ?? (0x4000, 0)) | (e.intentToAdd ?? (0x2000, 0))
+			flags = flags | 0x4000 when version >= 3 && extended != 0
+			putBe(out, int64(flags), 2)
+			putBe(out, int64(extended), 2) when version >= 3 && extended != 0
+			if version == 4 {
+				let common = 0
+				let m = prior.len() < name.len() ?? (prior.len(), name.len())
+				for common < m && prior[common] == name[common] {
+					common++
+				}
+				rtPutVarint(out, int64(prior.len() - common))
+				out.push(...name[common:])
+				out.push(0)
+				prior = name
+			} else {
+				out.push(...name)
+				let length = out.len() - start
+				let pad = 8 - length % 8
+				for let k = 0; k < pad; k++ {
+					out.push(0)
+				}
+			}
+		}
+		let t = idx.tree
+		if !(t is none) {
+			let body byte[] = []
+			writeCacheTree(body, t)
+			out.push(..."TREE".bytes())
+			putBe(out, int64(body.len()), 4)
+			out.push(...body)
+		}
+		if idx.resolveUndo.len() > 0 {
+			let body byte[] = []
+			for let r in idx.resolveUndo {
+				body.push(...r.path.bytes())
+				body.push(0)
+				for let m in r.modes {
+					body.push(..."%o".format(m).bytes())
+					body.push(0)
+				}
+				for let (k, id) in r.ids {
+					body.push(...id.bytes) unless r.modes[k] == 0
+				}
+			}
+			out.push(..."REUC".bytes())
+			putBe(out, int64(body.len()), 4)
+			out.push(...body)
+		}
+		if idx.sparse {
+			out.push(..."sdir".bytes())
+			putBe(out, 0, 4)
+		}
+		if idx.skipHash {
+			let zeros byte[]
+			zeros.len(hashLen)
+			return out + zeros
+		}
+		let h = newHasher(idx.format)
+		return out + h.hash(out)
+	}
+
+	internal def writeCacheTree(out byte[], t CacheTree) {
+		out.push(...t.name.bytes())
+		out.push(0)
+		out.push(..."{t.entryCount} {t.children.len()}\n".bytes())
+		let id = t.id
+		out.push(...id.bytes) when t.entryCount >= 0 && !(id is none)
+		for let c in t.children {
+			writeCacheTree(out, c)
+		}
+	}
+}

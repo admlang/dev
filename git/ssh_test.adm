@@ -1,0 +1,153 @@
+// SSH remotes against an in-process SSH server running the services;
+// credential helpers; submodules.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+		std.net.ssh
+	)
+
+	// An SSH server on a loopback port that runs `git-upload-pack` and
+	// `git-receive-pack` commands with this library's server.
+	internal def gitSshServer() !ssh.Server {
+		let server = new ssh.Server(new ssh.HandlerFunc(def (s ssh.Session) !none {
+			return try serveGitSession(s)
+		}), "127.0.0.1:0")
+		server.hostKeys.push(try ssh.generateKey())
+		try server.start()
+		return server
+	}
+
+	// Serves the session's command: `<program> '<path>'`.
+	internal def serveGitSession(s ssh.Session) !none {
+		let command = s.command()
+		let space = command.indexOf(" ")
+		fail "not a git command: {command}" when space < 0
+		let program = command.slice(0, space)
+		let quoted = command.slice(space + 1)
+		fail "path not quoted: {quoted}" unless quoted.startsWith("'") && quoted.endsWith("'")
+		let path = quoted.slice(1, quoted.len() - 1).replace("'\\''", "'")
+		let env = s.environment()
+		let protocol = env.get("GIT_PROTOCOL")
+		let version = !(protocol is none) && protocol.contains("version=2") ?? (2, 0)
+		let repo = try open(path)
+		let failure ?error = none
+		serveStateful(repo, program, version, new PktReader(s), s) onerror (err error) {
+			failure = err
+			recover none
+		}
+		repo.close()
+		try s.exit(failure is none ?? (0, 1))
+		return none
+	}
+
+	// A client that trusts any host key and logs in with a fresh key, never
+	// the user's own.
+	internal def testSshClient() !ssh.Client {
+		let client = new ssh.Client()
+		client.hostKeyPolicy = ssh.HostKeyPolicy.Insecure
+		client.useAgent = false
+		client.keys.push(try ssh.generateKey())
+		return client
+	}
+
+	check "SSH, credentials and submodules" {
+		@test()
+		def clonesAndPushesOverSsh() !none {
+			let (src, ids) = try servedRepo("ssh-src")
+			let server = try gitSshServer()
+			let url = "ssh://git@{server.address().str()}{src.gitDir}"
+			let branch = try src.branch()
+			for let v in protocols {
+				let dir = try scratch("ssh-clone-v{v}")
+				let repo = try clone(url, dir, connection = RemoteOptions{protocol: v, ssh: try testSshClient()})
+				fail "v{v}: HEAD not at the tip" unless (try repo.resolve("HEAD")).equals(ids[1])
+				let next = try addCommit(repo, branch, ids[1], "Over SSH v{v}")
+				let pushed = try repo.push("origin", connection = RemoteOptions{protocol: v, ssh: try testSshClient()})
+				fail "v{v}: not pushed: {pushed.changes[0].reason}" unless pushed.changes[0].kind == RefChangeKind.FastForward
+				fail "v{v}: server not moved" unless (try src.resolve(branch)).equals(next)
+				try src.setRef("refs/heads/{branch}", ids[1])
+				let fetched = try repo.fetch("origin", connection = RemoteOptions{protocol: v, ssh: try testSshClient()}, force = true)
+				fail "v{v}: rewind not fetched" unless fetched.changes.filter(c => c.kind == RefChangeKind.Forced).len() == 1
+				repo.close()
+			}
+			try server.close()
+			return none
+		}
+
+		@test()
+		def usesCredentialHelpers() !none {
+			let (src, ids) = try servedRepo("helper-src")
+			let ts = try gitHttpServer(src.gitDir)
+			let url = ts.url + "/repo.git"
+			let repo = try clone(url, try scratch("helper-clone"))
+			let branch = try repo.branch()
+			let store = os.join(repo.gitDir, "test-credentials")
+			try repo.config.set("credential.helper", "store --file={store}")
+			// Asked once, then kept by the store helper.
+			let asked = 0
+			let ask = def (req CredentialRequest) !?Credentials {
+				asked++
+				return Credentials{username: "ana", password: new Secret<string>("secret")}
+			}
+			let first = try addCommit(repo, branch, ids[1], "First with a helper")
+			let pushed = try repo.push("origin", connection = RemoteOptions{ask: ask})
+			fail "not pushed: {pushed.changes[0].reason}" unless pushed.changes[0].kind == RefChangeKind.FastForward
+			let stored = string(try os.readFile(store))
+			fail "store holds {stored}" unless stored.contains("ana:secret@127.0.0.1")
+			let second = try addCommit(repo, branch, first, "Second with a helper")
+			let again = try repo.push("origin", connection = RemoteOptions{ask: ask})
+			fail "second push failed: {again.changes[0].reason}" unless again.changes[0].kind == RefChangeKind.FastForward
+			fail "asked {asked} times" unless asked == 1
+			// A wrong stored password is erased, and the program asked again.
+			try os.writeFile(store, stored.replace("secret", "stale").bytes())
+			let third = try addCommit(repo, branch, second, "Third with a helper")
+			let _ = third
+			let retried = try repo.push("origin", connection = RemoteOptions{ask: ask})
+			fail "retry failed: {retried.changes[0].reason}" unless retried.changes[0].kind == RefChangeKind.FastForward
+			fail "asked {asked} times after a refusal" unless asked == 2
+			fail "stale login kept" when string(try os.readFile(store)).contains("stale")
+			// A shell helper.
+			try repo.config.set("credential.helper", "!f() \{ echo username=ana; echo password=secret; \}; f")
+			let fourth = try addCommit(repo, branch, try repo.resolve("HEAD"), "Fourth with a shell helper")
+			let _ = fourth
+			let shell = try repo.push("origin", connection = RemoteOptions{})
+			fail "shell helper push failed: {shell.changes[0].reason}" unless shell.changes[0].kind == RefChangeKind.FastForward
+			repo.close()
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def clonesSubmodules() !none {
+			let (sub, subIds) = try servedRepo("submodule-lib")
+			let superDir = try scratch("submodule-super")
+			let sup = try init(superDir, InitOptions{bare: true})
+			let modules = try sup.writeBlob("[submodule \"lib\"]\n\tpath = vendor/lib\n\turl = {sub.gitDir}\n".bytes())
+			let vendor = try sup.writeTree([TreeEntry{name: "lib", mode: EntryMode.Submodule, id: subIds[1]}])
+			let root = try sup.writeTree([
+				TreeEntry{name: ".gitmodules", mode: EntryMode.File, id: modules},
+				TreeEntry{name: "vendor", mode: EntryMode.Tree, id: vendor},
+			])
+			let sig = testSignature()
+			let c = try sup.write(ObjectKind.Commit, (new Commit(zeroId(sup.format), root, [], sig, sig, "Add lib\n")).encode())
+			try sup.setRef("refs/heads/{try sup.branch()}", c)
+			let dir = try scratch("submodule-clone")
+			let repo = try clone(sup.gitDir, dir, submodules = true)
+			let mods = try repo.submodules()
+			fail "{mods.len()} submodules" unless mods.len() == 1 && mods[0].path == "vendor/lib" && mods[0].cloned && mods[0].initialized
+			let recorded = mods[0].commit
+			fail "submodule commit not recorded" when recorded is none
+			fail "submodule commit {recorded.str()}" unless recorded.equals(subIds[1])
+			let readme = string(try os.readFile(os.join(dir, "vendor", "lib", "README.md")))
+			fail "submodule README reads {readme}" unless readme == "# Notes\n\nMore.\n"
+			let inner = try open(os.join(dir, "vendor", "lib"))
+			fail "submodule HEAD not detached at the commit" unless (try inner.headRef()) == "" && (try inner.resolve("HEAD")).equals(subIds[1])
+			inner.close()
+			let st = try repo.status()
+			fail "superproject not clean: {st.entries.len()}" unless st.entries.len() == 0
+			repo.close()
+			return none
+		}
+	}
+}

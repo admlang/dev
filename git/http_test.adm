@@ -1,0 +1,98 @@
+// Smart HTTP: the client against `git.Server` on a loopback port, in
+// protocol 2 and protocol 0, with logins for pushes.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+		std.net.http
+		std.net.http.httptest
+	)
+
+	// A server for one repository at `/repo.git`, taking pushes from
+	// ana:secret only.
+	internal def gitHttpServer(gitDir string) !httptest.Server {
+		let server = new Server(def (path string) !?Repository {
+			return try repoAt(path, gitDir)
+		})
+		server.authorize = def (ctx http.Context, path string, push bool) !none {
+			return none unless push
+			let login = ctx.request.basicAuth()
+			fail http.HttpError{message: "log in to push", status: 401} when login is none
+			let (user, secret) = login
+			fail http.HttpError{message: "wrong login", status: 401} unless user == "ana" && secret == "secret"
+			return none
+		}
+		let ts = new httptest.Server(server)
+		try ts.start()
+		return ts
+	}
+
+	internal def repoAt(path string, gitDir string) !?Repository {
+		return none unless path == "repo.git"
+		return try open(gitDir)
+	}
+
+	check "Smart HTTP" {
+		@test()
+		def clonesOverHttp() !none {
+			let (src, ids) = try servedRepo("http-src")
+			let ts = try gitHttpServer(src.gitDir)
+			let url = ts.url + "/repo.git"
+			for let v in protocols {
+				let ro = RemoteOptions{protocol: v}
+				let refs = try lsRemote(url, ["refs/tags/"], connection = ro)
+				fail "v{v}: tags {refs.len()}" unless refs.len() == 1 && refs[0].name == "refs/tags/v1"
+				let dir = try scratch("http-clone-v{v}")
+				let repo = try clone(url, dir, connection = ro)
+				fail "v{v}: HEAD not at the tip" unless (try repo.resolve("HEAD")).equals(ids[1])
+				fail "v{v}: README" unless string(try os.readFile(os.join(dir, "README.md"))) == "# Notes\n\nMore.\n"
+				// Fetch after the source moved: negotiation finds the common commit.
+				let branch = try src.branch()
+				let next = try addCommit(src, branch, ids[1], "Over HTTP v{v}")
+				let result = try repo.fetch("origin", connection = ro)
+				fail "v{v}: not fetched" unless result.changes.filter(c => c.kind == RefChangeKind.FastForward).len() == 1
+				fail "v{v}: wrong tip" unless (try repo.resolve("origin/{branch}")).equals(next)
+				try src.setRef("refs/heads/{branch}", ids[1])
+				repo.close()
+			}
+			try ts.close()
+			return none
+		}
+
+		@test()
+		def pushesOverHttpWithLogin() !none {
+			let (src, ids) = try servedRepo("http-push-src")
+			let ts = try gitHttpServer(src.gitDir)
+			let url = ts.url + "/repo.git"
+			for let v in protocols {
+				let repo = try clone(url, try scratch("http-push-v{v}"), connection = RemoteOptions{protocol: v})
+				let branch = try repo.branch()
+				let next = try addCommit(repo, branch, ids[1], "Pushed over HTTP v{v}")
+				// No login: refused.
+				let refused = repo.push("origin", connection = RemoteOptions{protocol: v}) onerror (err error) {
+					fail "v{v}: refusal reads {err.message}" unless err.message.contains("401")
+					recover PushResult{url: ""}
+				}
+				fail "v{v}: push without a login went through" unless refused.url == ""
+				// Asked for and given.
+				let asked = 0
+				let ro = RemoteOptions{protocol: v, useHelpers: false, ask: def (req CredentialRequest) !?Credentials {
+					asked++
+					return Credentials{username: "ana", password: new Secret<string>("secret")}
+				}}
+				let pushed = try repo.push("origin", connection = ro)
+				fail "v{v}: not pushed: {pushed.changes[0].reason}" unless pushed.changes[0].kind == RefChangeKind.FastForward
+				fail "v{v}: asked {asked} times" unless asked == 1
+				fail "v{v}: server not moved" unless (try src.resolve(branch)).equals(next)
+				// Given up front; the wrong one is refused.
+				let wrong = RemoteOptions{protocol: v, useHelpers: false, credentials: Credentials{username: "ana", password: new Secret<string>("nope")}}
+				let failed = repo.push("origin", connection = wrong, refspecs = ["{ids[1].str()}:refs/heads/other-{v}"]) onerror recover PushResult{url: ""}
+				fail "v{v}: wrong password accepted" unless failed.url == ""
+				try src.setRef("refs/heads/{branch}", ids[1])
+				repo.close()
+			}
+			try ts.close()
+			return none
+		}
+	}
+}

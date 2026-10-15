@@ -1,0 +1,590 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// Which tags a fetch brings along.
+	enum TagMode {
+		// Tags pointing at what the fetch brings (`git fetch`'s default).
+		Follow,
+		// Every tag of the remote (`--tags`).
+		All,
+		// None (`--no-tags`).
+		None
+	}
+
+	// What happened to one local reference in a fetch or a push.
+	enum RefChangeKind {
+		UpToDate,
+		Created,
+		FastForward,
+		// Moved to a commit that does not contain the old one.
+		Forced,
+		Deleted,
+		// Left alone: see `reason`.
+		Rejected
+	}
+
+	// A reference a fetch or push changed or would have.
+	struct RefChange {
+		// The local reference (fetch) or the remote one (push).
+		name   string
+		// The remote reference it came from (fetch) or the local one sent
+		// (push).
+		source string    = ""
+		before ?ObjectId = none
+		after  ?ObjectId = none
+		kind   RefChangeKind
+		reason string    = ""
+	}
+
+	// The settings of a fetch (`Repository.fetch`'s parameters).
+	internal struct FetchOptions {
+		remote        RemoteOptions = RemoteOptions{}
+		// Refspecs to fetch instead of `remote.<name>.fetch`.
+		refspecs      string[]      = []
+		tags          TagMode       = TagMode.Follow
+		// Delete remote-tracking references whose branch is gone; none
+		// takes `fetch.prune` / `remote.<name>.prune`.
+		prune         ?bool         = none
+		// Commits to keep from each tip (`--depth`); 0: all.
+		depth         int           = 0
+		// Deepen the current shallow history by `depth` (`--deepen`).
+		deepen        bool          = false
+		// Commits newer than this only (`--shallow-since`).
+		shallowSince  ?time.Time    = none
+		// History reachable from these remote refs is left out
+		// (`--shallow-exclude`).
+		shallowExclude string[]     = []
+		// Fetch the whole history of a shallow repository (`--unshallow`).
+		unshallow     bool          = false
+		// An object filter (`blob:none`, `blob:limit=1m`, `tree:0`); empty
+		// takes `remote.<name>.partialclonefilter`.
+		filter        string        = ""
+		// Update references even when it is not a fast-forward.
+		force         bool          = false
+		// Write FETCH_HEAD.
+		writeFetchHead bool         = true
+	}
+
+	// What a fetch did.
+	struct FetchResult {
+		// The remote's URL.
+		url     string
+		changes RefChange[] = []
+		// The references the remote listed.
+		refs    RemoteRef[] = []
+	}
+
+	// A remote the configuration names, or a URL used as one.
+	internal struct RemoteConfig {
+		// The name, or empty for a bare URL.
+		name     string
+		url      string
+		pushUrl  string
+		fetch    string[] = []
+		push     string[] = []
+		tagOpt   string   = ""
+		promisor bool     = false
+		filter   string   = ""
+		mirror   bool     = false
+	}
+
+	// The remote named `name` in the configuration, or `name` itself as a
+	// URL. Fails when it is neither.
+	internal def remoteConfig(repo Repository, name string) !RemoteConfig {
+		let c = repo.config
+		let configured = c.get("remote.{name}.url")
+		if configured is none {
+			fail "git: no remote named {name}" unless name.contains("/") || name.contains(":")
+			return RemoteConfig{name: "", url: name, pushUrl: name}
+		}
+		let push = c.get("remote.{name}.pushurl")
+		return RemoteConfig{
+			name: name,
+			url: configured,
+			pushUrl: push is none ?? (configured, push),
+			fetch: c.all("remote.{name}.fetch"),
+			push: c.all("remote.{name}.push"),
+			tagOpt: c.get("remote.{name}.tagOpt", ""),
+			promisor: c.getBool("remote.{name}.promisor", false) onerror recover false,
+			filter: c.get("remote.{name}.partialclonefilter", ""),
+			mirror: c.getBool("remote.{name}.mirror", false) onerror recover false,
+		}
+	}
+
+	// The wire for a URL: HTTP(S), SSH, or the in-process server for a
+	// repository on this machine.
+	internal def wireFor(remote RemoteUrl, options RemoteOptions, config Config) !Wire {
+		switch remote.scheme {
+			case RemoteScheme.Http, RemoteScheme.Https:
+				return new HttpWire(remote, options, config)
+			case RemoteScheme.Ssh:
+				return new SshWire(remote, options)
+		}
+		return new LocalWire(try open(remote.path))
+	}
+
+	// Opens a session with a remote service and reads its advertisement.
+	// Fails when the remote cannot be reached.
+	internal def openSession(text string, program string, options RemoteOptions, config Config) !RemoteSession {
+		let remote = try parseRemoteUrl(text)
+		let wire = try wireFor(remote, options, config)
+		let session = new RemoteSession(wire, program, options)
+		session.open() onerror (err error) {
+			wire.close()
+			fail err
+		}
+		return session
+	}
+
+	// The references of a remote repository (`git ls-remote`), those under
+	// `prefixes` when given. Fails when the remote cannot be reached.
+	def lsRemote(url string, prefixes string[] = [], credentials ?Credentials = none, connection RemoteOptions = RemoteOptions{}) !RemoteRef[] {
+		let session = try openSession(url, "git-upload-pack", withCredentials(connection, credentials), userConfig())
+		let refs = session.lsRefs(prefixes) onerror (err error) {
+			session.close()
+			fail err
+		}
+		session.close()
+		return refs
+	}
+
+	// ---- fetch ------------------------------------------------------------------
+
+	// One remote reference a fetch takes, and where it goes.
+	internal struct FetchTarget {
+		ref      RemoteRef
+		// The local reference; empty for FETCH_HEAD only.
+		local    string
+		force    bool
+		forMerge bool
+		// Came from a pattern refspec or tag following.
+		pattern  bool
+	}
+
+	// The references a fetch takes under the refspecs, and the tags it
+	// follows.
+	internal def fetchTargets(refs RemoteRef[], specs Refspec[], explicit bool, mergeRefs string[], tags TagMode) FetchTarget[] {
+		let out FetchTarget[] = []
+		let taken map<string, bool> = {}
+		for let spec in specs {
+			continue when spec.negative
+			for let ref in refs {
+				continue when ref.id is none || ref.name.endsWith("^\{\}")
+				continue when excludedBy(specs, ref.name)
+				let dst = mapSource(spec, ref.name)
+				if dst is none && !spec.pattern && spec.target == "" && fullRefMatch(spec.source, ref.name) {
+					dst = ""
+				}
+				continue when dst is none
+				let key = ref.name + "\u0000" + dst
+				continue when taken.hasKey(key)
+				taken[key] = true
+				let merge = explicit ?? (!spec.pattern, mergeRefs.includes(ref.name))
+				out.push(FetchTarget{ref: ref, local: dst, force: spec.force, forMerge: merge, pattern: spec.pattern})
+			}
+		}
+		if tags == TagMode.All {
+			for let ref in refs {
+				continue unless ref.name.startsWith("refs/tags/") && !(ref.id is none) && !ref.name.endsWith("^\{\}")
+				let key = ref.name + "\u0000" + ref.name
+				continue when taken.hasKey(key)
+				taken[key] = true
+				out.push(FetchTarget{ref: ref, local: ref.name, force: false, forMerge: false, pattern: true})
+			}
+		}
+		return out
+	}
+
+	// Whether a short refspec source (`main`, `heads/main`) names the
+	// reference, by git's rules for the left side of a fetch refspec.
+	internal def fullRefMatch(short string, name string) bool {
+		return true when short == name
+		for let prefix in string["refs/", "refs/tags/", "refs/heads/", "refs/remotes/"] {
+			return true when prefix + short == name
+		}
+		return name == "refs/remotes/" + short + "/HEAD"
+	}
+
+	// Fetches from a remote (a configured name or a URL) into the
+	// repository and updates the references the refspecs map. Fails when
+	// the remote cannot be reached, refuses, or sends a bad pack; a
+	// reference that cannot be updated is reported as rejected instead.
+	internal def fetchRemote(repo Repository, name string, options FetchOptions) !FetchResult {
+		let remote = try remoteConfig(repo, name)
+		let specTexts = options.refspecs.len() > 0 ?? (options.refspecs, remote.fetch)
+		let explicit = options.refspecs.len() > 0
+		let specs Refspec[] = []
+		for let t in specTexts {
+			specs.push(try parseRefspec(t))
+		}
+		// Without refspecs a URL fetch takes the remote's HEAD.
+		specs.push(Refspec{source: "HEAD"}) when specs.len() == 0
+		let tags = options.tags
+		if tags == TagMode.Follow {
+			tags = TagMode.None when remote.tagOpt == "--no-tags"
+			tags = TagMode.All when remote.tagOpt == "--tags"
+		}
+		let mergeRefs string[] = []
+		let branch = repo.branch() onerror recover ""
+		if !explicit && branch != "" && remote.name != "" && repo.config.get("branch.{branch}.remote", "") == remote.name {
+			mergeRefs = repo.config.all("branch.{branch}.merge")
+		}
+		let session = try openSession(remote.url, "git-upload-pack", options.remote, repo.config)
+		let result = doFetch(repo, session, remote, specs, explicit, mergeRefs, tags, options) onerror (err error) {
+			session.close()
+			fail err
+		}
+		session.close()
+		return result
+	}
+
+	internal def doFetch(repo Repository, session RemoteSession, remote RemoteConfig, specs Refspec[], explicit bool, mergeRefs string[], tags TagMode, options FetchOptions) !FetchResult {
+		let label = remote.name != "" ?? ("fetch {remote.name}", "fetch {remote.url}")
+		return try doFetchLabeled(repo, session, remote, specs, explicit, mergeRefs, tags, options, label)
+	}
+
+	// doFetch with the reflog message's prefix given.
+	internal def doFetchLabeled(repo Repository, session RemoteSession, remote RemoteConfig, specs Refspec[], explicit bool, mergeRefs string[], tags TagMode, options FetchOptions, label string) !FetchResult {
+		let prefixes string[] = []
+		for let s in specs {
+			continue when s.negative
+			let src = s.source
+			if s.pattern {
+				prefixes.push(src.slice(0, src.indexOf("*")))
+			} else if src.startsWith("refs/") || src == "HEAD" {
+				prefixes.push(src)
+			} else {
+				for let p in string["", "refs/", "refs/tags/", "refs/heads/", "refs/remotes/"] {
+					prefixes.push(p + src)
+				}
+			}
+		}
+		prefixes.push("refs/tags/") unless tags == TagMode.None
+		prefixes.push("HEAD") unless prefixes.includes("HEAD")
+		let refs = try session.lsRefs(prefixes)
+		let targets = fetchTargets(refs, specs, explicit, mergeRefs, tags)
+		fail "git: the remote has no reference matching {refspecText(specs[0])}" when targets.len() == 0 && explicit && !specs[0].pattern
+		// Annotated tags whose commits arrive come along when followed.
+		let follow = tags == TagMode.Follow
+		let wants ObjectId[] = []
+		let wanted map<string, bool> = {}
+		let deepening = options.depth > 0 || !(options.shallowSince is none) || options.shallowExclude.len() > 0 || options.unshallow
+		for let t in targets {
+			let id = t.ref.id
+			continue when id is none || wanted.hasKey(id.str())
+			if deepening || !repo.has(id) {
+				wants.push(id)
+				wanted[id.str()] = true
+			}
+		}
+		let filter = options.filter != "" ?? (options.filter, remote.filter)
+		let outcome = FetchOutcome{}
+		if wants.len() > 0 {
+			let req = FetchRequest{wants: wants, includeTag: follow, filter: filter}
+			if options.unshallow {
+				req.depth = 2147483647
+			} else {
+				req.depth = options.depth
+				req.deepenRelative = options.deepen
+			}
+			let since = options.shallowSince
+			req.deepenSince = since.unixNs() / 1000000000 unless since is none
+			req.deepenNot = options.shallowExclude
+			outcome = try fetchPack(session, repo, req)
+			try applyShallowUpdate(repo, outcome)
+			if remote.promisor || filter != "" {
+				try markPromisor(repo, outcome.pack, targets)
+			}
+		}
+		if follow {
+			// A tag whose object the repository now has is created too.
+			for let ref in refs {
+				continue unless ref.name.startsWith("refs/tags/") && !ref.name.endsWith("^\{\}")
+				let id = ref.id
+				continue when id is none
+				let peeled = ref.peeled
+				let target = peeled is none ?? (id, peeled)
+				continue unless repo.has(id) && repo.has(target)
+				continue when targets.filter(t => t.ref.name == ref.name).len() > 0
+				targets.push(FetchTarget{ref: ref, local: ref.name, force: false, forMerge: false, pattern: true})
+			}
+		}
+		try checkConnected(repo, targets, filter != "" || remote.promisor)
+		let result = FetchResult{url: remote.url, refs: refs}
+		let prune = options.prune
+		let pruning = prune is none ?? (pruneConfigured(repo, remote.name), prune)
+		let changes = try updateFetchedRefs(repo, label, targets, specs, refs, pruning, options.force)
+		result.changes = changes
+		if options.writeFetchHead {
+			try writeFetchHead(repo, remote.url, targets)
+		}
+		if remote.name != "" {
+			try createRemoteHead(repo, remote.name, refs, specs)
+		}
+		return result
+	}
+
+	internal def pruneConfigured(repo Repository, name string) bool {
+		let general = repo.config.getBool("fetch.prune", false) onerror recover false
+		return general when name == ""
+		return repo.config.getBool("remote.{name}.prune", general) onerror recover general
+	}
+
+	// Moves the shallow boundary as the remote said. Fails when the
+	// `shallow` file cannot be written.
+	internal def applyShallowUpdate(repo Repository, outcome FetchOutcome) !none {
+		return none when outcome.shallow.len() == 0 && outcome.unshallow.len() == 0
+		let ids = shallowCommits(repo).clone()
+		for let s in outcome.shallow {
+			ids[s] = true
+		}
+		for let u in outcome.unshallow {
+			ids.delete(u)
+		}
+		return try writeShallow(repo, ids.keys())
+	}
+
+	// Marks a pack from a promisor remote: objects it lacks may be fetched
+	// from there. The file lists the references it was fetched for.
+	internal def markPromisor(repo Repository, pack ?ObjectId, targets FetchTarget[]) !none {
+		return none when pack is none
+		let lines string[] = []
+		for let t in targets {
+			let id = t.ref.id
+			lines.push("{id.str()} {t.ref.name}") unless id is none
+		}
+		let text = lines.len() == 0 ?? ("", lines.join("\n") + "\n")
+		let path = os.join(repo.objects.dir, "pack", "pack-{pack.str()}.promisor")
+		return try writeAtomically(path, text.bytes(), 0o444)
+	}
+
+	// Checks that everything the fetched references reach is in the
+	// repository, as git does before it moves references: commits always,
+	// trees and blobs unless a promisor remote may hold them. Fails naming
+	// the first object missing.
+	internal def checkConnected(repo Repository, targets FetchTarget[], promisor bool) !none {
+		let walk = new RevWalk(repo)
+		let pushed = 0
+		for let t in targets {
+			let id = t.ref.id
+			continue when id is none
+			fail "git: the remote did not send {id.str()} ({t.ref.name})" unless repo.has(id)
+			let c = repo.peel(id, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			if c.isZero() {
+				// A tag of a tree or blob, or a tree or blob itself.
+				let target = repo.peel(id, ObjectKind.Tree) onerror recover zeroId(repo.format)
+				fail "git: {t.ref.name} points at a missing object" when target.isZero() && !promisor
+				continue
+			}
+			try walk.push(c)
+			pushed++
+		}
+		return none when pushed == 0
+		for let tip in negotiationTips(repo) {
+			try walk.hide(tip)
+		}
+		let commits = try walk.all()
+		let sending map<string, bool> = {}
+		for let c in commits {
+			sending[c.id.str()] = true
+		}
+		let known map<string, bool> = {}
+		for let c in commits {
+			for let p in c.parents {
+				continue when sending.hasKey(p.str())
+				let pc = commitOrNone(repo, p)
+				try markTree(repo, pc.tree, known) unless pc is none
+			}
+		}
+		for let c in commits {
+			try checkTreeConnected(repo, c.tree, known, promisor)
+		}
+		return none
+	}
+
+	internal def checkTreeConnected(repo Repository, id ObjectId, known map<string, bool>, promisor bool) !none {
+		let key = id.str()
+		return none when known.hasKey(key)
+		known[key] = true
+		if !repo.has(id) {
+			return none when promisor
+			fail "git: tree {id.str()} is missing after the fetch"
+		}
+		let t = try repo.tree(id)
+		for let e in t.entries {
+			if isTree(e.mode) {
+				try checkTreeConnected(repo, e.id, known, promisor)
+			} else if e.mode != EntryMode.Submodule {
+				let k = e.id.str()
+				continue when known.hasKey(k)
+				known[k] = true
+				fail "git: blob {k} is missing after the fetch" unless promisor || repo.has(e.id)
+			}
+		}
+		return none
+	}
+
+	// Moves the local references the fetch maps, as git decides: new ones
+	// are created, fast-forwards made, others only when forced; existing
+	// tags are not moved unless forced; the checked-out branch is left
+	// alone. With `prune`, references a pattern refspec maps from a
+	// remote reference that is gone are deleted.
+	internal def updateFetchedRefs(repo Repository, label string, targets FetchTarget[], specs Refspec[], refs RemoteRef[], prune bool, force bool) !RefChange[] {
+		let who = try repo.identity("committer")
+		let current = repo.isBare() ?? ("", repo.headRef() onerror recover "")
+		let out RefChange[] = []
+		let done map<string, bool> = {}
+		for let t in targets {
+			continue when t.local == "" || done.hasKey(t.local)
+			done[t.local] = true
+			let id = t.ref.id
+			continue when id is none
+			let old = repo.refTarget(t.local) onerror recover none
+			let change = RefChange{name: t.local, source: t.ref.name, before: old, after: id, kind: RefChangeKind.UpToDate}
+			out.push(change)
+			continue when !(old is none) && old.equals(id)
+			let tag = t.local.startsWith("refs/tags/")
+			let forced = force || t.force
+			let message = ""
+			if t.local == current {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "refusing to fetch into the checked-out branch"
+				continue
+			}
+			if old is none {
+				change.kind = RefChangeKind.Created
+				message = tag ?? ("storing tag", t.local.startsWith("refs/heads/") || t.local.startsWith("refs/remotes/") ?? ("storing head", "storing ref"))
+			} else if tag && !forced {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "would clobber existing tag"
+				continue
+			} else if try fastForwards(repo, old, id) {
+				change.kind = RefChangeKind.FastForward
+				message = "fast-forward"
+			} else if forced {
+				change.kind = RefChangeKind.Forced
+				message = "forced-update"
+			} else {
+				change.kind = RefChangeKind.Rejected
+				change.reason = "non-fast-forward"
+				continue
+			}
+			let u = RefUpdate{name: t.local, newId: id, expected: old is none ?? (zeroId(repo.format), old), message: "{label}: {message}"}
+			repo.refStore.commit([u], who) onerror (err error) {
+				change.kind = RefChangeKind.Rejected
+				change.reason = err.message
+				recover none
+			}
+		}
+		if prune {
+			let remoteNames map<string, bool> = {}
+			for let r in refs {
+				remoteNames[r.name] = true
+			}
+			for let spec in specs {
+				continue unless spec.pattern && !spec.negative && spec.target != ""
+				let prefix = spec.target.slice(0, spec.target.indexOf("*"))
+				for let local in try repo.refs(prefix) {
+					continue when done.hasKey(local.name) || local.target != ""
+					let source = mapTarget(spec, local.name)
+					continue when source is none || remoteNames.hasKey(source) || excludedBy(specs, source)
+					done[local.name] = true
+					let change = RefChange{name: local.name, source: source, before: local.id, kind: RefChangeKind.Deleted}
+					out.push(change)
+					let u = RefUpdate{name: local.name, delete: true, expected: local.id, deref: false}
+					repo.refStore.commit([u], who) onerror (err error) {
+						change.kind = RefChangeKind.Rejected
+						change.reason = err.message
+						recover none
+					}
+				}
+			}
+		}
+		return out
+	}
+
+	// Whether moving from `old` to `id` is a fast-forward: both commits and
+	// `old` an ancestor of `id`.
+	internal def fastForwards(repo Repository, old ObjectId, id ObjectId) !bool {
+		let oc = repo.peel(old, ObjectKind.Commit) onerror recover zeroId(repo.format)
+		let nc = repo.peel(id, ObjectKind.Commit) onerror recover zeroId(repo.format)
+		return false when oc.isZero() || nc.isZero()
+		return try isAncestor(repo, oc, nc)
+	}
+
+	// Writes FETCH_HEAD: the fetched references, those to merge first, each
+	// with what it was and where from.
+	internal def writeFetchHead(repo Repository, remoteUrl string, targets FetchTarget[]) !none {
+		let shown = fetchHeadUrl(remoteUrl)
+		let merge string[] = []
+		let rest string[] = []
+		let seen map<string, bool> = {}
+		for let t in targets {
+			let id = t.ref.id
+			continue when id is none || seen.hasKey(t.ref.name)
+			seen[t.ref.name] = true
+			let name = t.ref.name
+			let what = "'{name}' of {shown}"
+			if name == "HEAD" {
+				what = shown
+			} else if name.startsWith("refs/heads/") {
+				what = "branch '{name.slice(11)}' of {shown}"
+			} else if name.startsWith("refs/tags/") {
+				what = "tag '{name.slice(10)}' of {shown}"
+			} else if name.startsWith("refs/remotes/") {
+				what = "remote-tracking branch '{name.slice(13)}' of {shown}"
+			}
+			if t.forMerge {
+				merge.push("{id.str()}\t\t{what}")
+			} else {
+				rest.push("{id.str()}\tnot-for-merge\t{what}")
+			}
+		}
+		let lines = merge + rest
+		let text = lines.len() == 0 ?? ("", lines.join("\n") + "\n")
+		return try writeAtomically(os.join(repo.gitDir, "FETCH_HEAD"), text.bytes())
+	}
+
+	// The URL FETCH_HEAD shows: without a login, trailing slashes or
+	// `.git`.
+	internal def fetchHeadUrl(text string) string {
+		let u = text
+		let scheme = u.indexOf("://")
+		if scheme > 0 {
+			let rest = u.slice(scheme + 3)
+			let slash = rest.indexOf("/")
+			let authority = slash < 0 ?? (rest, rest.slice(0, slash))
+			let at = authority.lastIndexOf("@")
+			u = u.slice(0, scheme + 3) + rest.slice(at + 1) when at >= 0
+		}
+		for u.endsWith("/") {
+			u = u.slice(0, u.len() - 1)
+		}
+		u = u.slice(0, u.len() - 4) when u.endsWith(".git") && u.len() > 4
+		return u
+	}
+
+	// Creates `refs/remotes/<name>/HEAD` when it is missing and the remote's
+	// HEAD names a branch the refspecs map (`remote.<name>.followRemoteHEAD`
+	// "create", git's default).
+	internal def createRemoteHead(repo Repository, name string, refs RemoteRef[], specs Refspec[]) !none {
+		let follow = repo.config.get("remote.{name}.followRemoteHEAD", "create")
+		return none when follow == "never"
+		let local = "refs/remotes/{name}/HEAD"
+		let existing = repo.ref(local) onerror recover none
+		return none unless existing is none
+		let head = refs.filter(r => r.name == "HEAD" && r.target != "")
+		return none when head.len() == 0
+		for let spec in specs {
+			let dst = mapSource(spec, head[0].target)
+			continue when dst is none || !dst.startsWith("refs/remotes/{name}/")
+			let mapped = repo.ref(dst) onerror recover none
+			return none when mapped is none
+			return try repo.setSymbolicRef(local, dst, "remote set-head")
+		}
+		return none
+	}
+}

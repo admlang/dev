@@ -1,0 +1,200 @@
+// Repositories this library creates and writes, read back. The same
+// repositories pass `git fsck` and read in git (checked by hand with
+// ADM_TEST_GIT_KEEP set; see README).
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+		std.testing
+	)
+
+	// A folder the suite may leave its repositories in, to inspect them with
+	// git afterwards; empty: the per-run scratch folder.
+	@env("ADM_TEST_GIT_KEEP")
+	internal const keepDir string
+
+	internal def scratch(name string) !string {
+		let base = keepDir == "" ?? (try os.appHome(), keepDir)
+		let dir = os.join(base, "{name}-{time.now().unixNs()}")
+		try os.mkdir(dir, true)
+		return dir
+	}
+
+	internal def testSignature(offsetHours int = 2) Signature {
+		return new Signature("Ana Lima", "ana@example.com", time.fromUnixNs(int64(1700000000) * 1000000000), duration(int64(offsetHours) * 3600000000000))
+	}
+
+	// Writes a small history through the object and reference APIs and
+	// returns the commits, oldest first.
+	internal def writeHistory(repo Repository) !ObjectId[] {
+		let readme = try repo.writeBlob("# Notes\n".bytes())
+		let tool = try repo.writeBlob("#!/bin/sh\necho hi\n".bytes())
+		let inner = try repo.writeTree([TreeEntry{name: "tool.sh", mode: EntryMode.Executable, id: tool}])
+		let root = try repo.writeTree([
+			TreeEntry{name: "README.md", mode: EntryMode.File, id: readme},
+			TreeEntry{name: "bin", mode: EntryMode.Tree, id: inner},
+			TreeEntry{name: "link", mode: EntryMode.Symlink, id: try repo.writeBlob("README.md".bytes())},
+		])
+		let sig = testSignature()
+		let first = new Commit(zeroId(repo.format), root, [], sig, sig, "First\n\nWith a body.\n")
+		let c1 = try repo.write(ObjectKind.Commit, first.encode())
+		let changed = try repo.writeBlob("# Notes\n\nMore.\n".bytes())
+		let root2 = try repo.writeTree([
+			TreeEntry{name: "README.md", mode: EntryMode.File, id: changed},
+			TreeEntry{name: "bin", mode: EntryMode.Tree, id: inner},
+		])
+		let second = new Commit(zeroId(repo.format), root2, [c1], sig, testSignature(-5), "Second\n")
+		let c2 = try repo.write(ObjectKind.Commit, second.encode())
+		let branch = try repo.branch()
+		try repo.setRef("refs/heads/" + branch, c1, "commit (initial): First", zeroId(repo.format))
+		try repo.setRef("HEAD", c2, "commit: Second", c1)
+		let tag = new Tag(zeroId(repo.format), c1, ObjectKind.Commit, "v1", "Version 1\n")
+		tag.tagger = sig
+		let tagId = try repo.write(ObjectKind.Tag, tag.encode())
+		try repo.setRef("refs/tags/v1", tagId)
+		try repo.setRef("refs/heads/topic", c1, "branch: Created from v1")
+		return [c1, c2]
+	}
+
+	internal def checkHistory(repo Repository, ids ObjectId[]) !none {
+		let branch = try repo.branch()
+		let head = try repo.resolve("HEAD")
+		fail "HEAD is {head.str()}" unless head.equals(ids[1])
+		fail "{branch} moved" unless (try repo.resolve(branch)).equals(ids[1])
+		fail "HEAD~ is wrong" unless (try repo.resolve("HEAD~")).equals(ids[0])
+		fail "v1 does not peel" unless (try repo.resolve("v1^\{commit\}")).equals(ids[0])
+		let c = try repo.commitAt("HEAD")
+		fail "message is {c.message}" unless c.message == "Second\n" && c.summary == "Second"
+		fail "committer zone is {c.committer.str()}" unless c.committer.str().endsWith(" -0500")
+		let blob = try (try repo.tree("HEAD")).file("bin/tool.sh")
+		fail "tool.sh reads {try blob.text()}" unless (try blob.text()) == "#!/bin/sh\necho hi\n"
+		let log = try repo.reflog("refs/heads/" + branch)
+		if repo.isBare() {
+			// Bare repositories keep no logs unless core.logAllRefUpdates says so.
+			fail "bare branch reflog has {log.len()} entries" unless log.len() == 0
+		} else {
+			fail "branch reflog has {log.len()} entries" unless log.len() == 2 && log[1].message == "commit: Second"
+			let headLog = try repo.reflog("HEAD")
+			fail "HEAD reflog has {headLog.len()} entries" unless headLog.len() == 2
+		}
+		let walk = new RevWalk(repo)
+		try walk.push(head)
+		let all = try walk.all()
+		fail "walk gives {all.len()} commits" unless all.len() == 2
+		return none
+	}
+
+	check "Writing" {
+		@test()
+		def writesEveryFormat() !none {
+			let forms = [
+				InitOptions{},
+				InitOptions{bare: true},
+				InitOptions{format: ObjectFormat.Sha256},
+				InitOptions{refFormat: RefFormat.Reftable},
+				InitOptions{bare: true, format: ObjectFormat.Sha256, refFormat: RefFormat.Reftable, initialBranch: "trunk"},
+			]
+			for let (i, options) in forms {
+				let dir = try scratch("write-{i}")
+				let repo = try init(dir, options)
+				let ids = try writeHistory(repo)
+				try checkHistory(repo, ids)
+				repo.close()
+				// Opened again from disk.
+				let again = try open(dir)
+				try checkHistory(again, ids)
+				again.close()
+			}
+			return none
+		}
+
+		@test()
+		def updatesReferences() !none {
+			for let (i, refFormat) in [RefFormat.Files, RefFormat.Reftable] {
+				let dir = try scratch("refs-{i}")
+				let repo = try init(dir, InitOptions{refFormat: refFormat})
+				let ids = try writeHistory(repo)
+				// A stale expected value is refused.
+				let refused = false
+				repo.setRef("refs/heads/topic", ids[1], "", ids[1]) onerror (err error) {
+					refused = true
+					recover none
+				}
+				fail "stale update accepted" unless refused
+				let created = false
+				repo.setRef("refs/heads/topic", ids[1], "", zeroId(repo.format)) onerror (err error) {
+					created = true
+					recover none
+				}
+				fail "create over an existing ref accepted" unless created
+				try repo.deleteRef("refs/heads/topic", ids[0])
+				fail "topic still there" unless (try repo.ref("refs/heads/topic")) is none
+				fail "topic log still there" unless (try repo.reflog("refs/heads/topic")).len() == 0
+				// Many updates, then everything still resolves (reftable compacts).
+				for let k = 0; k < 40; k++ {
+					try repo.setRef("refs/heads/many/{k}", ids[k % 2])
+				}
+				for let k = 0; k < 40; k++ {
+					fail "many/{k} lost" unless (try repo.resolve("many/{k}")).equals(ids[k % 2])
+				}
+				try repo.setSymbolicRef("refs/heads/alias", "refs/heads/many/3")
+				fail "alias does not follow" unless (try repo.resolve("alias")).equals(ids[1])
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def packsReferences() !none {
+			let dir = try scratch("pack-refs")
+			let repo = try init(dir)
+			let ids = try writeHistory(repo)
+			let store = repo.refStore
+			fail "not a files store" unless store is FileRefs
+			let files FileRefs = store
+			try files.pack(id => peelOrNone(repo, id, ObjectKind.Commit))
+			fail "loose topic left" when os.exists(os.join(repo.gitDir, "refs", "heads", "topic")) onerror recover true
+			fail "topic not packed" unless (try repo.resolve("topic")).equals(ids[0])
+			let tag = try repo.ref("refs/tags/v1")
+			fail "v1 not peeled" when tag is none || tag.peeled is none
+			// Deleting a packed reference rewrites packed-refs.
+			try repo.deleteRef("refs/heads/topic")
+			fail "packed topic still there" unless (try repo.ref("refs/heads/topic")) is none
+			// git needs refs/ and refs/heads to see a repository.
+			fail "refs/heads removed" unless os.exists(os.join(repo.gitDir, "refs", "heads")) onerror recover false
+			repo.close()
+			fail "no longer a repository" when (try findGitDir(dir)) is none
+			return none
+		}
+
+		@test()
+		def editsConfiguration() !none {
+			let dir = try scratch("config")
+			let repo = try init(dir)
+			let path = os.join(repo.gitDir, "config")
+			let before = string(try os.readFile(path))
+			try os.writeFile(path, (before + "# kept comment\n[remote \"origin\"]\n\turl = https://example.com/a.git ; trailing\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n").bytes())
+			try repo.config.reload()
+			fail "url is {repo.config.get("remote.origin.url", "")}" unless repo.config.get("remote.origin.url", "") == "https://example.com/a.git"
+			try repo.config.set("remote.origin.url", "  spaced # value ")
+			try repo.config.add("remote.origin.fetch", "+refs/tags/*:refs/tags/*")
+			try repo.config.set("branch.main.remote", "origin")
+			try repo.config.set("user.name", "Ana \"Q\" Lima")
+			fail "quoted value lost" unless repo.config.get("remote.origin.url", "") == "  spaced # value "
+			fail "fetch values" unless repo.config.all("remote.origin.fetch").len() == 2
+			fail "quote escape" unless repo.config.get("user.name", "") == "Ana \"Q\" Lima"
+			let text = string(try os.readFile(path))
+			fail "comment lost" unless text.contains("# kept comment")
+			try repo.config.unset("remote.origin.fetch", true)
+			fail "fetch not removed" unless repo.config.all("remote.origin.fetch").len() == 0
+			try repo.config.renameSection("remote.origin", "remote.upstream")
+			fail "rename failed" unless repo.config.get("remote.upstream.url", "") == "  spaced # value "
+			try repo.config.removeSection("remote.upstream")
+			fail "remove failed" unless repo.config.get("remote.upstream.url") is none
+			fail "bool" unless !(try repo.config.getBool("core.bare", true))
+			fail "int" unless (try parseConfigInt("2k")) == 2048
+			repo.close()
+			return none
+		}
+	}
+}

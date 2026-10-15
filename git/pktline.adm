@@ -1,0 +1,169 @@
+partial module adm.dev.git {
+	use std.io
+
+	// The largest pkt-line: 65520 bytes with its 4-byte length.
+	internal const maxPktLine = 65520
+
+	// What a pkt-line read returned: data, or one of the special packets.
+	internal enum PktKind {
+		Data,
+		// 0000: the end of a section.
+		Flush,
+		// 0001: protocol v2's separator between capabilities and arguments.
+		Delimiter,
+		// 0002: protocol v2's end of a response in a stateless connection.
+		ResponseEnd
+	}
+
+	// One pkt-line.
+	internal struct Pkt {
+		kind PktKind
+		data byte[] = []
+	}
+
+	// The data of a packet as text with its trailing newline dropped.
+	internal def pktText(p Pkt) string {
+		let d = p.data
+		let n = d.len()
+		n-- when n > 0 && d[n - 1] == 0x0A
+		return string(d[0:n])
+	}
+
+	// PktReader reads git's pkt-line framing: a 4-hex-digit length (itself
+	// included) before each packet, `0000` flush, `0001` delimiter and
+	// `0002` response end.
+	internal type PktReader {
+		internal r   io.Reader
+		internal buf byte[] = []
+		internal pos int    = 0
+		internal end int    = 0
+		// A packet `peek` read and `read` has not returned yet.
+		internal ahead ?Pkt = none
+
+		def new(r io.Reader) {
+			self.r = r
+			buf.len(65536)
+		}
+
+		internal def fill(n int) !none {
+			if end - pos >= n {
+				return none
+			}
+			if pos > 0 {
+				let left = end - pos
+				buf[pos:end].copy(buf[0:left])
+				pos = 0
+				end = left
+			}
+			for end - pos < n {
+				let got = try r.read(buf[end:])
+				fail "git: the connection closed in the middle of a packet" when got == 0
+				end += got
+			}
+			return none
+		}
+
+		// The next packet without taking it: the next `read` returns it.
+		// Fails as `read` does.
+		def peek() !Pkt {
+			let a = ahead
+			return a unless a is none
+			let p = try read()
+			ahead = p
+			return p
+		}
+
+		// The next packet. Fails on a malformed length or a closed
+		// connection.
+		def read() !Pkt {
+			let a = ahead
+			if !(a is none) {
+				ahead = none
+				return a
+			}
+			try fill(4)
+			let length = 0
+			for let k = 0; k < 4; k++ {
+				let v = hexValue(buf[pos + k])
+				fail "git: bad pkt-line length" when v < 0
+				length = length * 16 + v
+			}
+			pos += 4
+			switch length {
+				case 0:
+					return Pkt{kind: PktKind.Flush}
+				case 1:
+					return Pkt{kind: PktKind.Delimiter}
+				case 2:
+					return Pkt{kind: PktKind.ResponseEnd}
+				case 3:
+					fail "git: bad pkt-line length 3"
+			}
+			fail "git: pkt-line too long" when length > maxPktLine
+			let size = length - 4
+			try fill(size)
+			let data = buf[pos:pos + size].clone()
+			pos += size
+			// A server reports a failure on an `ERR` line wherever it is.
+			if data.len() > 4 && data[0] == 0x45 && data[1] == 0x52 && data[2] == 0x52 && data[3] == 0x20 {
+				fail "git: remote error: {string(data[4:]).trim()}"
+			}
+			return Pkt{kind: PktKind.Data, data: data}
+		}
+
+		// The packets up to the next flush (not included).
+		def section() !Pkt[] {
+			let out Pkt[] = []
+			for {
+				let p = try read()
+				break when p.kind == PktKind.Flush
+				out.push(p)
+			}
+			return out
+		}
+
+		// Bytes left over in the buffer after the last packet read, for a
+		// stream that switches to raw data (a packfile without sideband).
+		def leftover() byte[] {
+			let out = buf[pos:end].clone()
+			pos = end
+			return out
+		}
+
+		// Puts bytes back before what is buffered, for a reader that took
+		// more than it used.
+		def unread(data byte[]) {
+			return when data.len() == 0
+			let left = buf[pos:end].clone()
+			let joined = data + left
+			buf.len(joined.len().max(65536))
+			joined.copy(buf)
+			pos = 0
+			end = joined.len()
+		}
+
+		// Reads raw bytes, the buffered ones first.
+		def readRaw(into byte[]) !int {
+			if pos < end {
+				let n = buf[pos:end].copy(into)
+				pos += n
+				return n
+			}
+			return try r.read(into)
+		}
+	}
+
+	// A data packet holding the bytes. Fails when they do not fit one.
+	internal def pktLine(data byte[]) !byte[] {
+		fail "git: pkt-line too long" when data.len() + 4 > maxPktLine
+		return "%04x".format(data.len() + 4).bytes() + data
+	}
+
+	// A data packet holding the text and a newline.
+	internal def pktLine(text string) !byte[] {
+		return try pktLine((text + "\n").bytes())
+	}
+
+	internal const pktFlush = "0000"
+	internal const pktDelim = "0001"
+}

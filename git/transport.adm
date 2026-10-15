@@ -1,0 +1,638 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.net.http
+		std.net.ssh
+		std.net.url
+		std.services.runtime::(Runtime)
+	)
+
+	// How a remote repository is reached.
+	internal enum RemoteScheme {
+		Http,
+		Https,
+		Ssh,
+		// A repository on this machine: a path or a `file://` URL.
+		Local
+	}
+
+	// A remote repository's address, as git reads URLs: `https://host/path`,
+	// `ssh://[user@]host[:port]/path`, the scp-like `[user@]host:path`,
+	// `file:///path` and plain paths.
+	internal struct RemoteUrl {
+		scheme RemoteScheme
+		// The host name, without a port.
+		host   string = ""
+		// 0: the scheme's default.
+		port   int    = 0
+		user   string = ""
+		// The repository path on the host (for scp-like SSH addresses,
+		// relative to the login's home unless it starts with `/`).
+		path   string = ""
+		// The URL as given.
+		text   string = ""
+	}
+
+	// The base URL of an HTTP remote, without credentials or a trailing
+	// slash.
+	internal def httpBase(remote RemoteUrl) string {
+		let scheme = remote.scheme == RemoteScheme.Https ?? ("https", "http")
+		let p = remote.path
+		p = p.slice(0, p.len() - 1) when p.endsWith("/")
+		return "{scheme}://{hostWithPort(remote)}{p}"
+	}
+
+	// `host` or `host:port`.
+	internal def hostWithPort(remote RemoteUrl) string {
+		return remote.port == 0 ?? (remote.host, "{remote.host}:{remote.port}")
+	}
+
+	// A field of the credential protocol, empty when absent.
+	internal def field(fields map<string, string>, key string) string {
+		let v = fields.get(key)
+		return v is none ?? ("", v)
+	}
+
+	// Reads a remote's address. Fails when it names a scheme git does not
+	// speak here (`git://`, `ftp://`) or has no host.
+	internal def parseRemoteUrl(text string) !RemoteUrl {
+		let schemeEnd = text.indexOf("://")
+		if schemeEnd > 0 {
+			let scheme = text.slice(0, schemeEnd).lower()
+			if scheme == "file" {
+				return RemoteUrl{scheme: RemoteScheme.Local, path: try url.unescape(text.slice(schemeEnd + 3)), text: text}
+			}
+			let kind = RemoteScheme.Http
+			switch scheme {
+				case "http":
+					kind = RemoteScheme.Http
+				case "https":
+					kind = RemoteScheme.Https
+				case "ssh", "git+ssh", "ssh+git":
+					kind = RemoteScheme.Ssh
+				default:
+					fail "git: remotes over {scheme}:// are not supported (use https, ssh or a path)"
+			}
+			let rest = text.slice(schemeEnd + 3)
+			let slash = rest.indexOf("/")
+			let authority = slash < 0 ?? (rest, rest.slice(0, slash))
+			let path = slash < 0 ?? ("/", rest.slice(slash))
+			let user = ""
+			let at = authority.lastIndexOf("@")
+			if at >= 0 {
+				user = try url.unescape(authority.slice(0, at))
+				authority = authority.slice(at + 1)
+			}
+			let (host, port) = try splitHostPort(authority)
+			fail "git: {text} names no host" when host == ""
+			if kind == RemoteScheme.Ssh {
+				// `ssh://host/~user/repo` is relative to that user's home.
+				path = path.slice(1) when path.startsWith("/~")
+				path = try url.unescape(path)
+			}
+			return RemoteUrl{scheme: kind, host: host, port: port, user: user, path: path, text: text}
+		}
+		// scp-like: a colon before the first slash, and not a Windows drive.
+		let colon = text.indexOf(":")
+		let firstSlash = text.indexOf("/")
+		if colon > 0 && (firstSlash < 0 || colon < firstSlash) && !(colon == 1 && isAsciiLetter(text.bytes()[0])) {
+			let hostPart = text.slice(0, colon)
+			let user = ""
+			let at = hostPart.lastIndexOf("@")
+			if at >= 0 {
+				user = hostPart.slice(0, at)
+				hostPart = hostPart.slice(at + 1)
+			}
+			if hostPart.startsWith("[") && hostPart.endsWith("]") {
+				hostPart = hostPart.slice(1, hostPart.len() - 1)
+			}
+			return RemoteUrl{scheme: RemoteScheme.Ssh, host: hostPart, user: user, path: text.slice(colon + 1), text: text}
+		}
+		return RemoteUrl{scheme: RemoteScheme.Local, path: text, text: text}
+	}
+
+	internal def isAsciiLetter(c byte) bool {
+		return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+	}
+
+	// `host`, `host:port`, `[v6]` or `[v6]:port`, split.
+	internal def splitHostPort(authority string) !(string, int) {
+		if authority.startsWith("[") {
+			let close = authority.indexOf("]")
+			fail "git: bad host in {authority}" when close < 0
+			let host = authority.slice(1, close)
+			let rest = authority.slice(close + 1)
+			return (host, 0) when rest == ""
+			fail "git: bad port in {authority}" unless rest.startsWith(":")
+			return (host, try portNumber(rest.slice(1)))
+		}
+		let colon = authority.lastIndexOf(":")
+		return (authority, 0) when colon < 0
+		return (authority.slice(0, colon), try portNumber(authority.slice(colon + 1)))
+	}
+
+	internal def portNumber(text string) !int {
+		return 0 when text == ""
+		for let c in text.bytes() {
+			fail "git: bad port {text}" unless c >= 0x30 && c <= 0x39
+		}
+		let n = text.toInt<int>()
+		fail "git: bad port {text}" when n <= 0 || n > 65535
+		return n
+	}
+
+	// ---- credentials ------------------------------------------------------------
+
+	// A login for an HTTP remote: a user name and a password or token.
+	struct Credentials {
+		username string         = ""
+		password Secret<string> = new Secret<string>("")
+	}
+
+	// What a remote wants credentials for, as git's credential protocol
+	// names it.
+	struct CredentialRequest {
+		protocol string
+		host     string
+		// The repository path; empty unless `credential.useHttpPath` is set.
+		path     string = ""
+		// The user name the URL or configuration gives.
+		username string = ""
+		// The credentials offered last were refused.
+		refused  bool   = false
+	}
+
+	// What reaching a remote may need: credentials, how to ask for them,
+	// an SSH client to log in with, and where progress goes.
+	struct RemoteOptions {
+		// Credentials for an HTTP remote, tried first.
+		credentials  ?Credentials                                = none
+		// Asked when the remote wants credentials that neither
+		// `credentials` nor a credential helper gave (or they were
+		// refused); none gives up instead.
+		ask          ?def (CredentialRequest) !?Credentials       = none
+		// Use the credential helpers the configuration names
+		// (`credential.helper`).
+		useHelpers   bool                                        = true
+		// An SSH client set up by the program (keys, known hosts, host key
+		// policy), not yet connected; none logs in with the SSH agent and
+		// the default keys in `~/.ssh`.
+		ssh          ?ssh.Client                                  = none
+		// The protocol version asked for: 2, or 0 for servers that answer
+		// version 2 wrongly.
+		protocol     int                                         = 2
+		// Strings passed to a protocol v2 server (`--server-option`).
+		serverOptions string[]                                   = []
+		// Receives the remote's progress messages.
+		progress     ?def (string)                                = none
+		// How long connecting and each exchange may take; 0s: no limit.
+		timeout      duration                                    = 0s
+	}
+
+	// The credential helpers the configuration names for `remote`, in
+	// order: `credential.helper` and `credential.<url>.helper` entries in
+	// the order they were read, an empty value clearing those before it.
+	internal def credentialHelpers(config Config, remote RemoteUrl) string[] {
+		let out string[] = []
+		let entries = config.entries + config.overrides
+		for let e in entries {
+			continue unless e.section == "credential" && e.key == "helper"
+			continue unless e.subsection == "" || credentialUrlMatches(e.subsection, remote)
+			let v = e.value
+			let value = v is none ?? ("", v)
+			if value == "" {
+				out.flush()
+			} else {
+				out.push(value)
+			}
+		}
+		return out
+	}
+
+	// Whether a `credential.<url>` subsection applies to the remote: the
+	// same scheme and host (a `*.` label matching one label), the same port,
+	// the same user when it names one, and a path it is a prefix of.
+	internal def credentialUrlMatches(pattern string, remote RemoteUrl) bool {
+		let p = parseRemoteUrl(pattern) onerror recover RemoteUrl{scheme: RemoteScheme.Local}
+		return false when p.scheme == RemoteScheme.Local || p.scheme != remote.scheme
+		return false unless hostMatches(p.host.lower(), remote.host.lower())
+		return false when p.port != remote.port
+		return false when p.user != "" && p.user != remote.user
+		let path = p.path
+		return true when path == "" || path == "/"
+		let want = path.endsWith("/") ?? (path, path + "/")
+		let have = remote.path.endsWith("/") ?? (remote.path, remote.path + "/")
+		return have.startsWith(want)
+	}
+
+	internal def hostMatches(pattern string, host string) bool {
+		let ps = pattern.split(".")
+		let hs = host.split(".")
+		return false when ps.len() != hs.len()
+		for let i = 0; i < ps.len(); i++ {
+			continue when ps[i] == "*"
+			return false when ps[i] != hs[i]
+		}
+		return true
+	}
+
+	// The fields of git's credential protocol for a request, ending in a
+	// blank line.
+	internal def credentialText(req CredentialRequest, creds ?Credentials) string {
+		let out = "protocol={req.protocol}\nhost={req.host}\n"
+		out += "path={req.path}\n" when req.path != ""
+		if !(creds is none) {
+			out += "username={creds.username}\npassword={creds.password.reveal()}\n"
+		} else if req.username != "" {
+			out += "username={req.username}\n"
+		}
+		return out + "\n"
+	}
+
+	// Reads `key=value` lines of the credential protocol.
+	internal def credentialFields(text string) map<string, string> {
+		let out map<string, string> = {}
+		for let line in text.split("\n") {
+			let eq = line.indexOf("=")
+			continue when eq <= 0
+			out[line.slice(0, eq)] = line.slice(eq + 1)
+		}
+		return out
+	}
+
+	// Runs one helper action (`get`, `store`, `erase`) with the request on
+	// its input and returns what it printed. `store` and its `--file`
+	// option are handled here; other helpers run as git runs them: `!cmd`
+	// through the shell, an absolute path as is, a bare name as
+	// `git-credential-<name>`.
+	internal def runCredentialHelper(helper string, action string, input string) !string {
+		let words = helper.split(" ").filter(w => w != "")
+		if !helper.startsWith("!") && words.len() > 0 && words[0] == "store" {
+			let files string[] = []
+			for let w in words[1:] {
+				files.push(try os.resolve(w.slice(7))) when w.startsWith("--file=")
+			}
+			return try credentialStore(files, action, input)
+		}
+		let command = helper
+		if helper.startsWith("!") {
+			command = helper.slice(1)
+		} else if !helper.startsWith("/") {
+			command = "git-credential-" + helper
+		}
+		let p = try Runtime.start("/bin/sh", ["-c", command + " " + action])
+		try p.input.write(input.bytes())
+		try p.input.close()
+		let out = try io.readAll(p.output)
+		let _ = try p.wait()
+		return string(out)
+	}
+
+	// git's `store` helper: `https://user:password@host/path` lines in
+	// `~/.git-credentials` (and `$XDG_CONFIG_HOME/git/credentials`), or in
+	// the `--file` given.
+	internal def credentialStore(given string[], action string, input string) !string {
+		let files = given.clone()
+		if files.len() == 0 {
+			files.push(try os.resolve("~/.git-credentials"))
+			let xdg = Runtime.getEnv("XDG_CONFIG_HOME")
+			let base = xdg is none || xdg == "" ?? (try os.resolve("~/.config"), xdg)
+			files.push(os.join(base, "git", "credentials"))
+		}
+		let fields = credentialFields(input)
+		let protocol = field(fields, "protocol")
+		let host = field(fields, "host")
+		let path = field(fields, "path")
+		let user = field(fields, "username")
+		switch action {
+			case "get":
+				for let f in files {
+					let text = string(os.readFile(f) onerror recover byte[])
+					for let line in text.split("\n") {
+						let entry = parseRemoteUrl(line.trim()) onerror recover RemoteUrl{scheme: RemoteScheme.Local}
+						continue when entry.scheme == RemoteScheme.Local
+						let (eu, ep) = storedLogin(line.trim())
+						continue unless storedMatches(entry, protocol, host, path) && (user == "" || eu == user)
+						return "username={eu}\npassword={ep}\n"
+					}
+				}
+				return ""
+			case "store", "erase":
+				let f = files[0]
+				let text = string(os.readFile(f) onerror recover byte[])
+				let kept string[] = []
+				for let line in text.split("\n") {
+					continue when line.trim() == ""
+					let entry = parseRemoteUrl(line.trim()) onerror recover RemoteUrl{scheme: RemoteScheme.Local}
+					let (eu, _) = storedLogin(line.trim())
+					let same = entry.scheme != RemoteScheme.Local && storedMatches(entry, protocol, host, path) && (user == "" || eu == user)
+					kept.push(line) unless same
+				}
+				if action == "store" {
+					let secret = field(fields, "password")
+					return "" when user == "" || secret == ""
+					let p = path == "" ?? ("", "/" + path)
+					kept.push("{protocol}://{url.escape(user)}:{url.escape(secret)}@{host}{p}")
+				}
+				let body = kept.join("\n")
+				body += "\n" when body != ""
+				try writeAtomically(f, body.bytes(), 0o600)
+				return ""
+		}
+		return ""
+	}
+
+	// The user and password of a stored `scheme://user:password@host` line.
+	internal def storedLogin(line string) (string, string) {
+		let start = line.indexOf("://")
+		return ("", "") when start < 0
+		let rest = line.slice(start + 3)
+		let at = rest.indexOf("@")
+		return ("", "") when at < 0
+		let login = rest.slice(0, at)
+		let colon = login.indexOf(":")
+		let user = colon < 0 ?? (login, login.slice(0, colon))
+		let secret = colon < 0 ?? ("", login.slice(colon + 1))
+		return (url.unescape(user) onerror recover user, url.unescape(secret) onerror recover secret)
+	}
+
+	internal def storedMatches(entry RemoteUrl, protocol string, host string, path string) bool {
+		let scheme = entry.scheme == RemoteScheme.Https ?? ("https", entry.scheme == RemoteScheme.Http ?? ("http", "ssh"))
+		return false when scheme != protocol
+		let hostPort = entry.port == 0 ?? (entry.host, "{entry.host}:{entry.port}")
+		return false when hostPort != host
+		let p = entry.path.trimStart("/")
+		return p == "" || p == path
+	}
+
+	// Credentials for an HTTP remote and what to do once they worked or
+	// failed: tells the helpers that gave or should keep them.
+	internal type CredentialSource {
+		internal options RemoteOptions
+		internal helpers string[]
+		internal request CredentialRequest
+		// The credentials in use and whether a helper or `ask` gave them.
+		internal current ?Credentials = none
+		internal fromHelper bool = false
+		internal asked bool = false
+		internal triedGiven bool = false
+
+		def new(options RemoteOptions, config Config, remote RemoteUrl) {
+			self.options = options
+			helpers = options.useHelpers ?? (credentialHelpers(config, remote), string[])
+			let useHttpPath = config.getBool("credential.useHttpPath", false) onerror recover false
+			let protocol = remote.scheme == RemoteScheme.Https ?? ("https", "http")
+			let hostPort = hostWithPort(remote)
+			let user = remote.user != "" ?? (remote.user, config.get("credential.username", ""))
+			request = CredentialRequest{protocol: protocol, host: hostPort, path: useHttpPath ?? (remote.path.trimStart("/"), ""), username: user}
+		}
+
+		// The next credentials to try after a refusal (or the first ones);
+		// none when there are no more. Fails when a helper or `ask` fails.
+		def next() !?Credentials {
+			if !(current is none) {
+				try reject()
+				request.refused = true
+			}
+			current = none
+			if !triedGiven {
+				triedGiven = true
+				let given = options.credentials
+				if !(given is none) {
+					current = given
+					return given
+				}
+				for let h in helpers {
+					let fields = credentialFields(try runCredentialHelper(h, "get", credentialText(request, none)))
+					break when field(fields, "quit") == "1" || field(fields, "quit") == "true"
+					let user = fields.hasKey("username") ?? (field(fields, "username"), request.username)
+					let secret = fields.get("password")
+					continue when secret is none
+					fromHelper = true
+					let c = Credentials{username: user, password: new Secret<string>(secret)}
+					current = c
+					return c
+				}
+			}
+			let ask = options.ask
+			return none when ask is none || asked
+			asked = true
+			fromHelper = false
+			let answer = try ask(request)
+			current = answer
+			return answer
+		}
+
+		// The credentials worked: helpers keep them (`store`).
+		def approve() !none {
+			let c = current
+			return none when c is none
+			for let h in helpers {
+				let _ = try runCredentialHelper(h, "store", credentialText(request, c))
+			}
+			return none
+		}
+
+		// The credentials were refused: helpers forget them (`erase`).
+		def reject() !none {
+			let c = current
+			return none when c is none
+			for let h in helpers {
+				let _ = try runCredentialHelper(h, "erase", credentialText(request, c))
+			}
+			return none
+		}
+	}
+
+	// ---- wires ---------------------------------------------------------------------
+
+	// A connection to a git service (`git-upload-pack` or
+	// `git-receive-pack`) on a remote.
+	internal interface Wire {
+		// Starts the service and returns the reader of its advertisement.
+		def advertise(program string, version int) !PktReader
+		// Sends a request. A stateful wire writes it and the advertisement's
+		// reader goes on with the answer; a stateless one (HTTP) sends it as a
+		// request of its own and returns the reader of its response.
+		def request(program string, body io.Reader) !PktReader
+		// Whether every request is answered on its own (HTTP): the server
+		// keeps nothing between them.
+		def stateless() bool
+		def close()
+	}
+
+	// The agent git sends (`agent=`) and the HTTP user agent.
+	internal const gitAgent = "git/adm.dev.git-0.1"
+
+	// Smart HTTP: `GET info/refs?service=` for the advertisement, a `POST` to
+	// the service for every request.
+	internal type HttpWire {
+		internal client  http.Client
+		internal base    string
+		internal version int = 2
+		internal creds   CredentialSource
+		internal options RemoteOptions
+		internal approved bool = false
+
+		def new(remote RemoteUrl, options RemoteOptions, config Config) {
+			self.options = options
+			client = new http.Client(timeout = options.timeout)
+			client.userAgent = gitAgent
+			client.redirects = new http.DefaultRedirects()
+			base = httpBase(remote)
+			creds = new CredentialSource(options, config, remote)
+			if remote.user != "" && options.credentials is none {
+				client.username = remote.user
+			}
+		}
+
+		def advertise(program string, version int) !PktReader {
+			self.version = version
+			let res = try send(http.Method.GET, "{base}/info/refs?service={program}", "", none)
+			// A redirect moves every later request too.
+			let asked = res.request
+			if !(asked is none) {
+				let final = asked.url.str()
+				let suffix = "/info/refs?service={program}"
+				base = final.slice(0, final.len() - suffix.len()) when final.endsWith(suffix)
+			}
+			let kind = res.headers.get("Content-Type")
+			fail "git: {base} is not a smart HTTP git server (dumb HTTP is not supported)" unless kind.startsWith("application/x-{program}-advertisement")
+			let reader = new PktReader(try responseBody(res))
+			// Version 0 and 1 answers start with `# service=<service>` and a flush.
+			let first = try reader.peek()
+			if first.kind == PktKind.Data && pktText(first).startsWith("# service=") {
+				let _ = try reader.read()
+				let flush = try reader.read()
+				fail "git: bad smart HTTP advertisement" unless flush.kind == PktKind.Flush
+			}
+			return reader
+		}
+
+		def request(program string, body io.Reader) !PktReader {
+			let data = try io.readAll(body)
+			let res = try send(http.Method.POST, "{base}/{program}", "application/x-{program}-request", data)
+			let kind = res.headers.get("Content-Type")
+			fail "git: {base}/{program} answered {kind}" unless kind.startsWith("application/x-{program}-result")
+			return new PktReader(try responseBody(res))
+		}
+
+		// Sends a request, logging in when the server asks.
+		internal def send(method http.Method, target string, contentType string, data ?byte[]) !http.Response {
+			for {
+				let req = try client.request(method, target)
+				if !(data is none) {
+					req.replaceBody(data)
+					req.headers.set("Content-Type", contentType)
+					req.headers.set("Accept", contentType.replace("-request", "-result"))
+				}
+				req.headers.set("Git-Protocol", "version={version}") when version != 0
+				let res = try client.do(req)
+				if res.status == 401 {
+					res.close() onerror recover none
+					let next = try creds.next()
+					fail "git: {base} refused the credentials (HTTP 401)" when next is none
+					client.username = next.username
+					client.password = next.password
+					continue
+				}
+				if res.status != 200 {
+					let text = res.text() onerror recover ""
+					fail "git: {target} answered HTTP {res.status}{text == "" ?? ("", ": " + text.trim())}"
+				}
+				if !approved {
+					approved = true
+					try creds.approve()
+				}
+				return res
+			}
+		}
+
+		internal def responseBody(res http.Response) !io.Reader {
+			let b = res.body
+			return new bytes.Reader([]) when b is none
+			return b
+		}
+
+		def stateless() bool {
+			return true
+		}
+
+		def close() {
+			client.closeIdle()
+		}
+	}
+
+	// SSH: the service runs as a command on the remote host, with
+	// `GIT_PROTOCOL` asking for the version.
+	internal type SshWire {
+		internal remote  RemoteUrl
+		internal client  ssh.Client
+		internal process ?ssh.Process = none
+		internal reader  ?PktReader   = none
+
+		def new(remote RemoteUrl, options RemoteOptions) {
+			self.remote = remote
+			let given = options.ssh
+			client = given is none ?? (new ssh.Client(), given)
+			client.timeout = options.timeout when options.timeout > 0s
+		}
+
+		def advertise(program string, version int) !PktReader {
+			client.environment["GIT_PROTOCOL"] = "version={version}" when version != 0
+			if client.keys.len() == 0 {
+				for let k in defaultSshKeys() {
+					client.keys.push(k)
+				}
+			}
+			let addr = hostWithPort(remote)
+			try client.connect(addr, remote.user)
+			let p = try client.start("{program} {shellQuote(remote.path)}")
+			process = p
+			let r = new PktReader(p)
+			reader = r
+			return r
+		}
+
+		def request(program string, body io.Reader) !PktReader {
+			let p = process
+			let r = reader
+			fail "git: the SSH connection is not open" when p is none || r is none
+			let _ = try io.copy(body, p)
+			return r
+		}
+
+		def stateless() bool {
+			return false
+		}
+
+		def close() {
+			let p = process
+			if !(p is none) {
+				p.closeInput() onerror recover none
+			}
+			client.close() onerror recover none
+		}
+	}
+
+	// The keys OpenSSH tries when none is configured: those of the default
+	// files in `~/.ssh` that load without a passphrase.
+	internal def defaultSshKeys() ssh.Signer[] {
+		let out ssh.Signer[] = []
+		for let name in string["id_ed25519", "id_ecdsa", "id_rsa"] {
+			let path = os.resolve("~/.ssh/" + name) onerror recover ""
+			continue when path == ""
+			let key = loadKeyOrNone(path) onerror recover none
+			out.push(key) unless key is none
+		}
+		return out
+	}
+
+	// The key in the file; none when it is missing.
+	internal def loadKeyOrNone(path string) !?ssh.PrivateKey {
+		return none unless try os.exists(path)
+		return try ssh.loadKey(path)
+	}
+}

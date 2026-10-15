@@ -1,0 +1,545 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// The prefixes a short reference name is tried under, in order (git's
+	// ref DWIM rules).
+	internal const refRules = string["{}", "refs/{}", "refs/tags/{}", "refs/heads/{}", "refs/remotes/{}", "refs/remotes/{}/HEAD"]
+
+	// ---- resolving a revision -------------------------------------------------
+
+	// The object a revision names, as `git rev-parse` reads it: a full or
+	// abbreviated id, `git describe` output, a reference (`main`,
+	// `origin/main`, `v1.0`, `HEAD`, `@`), a reflog entry (`main@{2}`,
+	// `@{yesterday}`, `@{-1}` the branch checked out before),
+	// `@{upstream}` and `@{push}`, then any of `^`, `^n`, `~n`, `^{}`,
+	// `^{commit}` (or tree, blob, tag, object) and `^{/regex}`; also
+	// `<rev>:<path>`, `:<path>` and `:<n>:<path>` in the index, and
+	// `:/regex` for the youngest commit whose message matches.
+	// Fails when the revision names nothing or is ambiguous.
+	internal def resolveRevision(repo Repository, rev string) !ObjectId {
+		fail "git: empty revision" when rev == ""
+		if rev.startsWith(":/") {
+			return try searchMessage(repo, rev.slice(2), try allRefTips(repo))
+		}
+		if rev.startsWith(":") {
+			return try indexPath(repo, rev.slice(1))
+		}
+		let colon = revisionColon(rev)
+		if colon >= 0 {
+			let base = try resolveRevision(repo, rev.slice(0, colon))
+			let path = rev.slice(colon + 1)
+			let t = try repo.tree(try repo.peel(base, ObjectKind.Tree))
+			return t.id when path == "" || path == "/"
+			let e = try t.find(path.startsWith("./") ?? (path.slice(2), path))
+			fail "git: path '{path}' does not exist in '{rev.slice(0, colon)}'" when e is none
+			return e.id
+		}
+		let opAt = revisionOperators(rev)
+		let id = try resolveBase(repo, rev.slice(0, opAt))
+		return try applyRevisionOperators(repo, id, rev.slice(opAt), rev)
+	}
+
+	// Where `<rev>:<path>` splits: the first `:` outside `@{...}` and
+	// `^{...}`, or -1.
+	internal def revisionColon(rev string) int {
+		let b = rev.bytes()
+		let depth = 0
+		for let i = 0; i < b.len(); i++ {
+			let c = b[i]
+			if c == 0x7B && i > 0 && (b[i - 1] == 0x40 || b[i - 1] == 0x5E) {
+				depth++
+			} else if c == 0x7D && depth > 0 {
+				depth--
+			} else if c == 0x3A && depth == 0 {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// Where the `^` and `~` operators start: the first of them outside
+	// `@{...}`, or the length.
+	internal def revisionOperators(rev string) int {
+		let b = rev.bytes()
+		let depth = 0
+		for let i = 0; i < b.len(); i++ {
+			let c = b[i]
+			if c == 0x7B && i > 0 && b[i - 1] == 0x40 {
+				depth++
+			} else if c == 0x7D && depth > 0 {
+				depth--
+			} else if depth == 0 && (c == 0x5E || c == 0x7E) {
+				return i
+			}
+		}
+		return b.len()
+	}
+
+	// Applies `^`, `^n`, `~n` and `^{...}` from left to right.
+	internal def applyRevisionOperators(repo Repository, start ObjectId, ops string, rev string) !ObjectId {
+		let id = start
+		let b = ops.bytes()
+		let i = 0
+		for i < b.len() {
+			let c = b[i]
+			i++
+			if c == 0x5E && i < b.len() && b[i] == 0x7B {
+				let close = indexByte(b, 0x7D, i, b.len())
+				// `^{/re}` may hold a `}`: it runs to the last brace.
+				let last = b.len() - 1
+				close = last when i + 1 < b.len() && b[i + 1] == 0x2F && b[last] == 0x7D
+				fail "git: bad revision '{rev}'" when close < 0
+				let inner = string(b[i + 1:close])
+				i = close + 1
+				id = try peelSpec(repo, id, inner, rev)
+				continue
+			}
+			let digitsAt = i
+			for i < b.len() && b[i] >= 0x30 && b[i] <= 0x39 {
+				i++
+			}
+			let digits = string(b[digitsAt:i])
+			let has = digits != ""
+			let n = has ?? (digits.toInt<int>(), 1)
+			if c == 0x7E {
+				for let k = 0; k < n; k++ {
+					let commit = try repo.commitAt(try repo.peel(id, ObjectKind.Commit))
+					fail "git: '{rev}': commit {commit.id.short()} has no parent" when commit.parents.len() == 0
+					id = commit.parents[0]
+				}
+				continue
+			}
+			let commit = try repo.commitAt(try repo.peel(id, ObjectKind.Commit))
+			if n == 0 {
+				id = commit.id
+				continue
+			}
+			fail "git: '{rev}': commit {commit.id.short()} has no parent {n}" when n > commit.parents.len()
+			id = commit.parents[n - 1]
+		}
+		return id
+	}
+
+	// `^{}`, `^{type}` or `^{/regex}` applied to an object.
+	internal def peelSpec(repo Repository, id ObjectId, spec string, rev string) !ObjectId {
+		switch spec {
+			case "":
+				let current = id
+				for {
+					let (kind, data) = try repo.objects.readRaw(current)
+					return current unless kind == ObjectKind.Tag
+					current = (try parseTag(current, data)).target
+				}
+				fail "unreachable"
+			case "commit":
+				return try repo.peel(id, ObjectKind.Commit)
+			case "tree":
+				return try repo.peel(id, ObjectKind.Tree)
+			case "blob":
+				return try repo.peel(id, ObjectKind.Blob)
+			case "tag":
+				return try repo.peel(id, ObjectKind.Tag)
+			case "object":
+				try repo.objects.info(id)
+				return id
+		}
+		if spec.startsWith("/") {
+			return try searchMessage(repo, spec.slice(1), [try repo.peel(id, ObjectKind.Commit)])
+		}
+		fail "git: bad revision '{rev}'"
+	}
+
+	// The youngest commit reachable from the starts whose message matches the
+	// pattern: a leading `!-` negates it, `!!` stands for a literal `!`.
+	// Fails when none does.
+	internal def searchMessage(repo Repository, pattern string, starts ObjectId[]) !ObjectId {
+		let negate = false
+		let text = pattern
+		if text.startsWith("!-") {
+			negate = true
+			text = text.slice(2)
+		} else if text.startsWith("!!") {
+			text = text.slice(1)
+		} else if text.startsWith("!") {
+			fail "git: unknown :/ modifier in '{pattern}'"
+		}
+		let program = new regex(text, "")
+		fail "git: invalid pattern in '{pattern}'" unless program.valid()
+		let walk = new RevWalk(repo)
+		for let s in starts {
+			try walk.push(s)
+		}
+		walk.order = WalkOrder.Date
+		for {
+			let c = try walk.next()
+			break when c is none
+			let hit = program.test(c.message)
+			return c.id when hit != negate
+		}
+		fail "git: no commit message matches '{pattern}'"
+	}
+
+	// The tips of every branch, tag and remote, and HEAD.
+	internal def allRefTips(repo Repository) !ObjectId[] {
+		let out ObjectId[] = []
+		let head = try repo.headId()
+		out.push(head) unless head is none
+		for let r in try repo.refs("refs/") {
+			let id = r.id
+			continue when id is none
+			let c = peelOrNone(repo, id, ObjectKind.Commit)
+			out.push(c) unless c is none
+		}
+		return out
+	}
+
+	// The object peeled to the kind, none when it does not peel to one.
+	internal def peelOrNone(repo Repository, id ObjectId, kind ObjectKind) ?ObjectId {
+		return tryPeel(repo, id, kind) onerror recover none
+	}
+
+	internal def tryPeel(repo Repository, id ObjectId, kind ObjectKind) !?ObjectId {
+		return try repo.peel(id, kind)
+	}
+
+	// `:<path>` or `:<n>:<path>`: the blob at the path in the index, stage
+	// n (0 unless given).
+	internal def indexPath(repo Repository, spec string) !ObjectId {
+		let stage = 0
+		let path = spec
+		let b = spec.bytes()
+		if b.len() >= 2 && b[0] >= 0x30 && b[0] <= 0x33 && b[1] == 0x3A {
+			stage = int(b[0] - 0x30)
+			path = spec.slice(2)
+		}
+		let idx = try repo.index()
+		let e = idx.entry(path, stage)
+		fail "git: path '{path}' is not in the index at stage {stage}" when e is none
+		return e.id
+	}
+
+	// The base of a revision, before `^` and `~`.
+	internal def resolveBase(repo Repository, base string) !ObjectId {
+		fail "git: empty revision" when base == ""
+		let at = base.indexOf("@\{")
+		if at >= 0 && base.endsWith("}") {
+			let name = base.slice(0, at)
+			let spec = base.slice(at + 2, base.len() - 1)
+			return try resolveReflogSpec(repo, name, spec, base)
+		}
+		let name = base == "@" ?? ("HEAD", base)
+		let hexLen = idLength(repo.format) * 2
+		if name.len() == hexLen && isHex(name) {
+			return try parseId(name)
+		}
+		let byRef = try dwimRef(repo, name)
+		return byRef unless byRef is none
+		if name.len() >= 4 && name.len() < hexLen && isHex(name) {
+			return try expandShortIdIn(repo, name)
+		}
+		// `git describe` output: `<tag>-<n>-g<abbrev>`.
+		let g = name.lastIndexOf("-g")
+		if g > 0 {
+			let abbrev = name.slice(g + 2)
+			if abbrev.len() >= 4 && isHex(abbrev) {
+				return try expandShortIdIn(repo, abbrev)
+			}
+		}
+		fail "git: ambiguous argument '{base}': unknown revision"
+	}
+
+	internal def isHex(text string) bool {
+		for let c in text.bytes() {
+			return false when hexValue(c) < 0
+		}
+		return text != ""
+	}
+
+	// The full reference a short name means, none when no rule matches.
+	internal def expandRefName(repo Repository, name string) !?string {
+		for let rule in refRules {
+			let full = rule.replace("\{\}", name)
+			continue unless validRefName(full, true)
+			let r = try repo.refStore.read(full)
+			return full unless r is none
+		}
+		return none
+	}
+
+	// The object a short reference name leads to, none when no rule
+	// matches.
+	internal def dwimRef(repo Repository, name string) !?ObjectId {
+		let full = try expandRefName(repo, name)
+		return none when full is none
+		return try repo.refTarget(full)
+	}
+
+	// The object whose id starts with the hex digits. Fails when none or
+	// more than one does.
+	internal def expandShortIdIn(repo Repository, prefix string) !ObjectId {
+		let found = try objectsWithPrefix(repo, prefix, 2)
+		fail "git: no object starts with {prefix}" when found.len() == 0
+		fail "git: short object id {prefix} is ambiguous" when found.len() > 1
+		return found[0]
+	}
+
+	// Up to `limit` ids that start with the hex digits, from packs and loose
+	// repo.objects.
+	internal def objectsWithPrefix(repo Repository, prefix string, limit int) !ObjectId[] {
+		let text = prefix.lower()
+		let nibbles = text.len()
+		let packed byte[] = []
+		for let i = 0; i < nibbles; i += 2 {
+			let hi = hexValue(text.bytes()[i])
+			let lo = i + 1 < nibbles ?? (hexValue(text.bytes()[i + 1]), 0)
+			packed.push(byte(hi << 4 | lo))
+		}
+		let seen map<string, bool> = {}
+		let out ObjectId[] = []
+		try collectWithPrefix(repo.objects, packed, nibbles, text, limit, seen, out)
+		return out
+	}
+
+	internal def collectWithPrefix(db ObjectDatabase, packed byte[], nibbles int, text string, limit int, seen map<string, bool>, out ObjectId[]) !none {
+		for let p in db.packs {
+			for let id in p.findPrefix(packed, nibbles, limit + 1) {
+				let key = id.str()
+				continue when seen.hasKey(key)
+				seen[key] = true
+				out.push(id)
+			}
+		}
+		let folder = os.join(db.dir, text.slice(0, 2))
+		if text.len() >= 2 && (os.exists(folder) onerror recover false) {
+			for let e in try os.readDir(folder) {
+				let key = text.slice(0, 2) + e.info.name
+				continue unless key.len() == idLength(db.format) * 2 && key.startsWith(text) && !seen.hasKey(key)
+				seen[key] = true
+				out.push(try parseId(key))
+			}
+		}
+		for let a in db.alternates {
+			try collectWithPrefix(a, packed, nibbles, text, limit, seen, out)
+		}
+		return none
+	}
+
+	// `<name>@{<spec>}`: a reflog entry by number or date, the n-th branch
+	// checked out before (`@{-n}`), or the upstream or push branch.
+	internal def resolveReflogSpec(repo Repository, name string, spec string, rev string) !ObjectId {
+		let lower = spec.lower()
+		if lower := "u" || "upstream" || "push" {
+			let branch = name == "" ?? (try repo.branch(), try shortBranchName(name))
+			fail "git: HEAD does not point to a branch" when branch == ""
+			let target = lower == "push" ?? (try pushRef(repo, branch), try upstreamRef(repo, branch))
+			fail "git: no {lower} configured for branch '{branch}'" when target == ""
+			let id = try repo.refTarget(target)
+			fail "git: {target} does not exist" when id is none
+			return id
+		}
+		if spec.startsWith("-") && name == "" {
+			let n = spec.slice(1)
+			fail "git: bad revision '{rev}'" unless n.isNumeric()
+			let previous = try previousBranch(repo, n.toInt<int>())
+			fail "git: '{rev}' needs {n} branch switches in the HEAD reflog" when previous == ""
+			return try resolveRevision(repo, previous)
+		}
+		// With no name, a reflog spec reads the current branch's log.
+		let refName = name
+		if refName == "" {
+			let current = try repo.headRef()
+			refName = current == "" ?? ("HEAD", current)
+		} else {
+			let full = try expandRefName(repo, refName)
+			fail "git: unknown reference '{name}'" when full is none
+			refName = full
+		}
+		let log = try repo.reflog(refName)
+		if spec.isNumeric() {
+			let n = spec.toInt<int>()
+			fail "git: log for '{refName}' only has {log.len()} entries" when n >= log.len() && !(n == log.len() && log.len() > 0)
+			if n == log.len() {
+				return log[0].oldId
+			}
+			return log[log.len() - 1 - n].newId
+		}
+		let when0 = try parseApproxDate(spec)
+		fail "git: log for '{refName}' is empty" when log.len() == 0
+		for let i = log.len() - 1; i >= 0; i-- {
+			return log[i].newId unless log[i].who.date.after(when0)
+		}
+		return log[0].oldId
+	}
+
+	// `main` for `main` or `refs/heads/main`.
+	internal def shortBranchName(name string) !string {
+		return name.slice(11) when name.startsWith("refs/heads/")
+		return name
+	}
+
+	// The branch the n-th `checkout: moving from A to B` line of HEAD's log
+	// left, counting back from the latest; empty when there are fewer.
+	internal def previousBranch(repo Repository, n int) !string {
+		let log = try repo.reflog("HEAD")
+		let seen = 0
+		for let i = log.len() - 1; i >= 0; i-- {
+			let m = log[i].message
+			continue unless m.startsWith("checkout: moving from ")
+			seen++
+			if seen == n {
+				let rest = m.slice("checkout: moving from ".len())
+				let to = rest.indexOf(" to ")
+				return to < 0 ?? (rest, rest.slice(0, to))
+			}
+		}
+		return ""
+	}
+
+	// The remote-tracking reference a branch merges from
+	// (`branch.<name>.remote` and `.merge`), empty without one.
+	internal def upstreamRef(repo Repository, branch string) !string {
+		let remote = repo.config.get("branch.{branch}.remote", "")
+		let merge = repo.config.get("branch.{branch}.merge", "")
+		return "" when remote == "" || merge == ""
+		return merge when remote == "."
+		let spec = try remoteFetchTarget(repo, remote, merge)
+		return spec
+	}
+
+	// The remote-tracking reference a push of the branch updates
+	// (`branch.<name>.pushRemote`, `remote.pushDefault`, `push.default`),
+	// empty without one.
+	internal def pushRef(repo Repository, branch string) !string {
+		let remote = repo.config.get("branch.{branch}.pushremote", repo.config.get("remote.pushdefault", repo.config.get("branch.{branch}.remote", "")))
+		return "" when remote == ""
+		let mode = repo.config.get("push.default", "simple").lower()
+		let target = "refs/heads/{branch}"
+		if mode := "upstream" || "tracking" {
+			let merge = repo.config.get("branch.{branch}.merge", "")
+			return "" when merge == ""
+			target = merge
+		}
+		return "" when mode == "nothing"
+		return try remoteFetchTarget(repo, remote, target)
+	}
+
+	// Where the remote's fetch refspecs put a reference of the remote.
+	internal def remoteFetchTarget(repo Repository, remote string, ref string) !string {
+		for let raw in repo.config.all("remote.{remote}.fetch") {
+			let spec = try parseRefspec(raw)
+			let mapped = mapSource(spec, ref)
+			return mapped unless mapped is none
+		}
+		return ""
+	}
+
+	// ---- dates ------------------------------------------------------------------
+
+	// A date as reflog specs write it: `2026-01-02`, `2026-01-02 10:30`,
+	// `2026-01-02T10:30:00Z`, `@<seconds>`, `now`, `yesterday`, `today`,
+	// `noon`, `midnight`, or amounts back from now (`2 weeks ago`, `1 month
+	// 2 days 3 hours ago`, `5.minutes.ago`). Fails on anything else.
+	def parseApproxDate(text string) !time.Time {
+		let t = text.trim().lower().replace(".", " ").replace("_", " ")
+		let now = time.now()
+		if t.startsWith("@") && t.slice(1).isNumeric() {
+			return time.fromUnixNs(t.slice(1).toInt<int64>() * 1000000000)
+		}
+		let iso = timeOrNone(text.trim())
+		return iso unless iso is none
+		let dated = parseDayAndTime(text.trim())
+		return dated unless dated is none
+		let words = t.split(" ").filter(w => w != "")
+		fail "git: invalid date '{text}'" when words.len() == 0
+		let at = now
+		let i = 0
+		let any = false
+		for i < words.len() {
+			let w = words[i]
+			switch w {
+				case "now":
+					i++
+					any = true
+					continue
+				case "ago":
+					i++
+					continue
+				case "yesterday":
+					at = at - 24h
+					i++
+					any = true
+					continue
+				case "today":
+					i++
+					any = true
+					continue
+				case "midnight":
+					at = time.fromUnixNs((at.unixNs() / 86400000000000) * 86400000000000)
+					i++
+					any = true
+					continue
+				case "noon":
+					at = time.fromUnixNs((at.unixNs() / 86400000000000) * 86400000000000 + 43200000000000)
+					i++
+					any = true
+					continue
+			}
+			fail "git: invalid date '{text}'" unless w.isNumeric() && i + 1 < words.len()
+			let n = w.toInt<int64>()
+			let unit = words[i + 1]
+			unit = unit.slice(0, unit.len() - 1) when unit.endsWith("s") && unit.len() > 1
+			let seconds = int64(0)
+			switch unit {
+				case "second", "sec":
+					seconds = 1
+				case "minute", "min":
+					seconds = 60
+				case "hour":
+					seconds = 3600
+				case "day":
+					seconds = 86400
+				case "week":
+					seconds = 7 * 86400
+				case "month":
+					seconds = 30 * 86400
+				case "year":
+					seconds = 365 * 86400
+				default:
+					fail "git: invalid date '{text}'"
+			}
+			at = at - duration(n * seconds * 1000000000)
+			any = true
+			i += 2
+		}
+		fail "git: invalid date '{text}'" unless any
+		return at
+	}
+
+	// An RFC 3339 time, none when the text is not one.
+	internal def timeOrNone(text string) ?time.Time {
+		return tryTime(text) onerror recover none
+	}
+
+	internal def tryTime(text string) !?time.Time {
+		return try time.parse(text)
+	}
+
+	// `YYYY-MM-DD` with an optional `HH:MM[:SS]` after a space, in UTC; none
+	// for anything else.
+	internal def parseDayAndTime(text string) ?time.Time {
+		let parts = text.split(" ").filter(p => p != "")
+		return none when parts.len() == 0 || parts.len() > 2
+		let day = parts[0].split("-")
+		return none unless day.len() == 3 && day[0].isNumeric() && day[1].isNumeric() && day[2].isNumeric()
+		let clock = parts.len() == 2 ?? (parts[1], "00:00:00")
+		let hms = clock.split(":")
+		return none unless hms.len() >= 2 && hms.len() <= 3
+		let full = hms.len() == 2 ?? (clock + ":00", clock)
+		let stamp = "{day[0]}-{"%02d".format(day[1].toInt<int>())}-{"%02d".format(day[2].toInt<int>())}T{full}Z"
+		let t = timeOrNone(stamp)
+		return t
+	}
+}

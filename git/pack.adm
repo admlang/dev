@@ -1,0 +1,475 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.services.storage::(MapAccess)
+		std.data.compress.zlib
+	)
+
+	// Pack entry types beyond the four object kinds: a delta against the
+	// object a negative offset back in the same pack, or against an object
+	// named by id.
+	internal const (
+		packOfsDelta = 6
+		packRefDelta = 7
+	)
+
+	// The bytes of the delta-base cache a pack keeps, as git's
+	// core.deltaBaseCacheLimit.
+	internal const deltaBaseCacheLimit = 96 * 1024 * 1024
+
+	// A big-endian uint32 at `at`.
+	internal def be32(data byte[], at int) int {
+		return (int(data[at]) << 24) | (int(data[at + 1]) << 16) | (int(data[at + 2]) << 8) | int(data[at + 3])
+	}
+
+	// A big-endian uint64 at `at`.
+	internal def be64(data byte[], at int) int64 {
+		return (int64(be32(data, at)) << 32) | int64(be32(data, at + 4))
+	}
+
+	// An object a pack holds, resolved: its kind and content.
+	internal struct PackedObject {
+		kind ObjectKind
+		data byte[]
+	}
+
+	// One packfile and its index, both mapped.
+	internal type Pack {
+		// The path of the .pack file.
+		path       string
+		format     ObjectFormat
+		hashLen    int
+		data       byte[]
+		idx        byte[]
+		count      int
+		idxVersion int
+		// Where the id table, the CRC table, the 32-bit offsets and the
+		// 64-bit offsets start in idx.
+		idsAt      int
+		crcsAt     int
+		offsetsAt  int
+		largeAt    int
+		maps       os.Mapping[]   = []
+		cache      map<int, PackedObject> = {}
+		cacheOrder int[]          = []
+		cacheBytes int            = 0
+		// Position in the index of each object by pack order, built the first
+		// time a caller needs to go from an offset to an id.
+		revIndex   int[]          = []
+
+		def new(path string, format ObjectFormat) {
+			self.path = path
+			self.format = format
+			hashLen = idLength(format)
+		}
+
+		def close() {
+			for let m in maps {
+				m.close()
+			}
+			maps = []
+		}
+
+		def dispose() {
+			close()
+		}
+
+		// The id of the n-th object in index order.
+		def idAt(n int) ObjectId {
+			// A version 1 entry is the offset, then the id.
+			let at = idxVersion == 1 ?? (idsAt + n * (hashLen + 4) + 4, idsAt + n * hashLen)
+			return new ObjectId(idx[at:at + hashLen].clone())
+		}
+
+		// The pack offset of the n-th object in index order.
+		def offsetAt(n int) int {
+			if idxVersion == 1 {
+				return be32(idx, 256 * 4 + n * (hashLen + 4))
+			}
+			let v = be32(idx, offsetsAt + n * 4)
+			return v when (v & 0x80000000) == 0
+			return int(be64(idx, largeAt + (v & 0x7FFFFFFF) * 8))
+		}
+
+		// The CRC-32 of the n-th object's packed bytes; 0 in a version 1 index,
+		// which has none.
+		def crcAt(n int) int {
+			return 0 when idxVersion == 1
+			return be32(idx, crcsAt + n * 4)
+		}
+
+		// The index position of the object, or -1 when the pack does not hold it.
+		def find(id byte[]) int {
+			let first = int(id[0])
+			let lo = first == 0 ?? (0, be32(idx, fanoutAt() + (first - 1) * 4))
+			let hi = be32(idx, fanoutAt() + first * 4)
+			let stride = idxVersion == 1 ?? (hashLen + 4, hashLen)
+			let skip = idxVersion == 1 ?? (4, 0)
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let c = compareIdBytes(idx, idsAt + mid * stride + skip, id, 0, hashLen)
+				return mid when c == 0
+				if c < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return -1
+		}
+
+		// The index positions from `lo` of the objects whose id starts with
+		// the `nibbles` hex digits in prefix (half bytes packed high first).
+		def findPrefix(prefix byte[], nibbles int, limit int) ObjectId[] {
+			let found ObjectId[] = []
+			let first = int(prefix[0])
+			let firstHi = nibbles == 1 ?? (first | 0x0F, first)
+			let lo = first == 0 ?? (0, be32(idx, fanoutAt() + (first - 1) * 4))
+			let hi = be32(idx, fanoutAt() + firstHi * 4)
+			let stride = idxVersion == 1 ?? (hashLen + 4, hashLen)
+			let skip = idxVersion == 1 ?? (4, 0)
+			// Binary search to the first id not below the prefix.
+			let a = lo
+			let b = hi
+			for a < b {
+				let mid = (a + b) / 2
+				if comparePrefix(idx, idsAt + mid * stride + skip, prefix, nibbles) < 0 {
+					a = mid + 1
+				} else {
+					b = mid
+				}
+			}
+			for let i = a; i < hi && found.len() < limit; i++ {
+				break when comparePrefix(idx, idsAt + i * stride + skip, prefix, nibbles) != 0
+				found.push(idAt(i))
+			}
+			return found
+		}
+
+		def fanoutAt() int {
+			return idxVersion == 1 ?? (0, 8)
+		}
+
+		// Maps the index and the pack and checks their headers. Fails when
+		// either is missing or malformed.
+		def load() !none {
+			let idxPath = path.slice(0, path.len() - 5) + ".idx"
+			let im = try os.mapFile(idxPath, MapAccess.Copy)
+			maps.push(im)
+			idx = try im.pages(0, im.length())
+			fail "git: {idxPath} is too short" when idx.len() < 1024 + 2 * hashLen
+			if idx[0] == 0xFF && idx[1] == 0x74 && idx[2] == 0x4F && idx[3] == 0x63 {
+				idxVersion = be32(idx, 4)
+				fail "git: {idxPath} has unsupported version {idxVersion}" unless idxVersion == 2
+				count = be32(idx, 8 + 255 * 4)
+				idsAt = 8 + 1024
+				crcsAt = idsAt + count * hashLen
+				offsetsAt = crcsAt + count * 4
+				largeAt = offsetsAt + count * 4
+				fail "git: {idxPath} is truncated" when largeAt + 2 * hashLen > idx.len()
+			} else {
+				idxVersion = 1
+				count = be32(idx, 255 * 4)
+				idsAt = 1024
+				fail "git: {idxPath} is truncated" when idsAt + count * (hashLen + 4) + 2 * hashLen > idx.len()
+			}
+			let pm = try os.mapFile(path, MapAccess.Copy)
+			maps.push(pm)
+			data = try pm.pages(0, pm.length())
+			fail "git: {path} is not a packfile" when data.len() < 12 + hashLen || string(data[0:4]) != "PACK"
+			let version = be32(data, 4)
+			fail "git: {path} has unsupported version {version}" unless version == 2 || version == 3
+			fail "git: {path} does not match its index" when be32(data, 8) != count
+			return none
+		}
+
+		// Reads the object at a pack offset, applying its deltas; `odb`
+		// resolves a delta's base that this pack does not hold (a thin pack
+		// being completed). Fails when the pack is corrupt.
+		def readAt(offset int, odb ?ObjectDatabase = none) !PackedObject {
+			let cached = cache.get(offset)
+			return cached unless cached is none
+			// Walk the chain down to a base that is whole or cached, keeping
+			// each delta's offset, then apply the deltas from the bottom up,
+			// caching each result that is the base of the next.
+			let chain int[] = []
+			let at = offset
+			let base ?PackedObject = none
+			for {
+				if at != offset {
+					let hit = cache.get(at)
+					if !(hit is none) {
+						base = hit
+						break
+					}
+				}
+				let (kind, size, dataAt) = try entryHeader(at)
+				if kind >= 1 && kind <= 4 {
+					let (raw, _) = try zlib.inflate(data, dataAt, size)
+					fail "git: corrupt object at {at} in {path}" when raw.len() != size
+					let whole = PackedObject{kind: ObjectKind(kind), data: raw}
+					remember(at, whole) when chain.len() > 0
+					base = whole
+					break
+				}
+				chain.push(at)
+				if kind == packOfsDelta {
+					let (back, _) = ofsDeltaDistance(dataAt)
+					fail "git: corrupt delta at {at} in {path}" when back <= 0 || back > at
+					at = at - back
+					continue
+				}
+				fail "git: corrupt object at {at} in {path}" unless kind == packRefDelta
+				let baseId = data[dataAt:dataAt + hashLen].clone()
+				let n = find(baseId)
+				if n >= 0 {
+					at = offsetAt(n)
+					continue
+				}
+				fail "git: delta base {new ObjectId(baseId).str()} is missing" when odb is none
+				let (bk, bd) = try odb.readRaw(new ObjectId(baseId))
+				base = PackedObject{kind: bk, data: bd}
+				break
+			}
+			fail "git: corrupt object at {offset} in {path}" when base is none
+			let result PackedObject = base
+			for let i = chain.len() - 1; i >= 0; i-- {
+				let delta = try deltaData(chain[i])
+				result = PackedObject{kind: result.kind, data: try applyDelta(result.data, delta)}
+				remember(chain[i], result) when i > 0
+			}
+			return result
+		}
+
+		// The inflated delta of the delta entry at `at`.
+		def deltaData(at int) !byte[] {
+			let (kind, size, dataAt) = try entryHeader(at)
+			let deltaAt = dataAt + hashLen
+			if kind == packOfsDelta {
+				let (_, p) = ofsDeltaDistance(dataAt)
+				deltaAt = p
+			}
+			let (delta, _) = try zlib.inflate(data, deltaAt, size)
+			fail "git: corrupt delta at {at} in {path}" when delta.len() != size
+			return delta
+		}
+
+		// Keeps a resolved object in the delta-base cache, dropping the oldest
+		// entries beyond the limit.
+		def remember(offset int, object PackedObject) {
+			return when object.data.len() > deltaBaseCacheLimit / 4 || cache.hasKey(offset)
+			cache[offset] = object
+			cacheOrder.push(offset)
+			cacheBytes += object.data.len()
+			for cacheBytes > deltaBaseCacheLimit && cacheOrder.len() > 0 {
+				let old = cacheOrder.shift()
+				let gone = cache.get(old)
+				if !(gone is none) {
+					cacheBytes -= gone.data.len()
+					cache.delete(old)
+				}
+			}
+		}
+
+		// The entry type, its size (the object's, or the delta data's) and
+		// where what follows the header starts.
+		def entryHeader(at int) !(int, int, int) {
+			fail "git: offset {at} is outside {path}" when at < 12 || at >= data.len() - hashLen
+			let c = int(data[at])
+			let kind = (c >> 4) & 7
+			let size = c & 15
+			let shift = 4
+			let p = at + 1
+			for (c & 0x80) != 0 {
+				c = int(data[p])
+				p++
+				size += (c & 0x7F) << shift
+				shift += 7
+			}
+			return (kind, size, p)
+		}
+
+		// An OFS_DELTA's distance back to its base, and where the delta data
+		// starts.
+		def ofsDeltaDistance(at int) (int, int) {
+			let p = at
+			let c = int(data[p])
+			p++
+			let back = c & 0x7F
+			for (c & 0x80) != 0 {
+				c = int(data[p])
+				p++
+				back = ((back + 1) << 7) | (c & 0x7F)
+			}
+			return (back, p)
+		}
+
+		// The kind and size of the object at an offset: from the entry header
+		// for a whole object; for a delta, the base's kind (following the
+		// chain's headers) and the size the delta's own header gives.
+		def infoAt(offset int, odb ?ObjectDatabase = none) !(ObjectKind, int) {
+			let (kind, size, _) = try entryHeader(offset)
+			return (ObjectKind(kind), size) when kind >= 1 && kind <= 4
+			let delta = try deltaData(offset)
+			let (_, p1) = deltaVarint(delta, 0)
+			let (target, _) = deltaVarint(delta, p1)
+			let at = offset
+			for {
+				let (k, _, d) = try entryHeader(at)
+				return (ObjectKind(k), target) when k >= 1 && k <= 4
+				if k == packOfsDelta {
+					let (back, _) = ofsDeltaDistance(d)
+					fail "git: corrupt delta at {at} in {path}" when back <= 0 || back > at
+					at = at - back
+					continue
+				}
+				fail "git: corrupt object at {at} in {path}" unless k == packRefDelta
+				let baseId = data[d:d + hashLen].clone()
+				let n = find(baseId)
+				if n < 0 {
+					fail "git: delta base {new ObjectId(baseId).str()} is missing" when odb is none
+					let (bk, _) = try odb.info(new ObjectId(baseId))
+					return (bk, target)
+				}
+				at = offsetAt(n)
+			}
+			fail "unreachable"
+		}
+
+		// Where the entry at an offset ends: at the next entry, or at the
+		// pack's checksum.
+		def entryEnd(offset int) int {
+			let order = reverse()
+			let lo = 0
+			let hi = order.len()
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				if offsetAt(order[mid]) <= offset {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return lo < order.len() ?? (offsetAt(order[lo]), data.len() - hashLen)
+		}
+
+		// The index position of the entry at an offset, or -1.
+		def positionOfOffset(offset int) int {
+			let order = reverse()
+			let lo = 0
+			let hi = order.len()
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let o = offsetAt(order[mid])
+				return order[mid] when o == offset
+				if o < offset {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return -1
+		}
+
+		// Positions in index order of the objects sorted by pack offset.
+		def reverse() int[] {
+			return revIndex when revIndex.len() == count
+			let order int[]
+			order.len(count)
+			for let i = 0; i < count; i++ {
+				order[i] = i
+			}
+			let offsets int[]
+			offsets.len(count)
+			for let i = 0; i < count; i++ {
+				offsets[i] = offsetAt(i)
+			}
+			order.sort((a, b) => offsets[a] < offsets[b] ?? (-1, offsets[a] > offsets[b] ?? (1, 0)))
+			revIndex = order
+			return order
+		}
+	}
+
+	// Compares the id at `at` with a prefix of `nibbles` hex digits: -1, 0
+	// when the id starts with it, or 1.
+	internal def comparePrefix(data byte[], at int, prefix byte[], nibbles int) int {
+		let whole = nibbles / 2
+		let c = compareIdBytes(data, at, prefix, 0, whole)
+		return c when c != 0 || nibbles % 2 == 0
+		let x = data[at + whole] & 0xF0
+		let y = prefix[whole] & 0xF0
+		return 0 when x == y
+		return x < y ?? (-1, 1)
+	}
+
+	// A delta header's size varint at `at`, and where it ends.
+	internal def deltaVarint(delta byte[], at int) (int, int) {
+		let size = 0
+		let shift = 0
+		let p = at
+		for p < delta.len() {
+			let c = int(delta[p])
+			p++
+			size |= (c & 0x7F) << shift
+			shift += 7
+			break when (c & 0x80) == 0
+		}
+		return (size, p)
+	}
+
+	// Rebuilds an object from its base and a git delta: the base's and the
+	// result's sizes, then instructions that copy a range of the base or
+	// insert literal bytes. Fails when the delta does not fit the base.
+	internal def applyDelta(base byte[], delta byte[]) !byte[] {
+		let (baseSize, p1) = deltaVarint(delta, 0)
+		let (size, p2) = deltaVarint(delta, p1)
+		fail "git: delta does not fit its base" when baseSize != base.len()
+		let out byte[]
+		out.len(size)
+		let o = 0
+		let p = p2
+		let n = delta.len()
+		for p < n {
+			let op = int(delta[p])
+			p++
+			if (op & 0x80) != 0 {
+				let off = 0
+				let length = 0
+				for let bit = 0; bit < 4; bit++ {
+					if (op & (1 << bit)) != 0 {
+						fail "git: truncated delta" when p >= n
+						off |= int(delta[p]) << (bit * 8)
+						p++
+					}
+				}
+				for let bit = 0; bit < 3; bit++ {
+					if (op & (0x10 << bit)) != 0 {
+						fail "git: truncated delta" when p >= n
+						length |= int(delta[p]) << (bit * 8)
+						p++
+					}
+				}
+				length = 0x10000 when length == 0
+				fail "git: delta copies outside its base" when off + length > base.len() || o + length > size
+				if length < 32 {
+					for let k = 0; k < length; k++ {
+						out[o + k] = base[off + k]
+					}
+				} else {
+					base[off:off + length].copy(out[o:o + length])
+				}
+				o += length
+			} else {
+				fail "git: delta has a zero instruction" when op == 0
+				fail "git: delta inserts past its end" when p + op > n || o + op > size
+				for let k = 0; k < op; k++ {
+					out[o + k] = delta[p + k]
+				}
+				p += op
+				o += op
+			}
+		}
+		fail "git: delta result is {o} bytes, not {size}" when o != size
+		return out
+	}
+}

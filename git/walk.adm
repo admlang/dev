@@ -1,0 +1,602 @@
+partial module adm.dev.git {
+	use std.time
+
+	// The order a RevWalk returns commits in.
+	enum WalkOrder {
+		// Newest commit time first, as `git log` shows them.
+		Date,
+		// Parents after all their children, without interleaving lines of
+		// history (`--topo-order`).
+		Topological,
+		// Parents after all their children, otherwise by date
+		// (`--date-order`).
+		DateTopological
+	}
+
+	// What a walk knows about a commit before reading the whole object: from
+	// the commit-graph when there is one.
+	internal type WalkNode {
+		id         ObjectId
+		parents    ObjectId[]
+		tree       ObjectId
+		time       int64
+		generation int64 = 0
+		// Reached from a hidden commit.
+		hidden     bool  = false
+		// Already queued.
+		seen       bool  = false
+		// Leaves the walk's paths as a parent had them.
+		treesame   bool  = false
+		// Output already, or dropped by history simplification.
+		done       bool  = false
+		// Merge-base painting: reached from one side, the other, or as a
+		// common ancestor that no longer leads to a best base.
+		flags      int   = 0
+		graph      ?GraphCommit = none
+
+		def new(id ObjectId, parents ObjectId[], tree ObjectId, time int64) {
+			self.id = id
+			self.parents = parents
+			self.tree = tree
+			self.time = time
+		}
+	}
+
+	// A max-heap of walk nodes by commit time, newest first; equal times
+	// come out in the order they went in.
+	internal type NodeQueue {
+		items WalkNode[] = []
+		order int64[]    = []
+		next  int64      = 0
+
+		def new() {}
+
+		def len() int {
+			return items.len()
+		}
+
+		def before(i int, j int) bool {
+			let a = items[i]
+			let b = items[j]
+			return a.time > b.time when a.time != b.time
+			return order[i] < order[j]
+		}
+
+		def swap(i int, j int) {
+			let t = items[i]
+			items[i] = items[j]
+			items[j] = t
+			let o = order[i]
+			order[i] = order[j]
+			order[j] = o
+		}
+
+		def push(n WalkNode) {
+			items.push(n)
+			order.push(next)
+			next++
+			let i = items.len() - 1
+			for i > 0 {
+				let parent = (i - 1) / 2
+				break unless before(i, parent)
+				swap(i, parent)
+				i = parent
+			}
+		}
+
+		def pop() WalkNode {
+			let top = items[0]
+			let last = items.len() - 1
+			swap(0, last)
+			items.pop()
+			order.pop()
+			let i = 0
+			let n = items.len()
+			for {
+				let l = 2 * i + 1
+				let r = l + 1
+				let best = i
+				best = l when l < n && before(l, best)
+				best = r when r < n && before(r, best)
+				break when best == i
+				swap(i, best)
+				i = best
+			}
+			return top
+		}
+	}
+
+	// RevWalk lists commits reachable from the commits pushed and not from
+	// those hidden, as `git rev-list` and `git log` do.
+	//
+	// ```
+	// let walk = new git.RevWalk(repo)
+	// try walk.push(try repo.resolve("main"))
+	// try walk.hide(try repo.resolve("v1.0"))
+	// for let c = try walk.next(); !(c is none); c = try walk.next() {
+	// 	print(c.summary)
+	// }
+	// ```
+	type RevWalk {
+		repo        Repository
+		order       WalkOrder = WalkOrder.Date
+		// Oldest first, after ordering.
+		reverse     bool      = false
+		// Follow only the first parent of merges.
+		firstParent bool      = false
+		// Leave out merges, or everything but merges.
+		noMerges    bool      = false
+		onlyMerges  bool      = false
+		// Only commits that change one of these paths (git's default history
+		// simplification): pathspecs as `git log -- <paths>` takes them.
+		paths       string[]  = []
+		// Only commits made after or before these instants.
+		since       ?time.Time = none
+		until       ?time.Time = none
+		internal nodes   map<string, WalkNode> = {}
+		internal queue   NodeQueue             = new NodeQueue()
+		internal started bool                  = false
+		internal limited WalkNode[]            = []
+		internal limitedAt int                 = 0
+		internal anyHidden bool                = false
+		internal pathspec ?Pathspec            = none
+
+		def new(repo Repository) {
+			self.repo = repo
+		}
+
+		// Starts the walk at the commit (a tag is peeled). Fails when it is
+		// not a commit.
+		def push(id ObjectId) !none {
+			let n = try node(try repo.peel(id, ObjectKind.Commit))
+			queueNode(n)
+			return none
+		}
+
+		// Leaves out the commit and everything reachable from it. Fails when
+		// it is not a commit.
+		def hide(id ObjectId) !none {
+			let n = try node(try repo.peel(id, ObjectKind.Commit))
+			n.hidden = true
+			anyHidden = true
+			queueNode(n)
+			return none
+		}
+
+		// Pushes and hides what a range names: `a..b` (b without a), `a...b`
+		// (either but not both), `^a`, `b^@` (b's parents), `b^!` (b without
+		// its parents), `b^-n` (b without its n-th parent), or one revision.
+		// Fails when a revision names nothing.
+		def pushRange(spec string) !none {
+			if spec.startsWith("^") {
+				try hide(try repo.resolve(spec.slice(1)))
+				return none
+			}
+			let three = spec.indexOf("...")
+			if three >= 0 {
+				let a = try repo.resolve(three == 0 ?? ("HEAD", spec.slice(0, three)))
+				let rest = spec.slice(three + 3)
+				let b = try repo.resolve(rest == "" ?? ("HEAD", rest))
+				try push(a)
+				try push(b)
+				for let base in try mergeBases(repo, a, b) {
+					try hide(base)
+				}
+				return none
+			}
+			let two = spec.indexOf("..")
+			if two >= 0 {
+				let left = spec.slice(0, two)
+				let right = spec.slice(two + 2)
+				try hide(try repo.resolve(left == "" ?? ("HEAD", left)))
+				try push(try repo.resolve(right == "" ?? ("HEAD", right)))
+				return none
+			}
+			if spec.endsWith("^@") {
+				let c = try repo.commitAt(spec.slice(0, spec.len() - 2))
+				for let p in c.parents {
+					try push(p)
+				}
+				return none
+			}
+			if spec.endsWith("^!") {
+				let c = try repo.commitAt(spec.slice(0, spec.len() - 2))
+				try push(c.id)
+				for let p in c.parents {
+					try hide(p)
+				}
+				return none
+			}
+			let dash = spec.lastIndexOf("^-")
+			if dash > 0 {
+				let digits = spec.slice(dash + 2)
+				if digits == "" || digits.isNumeric() {
+					let n = digits == "" ?? (1, digits.toInt<int>())
+					let c = try repo.commitAt(spec.slice(0, dash))
+					fail "git: '{spec}': no parent {n}" when n < 1 || n > c.parents.len()
+					try push(c.id)
+					try hide(c.parents[n - 1])
+					return none
+				}
+			}
+			try push(try repo.resolve(spec))
+			return none
+		}
+
+		internal def queueNode(n WalkNode) {
+			if n.seen {
+				return
+			}
+			n.seen = true
+			queue.push(n)
+		}
+
+		internal def node(id ObjectId) !WalkNode {
+			let key = id.str()
+			let known = nodes.get(key)
+			return known unless known is none
+			let n = try loadNode(repo, id)
+			nodes[key] = n
+			return n
+		}
+
+		// The next commit, none when the walk is over. Fails when an object
+		// is missing or corrupt.
+		def next() !?Commit {
+			let n = try nextNode()
+			return none when n is none
+			return try repo.commitAt(n.id)
+		}
+
+		// The next commit's id, none when the walk is over; cheaper than
+		// `next` when the commit itself is not needed.
+		// Fails when a commit cannot be read.
+		def nextId() !?ObjectId {
+			let n = try nextNode()
+			return none when n is none
+			return n.id
+		}
+
+		// Every commit left, in order.
+		// Fails when a commit cannot be read.
+		def all(limit int = -1) !Commit[] {
+			let out Commit[] = []
+			for limit < 0 || out.len() < limit {
+				let c = try next()
+				break when c is none
+				out.push(c)
+			}
+			return out
+		}
+
+		internal def nextNode() !?WalkNode {
+			if !started {
+				started = true
+				if paths.len() > 0 {
+					pathspec = try newPathspec(paths)
+				}
+				// Hidden commits, ordered output or path limiting need the whole
+				// set first (git's limit_list): a commit reached early may turn
+				// out to be hidden by a commit reached later.
+				if anyHidden || order != WalkOrder.Date || reverse || paths.len() > 0 {
+					try limit()
+				}
+			}
+			if started && (anyHidden || order != WalkOrder.Date || reverse || paths.len() > 0) {
+				return none when limitedAt >= limited.len()
+				let n = limited[limitedAt]
+				limitedAt++
+				return n
+			}
+			for queue.len() > 0 {
+				let n = queue.pop()
+				try expand(n)
+				continue unless try keep(n)
+				return n
+			}
+			return none
+		}
+
+		// Queues the parents of a commit, marking them hidden when it is. With
+		// paths, git's default history simplification first: a commit that
+		// leaves the paths as a parent had them is treesame and not shown, and
+		// a merge treesame to a parent follows only that parent.
+		internal def expand(n WalkNode) !none {
+			let spec = pathspec
+			if !(spec is none) && !n.hidden {
+				try simplifyNode(n, spec)
+			}
+			let ps = firstParent && n.parents.len() > 0 ?? ([n.parents[0]], n.parents)
+			for let pid in ps {
+				let p = try node(pid)
+				p.hidden = true when n.hidden
+				if p.seen {
+					continue
+				}
+				queueNode(p)
+			}
+			return none
+		}
+
+		internal def simplifyNode(n WalkNode, spec Pathspec) !none {
+			if n.parents.len() == 0 {
+				n.treesame = !(try treeHasPaths(repo, n.tree, spec))
+				return none
+			}
+			for let pid in n.parents {
+				let p = try node(pid)
+				if !(try pathsDiffer(repo, p, n, spec)) {
+					n.treesame = true
+					n.parents = [pid]
+					return none
+				}
+			}
+			return none
+		}
+
+		// Whether a commit that is not hidden passes the filters.
+		internal def keep(n WalkNode) !bool {
+			return false when n.hidden || n.done || n.treesame
+			return false when noMerges && n.parents.len() > 1
+			return false when onlyMerges && n.parents.len() < 2
+			let s = since
+			return false when !(s is none) && n.time * 1000000000 < s.unixNs()
+			let u = until
+			return false when !(u is none) && n.time * 1000000000 > u.unixNs()
+			return true
+		}
+
+		// Walks everything first, then orders it: hidden commits are only known
+		// once their side has been walked down past the visible ones.
+		internal def limit() !none {
+			let visible WalkNode[] = []
+			let slop = 5
+			for queue.len() > 0 {
+				let n = queue.pop()
+				try expand(n)
+				if !n.hidden {
+					visible.push(n)
+				}
+				// Stop when only hidden commits are left, after a few more to
+				// allow for clocks that were wrong (git's slop).
+				if allHidden() {
+					slop--
+					break when slop <= 0
+				} else {
+					slop = 5
+				}
+			}
+			let kept WalkNode[] = []
+			for let n in visible {
+				continue when n.hidden
+				kept.push(n)
+			}
+			let filtered WalkNode[] = []
+			for let n in kept {
+				filtered.push(n) when try keep(n)
+			}
+			if order != WalkOrder.Date {
+				filtered = topoSort(filtered, order == WalkOrder.Topological)
+			}
+			filtered.reverse() when reverse
+			limited = filtered
+			return none
+		}
+
+		internal def allHidden() bool {
+			for let n in queue.items {
+				return false unless n.hidden
+			}
+			return true
+		}
+	}
+
+	// The walk node of a commit: from the commit-graph when it lists the
+	// commit, else from the commit's header.
+	internal def loadNode(repo Repository, id ObjectId) !WalkNode {
+		let g = commitGraphOf(repo)
+		if !(g is none) {
+			let gc = graphLookup(g, id)
+			if !(gc is none) {
+				let n = new WalkNode(id, gc.parents, gc.tree, gc.time)
+				n.generation = gc.generation
+				n.graph = gc
+				return n
+			}
+		}
+		let c = try repo.commitAt(id)
+		return new WalkNode(id, c.parents, c.tree, c.committer.date.unixNs() / 1000000000)
+	}
+
+	// Orders the commits so that no parent comes before its children, as git
+	// does: by a stack for `--topo-order` (keeping lines together), by commit
+	// time otherwise. The input is in date order.
+	internal def topoSort(nodes WalkNode[], lifo bool) WalkNode[] {
+		let indegree map<string, int> = {}
+		for let n in nodes {
+			indegree[n.id.str()] = 1
+		}
+		for let n in nodes {
+			for let p in n.parents {
+				let k = p.str()
+				let d = indegree.get(k)
+				indegree[k] = d + 1 unless d is none
+			}
+		}
+		let out WalkNode[] = []
+		let byId map<string, WalkNode> = {}
+		for let n in nodes {
+			byId[n.id.str()] = n
+		}
+		if lifo {
+			let stack WalkNode[] = []
+			// Tips go on in date order and come off first-in first.
+			for let i = nodes.len() - 1; i >= 0; i-- {
+				stack.push(nodes[i]) when indegree[nodes[i].id.str()] == 1
+			}
+			for stack.len() > 0 {
+				let n = stack.pop()
+				for let p in n.parents {
+					let k = p.str()
+					let d = indegree.get(k)
+					continue when d is none
+					indegree[k] = d - 1
+					stack.push(byId[k]) when d - 1 == 1
+				}
+				out.push(n)
+			}
+			return out
+		}
+		let queue = new NodeQueue()
+		for let n in nodes {
+			queue.push(n) when indegree[n.id.str()] == 1
+		}
+		for queue.len() > 0 {
+			let n = queue.pop()
+			for let p in n.parents {
+				let k = p.str()
+				let d = indegree.get(k)
+				continue when d is none
+				indegree[k] = d - 1
+				queue.push(byId[k]) when d - 1 == 1
+			}
+			out.push(n)
+		}
+		return out
+	}
+
+	internal const (
+		paintOne    = 1
+		paintTwo    = 2
+		paintStale  = 4
+		paintResult = 8
+	)
+
+	// The best common ancestors of two commits (`git merge-base --all`):
+	// common ancestors that are not ancestors of another common ancestor.
+	// Fails when a commit is missing.
+	def mergeBases(repo Repository, a0 ObjectId, b0 ObjectId) !ObjectId[] {
+		let a = try repo.peel(a0, ObjectKind.Commit)
+		let b = try repo.peel(b0, ObjectKind.Commit)
+		return [a] when a.equals(b)
+		let nodes map<string, WalkNode> = {}
+		let candidates = try paintDown(repo, nodes, a, [b])
+		return try independent(repo, candidates)
+	}
+
+	// The merge bases of one commit with several (an octopus merge's), as
+	// `git merge-base --octopus` finds them.
+	// Fails when no commit is given or a commit cannot be read.
+	def mergeBasesMany(repo Repository, commits ObjectId[]) !ObjectId[] {
+		fail "git: merge-base needs at least one commit" when commits.len() == 0
+		let result = [commits[0]]
+		for let i = 1; i < commits.len(); i++ {
+			let next ObjectId[] = []
+			for let r in result {
+				for let base in try mergeBases(repo, r, commits[i]) {
+					next.push(base) unless next.filter(x => x.equals(base)).len() > 0
+				}
+			}
+			result = next
+		}
+		return result
+	}
+
+	internal def paintNode(repo Repository, nodes map<string, WalkNode>, id ObjectId) !WalkNode {
+		let key = id.str()
+		let known = nodes.get(key)
+		return known unless known is none
+		let n = try loadNode(repo, id)
+		nodes[key] = n
+		return n
+	}
+
+	// Paints from `one` and from `twos` down until every queued commit is
+	// stale; returns the commits reached from both that are not below
+	// another such commit along the way.
+	internal def paintDown(repo Repository, nodes map<string, WalkNode>, one ObjectId, twos ObjectId[]) !ObjectId[] {
+		let queue = new NodeQueue()
+		let first = try paintNode(repo, nodes, one)
+		first.flags = first.flags | paintOne
+		queue.push(first)
+		for let t in twos {
+			let n = try paintNode(repo, nodes, t)
+			n.flags = n.flags | paintTwo
+			queue.push(n)
+		}
+		let result WalkNode[] = []
+		for queue.len() > 0 && !allStale(queue) {
+			let n = queue.pop()
+			let flags = n.flags & (paintOne | paintTwo | paintStale)
+			if flags == (paintOne | paintTwo) {
+				if (n.flags & paintResult) == 0 {
+					n.flags = n.flags | paintResult
+					result.push(n)
+				}
+				flags = flags | paintStale
+			}
+			for let pid in n.parents {
+				let p = try paintNode(repo, nodes, pid)
+				continue when (p.flags & flags) == flags
+				p.flags = p.flags | flags
+				queue.push(p)
+			}
+		}
+		let out ObjectId[] = []
+		for let n in result {
+			out.push(n.id) when (n.flags & paintStale) == 0
+		}
+		return out
+	}
+
+	internal def allStale(queue NodeQueue) bool {
+		for let n in queue.items {
+			return false when (n.flags & paintStale) == 0
+		}
+		return true
+	}
+
+	// The commits that are not ancestors of another in the list.
+	internal def independent(repo Repository, commits ObjectId[]) !ObjectId[] {
+		return commits when commits.len() < 2
+		let out ObjectId[] = []
+		for let (i, c) in commits {
+			let below = false
+			for let (j, other) in commits {
+				continue when i == j
+				if try isAncestor(repo, c, other) {
+					below = true
+					break
+				}
+			}
+			out.push(c) unless below
+		}
+		return out
+	}
+
+	// Whether `ancestor` is reachable from `descendant` (a commit is its own
+	// ancestor). Generation numbers from the commit-graph cut the search
+	// short when there are some.
+	// Fails when a commit cannot be read.
+	def isAncestor(repo Repository, ancestor ObjectId, descendant ObjectId) !bool {
+		return true when ancestor.equals(descendant)
+		let target = try loadNode(repo, ancestor)
+		let seen map<string, bool> = {}
+		let stack = [descendant]
+		for stack.len() > 0 {
+			let id = stack.pop()
+			let key = id.str()
+			continue when seen.hasKey(key)
+			seen[key] = true
+			return true when id.equals(ancestor)
+			let n = try loadNode(repo, id)
+			// A commit's generation is above all its ancestors': nothing below
+			// a commit at or under the target's generation can reach it.
+			continue when target.generation > 0 && n.generation > 0 && n.generation <= target.generation
+			for let p in n.parents {
+				stack.push(p)
+			}
+		}
+		return false
+	}
+}

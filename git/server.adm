@@ -1,0 +1,1151 @@
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.crypto
+		std.data.compress.zlib
+	)
+
+	// One reference update a push asks for.
+	struct PushCommand {
+		// The reference (`refs/heads/main`).
+		name   string
+		// What the pusher thinks it holds; zero when it should not exist.
+		before ObjectId
+		// What it should hold; zero deletes it.
+		after  ObjectId
+	}
+
+	// How a repository is served: what clients may ask for and who may
+	// push what.
+	struct ServeOptions {
+		// Accept pushes at all.
+		allowPush      bool                            = true
+		// Accept object filters (partial clones, `uploadpack.allowFilter`).
+		allowFilter    bool                            = true
+		// Accept wants for any object reachable from a reference, not only
+		// reference tips (`uploadpack.allowReachableSHA1InWant`).
+		allowReachable bool                            = true
+		// Called for every reference a push updates, creates or deletes;
+		// failing rejects that reference with the error's message.
+		authorizePush  ?def (PushCommand) !none         = none
+		// Called once a push has updated its references, with the
+		// commands that succeeded and the push options sent.
+		onPush         ?def (PushCommand[], string[]) !none = none
+	}
+
+	// ---- framing helpers -----------------------------------------------------
+
+	// Writes side-band packets of one channel: data split to fit pkt-lines.
+	internal type SideBandWriter {
+		internal out  io.Writer
+		internal band byte
+
+		def new(out io.Writer, band byte) {
+			self.out = out
+			self.band = band
+		}
+
+		def write(data byte[]) !int {
+			let at = 0
+			for at < data.len() {
+				let n = (data.len() - at).min(maxPktLine - 5)
+				let head = "%04x".format(n + 5).bytes()
+				head.push(band)
+				let _ = try out.write(head + data[at:at + n])
+				at += n
+			}
+			return data.len()
+		}
+	}
+
+	internal def writePkt(out io.Writer, text string) !none {
+		let _ = try out.write(try pktLine(text))
+		return none
+	}
+
+	internal def writeFlush(out io.Writer) !none {
+		let _ = try out.write(pktFlush.bytes())
+		return none
+	}
+
+	// ---- advertisement ---------------------------------------------------------
+
+	// The references a server lists: HEAD first when it resolves, then
+	// every reference sorted, with peeled tags.
+	internal def servedRefs(repo Repository) !RemoteRef[] {
+		let out RemoteRef[] = []
+		let head = repo.ref("HEAD") onerror recover none
+		if !(head is none) {
+			let id = repo.refTarget("HEAD") onerror recover none
+			out.push(RemoteRef{name: "HEAD", id: id, target: head.target})
+		}
+		for let r in try repo.refs("refs/") {
+			let id = r.target != "" ?? (repo.refTarget(r.name) onerror recover none, r.id)
+			continue when id is none
+			let ref = RemoteRef{name: r.name, id: id, target: r.target}
+			let (kind, _) = repo.info(id) onerror recover (ObjectKind.Blob, 0)
+			if kind == ObjectKind.Tag {
+				ref.peeled = peelAny(repo, id)
+			}
+			out.push(ref)
+		}
+		return out
+	}
+
+	// What a tag finally names, whatever its kind.
+	internal def peelAny(repo Repository, id ObjectId) ?ObjectId {
+		let current = id
+		for let depth = 0; depth < 10; depth++ {
+			let (kind, data) = repo.raw(current) onerror recover (ObjectKind.Blob, byte[])
+			return current unless kind == ObjectKind.Tag
+			let next = tagTargetOrNone(current, data)
+			return none when next is none
+			current = next
+		}
+		return none
+	}
+
+	internal def tagTargetOrNone(id ObjectId, data byte[]) ?ObjectId {
+		return tryTagTarget(id, data) onerror recover none
+	}
+
+	internal def tryTagTarget(id ObjectId, data byte[]) !?ObjectId {
+		return (try parseTag(id, data)).target
+	}
+
+	// The capabilities a protocol 2 upload-pack advertises.
+	internal def uploadPackCapsV2(repo Repository, options ServeOptions) string[] {
+		let fetch = "shallow wait-for-done"
+		fetch += " filter" when options.allowFilter
+		return string[
+			"agent={gitAgent}",
+			"ls-refs=unborn",
+			"fetch={fetch}",
+			"server-option",
+			"object-format={formatName(repo.format)}",
+			"object-info",
+		]
+	}
+
+	// Writes what a service says before the client's first request: the
+	// protocol 2 capabilities, or the protocol 0 reference list.
+	internal def advertiseService(repo Repository, program string, version int, out io.Writer, options ServeOptions) !none {
+		if program == "git-upload-pack" && version == 2 {
+			try writePkt(out, "version 2")
+			for let c in uploadPackCapsV2(repo, options) {
+				try writePkt(out, c)
+			}
+			return try writeFlush(out)
+		}
+		let refs = try servedRefs(repo)
+		let caps string[] = []
+		if program == "git-upload-pack" {
+			caps = string["multi_ack", "thin-pack", "side-band", "side-band-64k", "ofs-delta", "shallow", "deepen-since", "deepen-not", "deepen-relative", "no-progress", "include-tag", "multi_ack_detailed", "allow-tip-sha1-in-want"]
+			caps.push("allow-reachable-sha1-in-want") when options.allowReachable
+			caps.push("no-done")
+			let head = refs.filter(r => r.name == "HEAD" && r.target != "")
+			caps.push("symref=HEAD:{head[0].target}") when head.len() > 0
+			caps.push("filter") when options.allowFilter
+		} else {
+			caps = string["report-status", "report-status-v2", "delete-refs", "quiet", "atomic", "ofs-delta", "push-options", "side-band-64k"]
+			// receive-pack lists no HEAD.
+			refs = refs.filter(r => r.name != "HEAD")
+		}
+		caps.push("object-format={formatName(repo.format)}")
+		caps.push("agent={gitAgent}")
+		let capText = caps.join(" ")
+		if refs.len() == 0 {
+			let line = "{zeroId(repo.format).str()} capabilities^\{\}".bytes()
+			line.push(0)
+			let _ = try out.write(try pktLine(line + (capText + "\n").bytes()))
+		}
+		for let (i, r) in refs {
+			let id = r.id
+			continue when id is none
+			if i == 0 {
+				let line = "{id.str()} {r.name}".bytes()
+				line.push(0)
+				let _ = try out.write(try pktLine(line + (capText + "\n").bytes()))
+			} else {
+				try writePkt(out, "{id.str()} {r.name}")
+			}
+			let peeled = r.peeled
+			try writePkt(out, "{peeled.str()} {r.name}^\{\}") unless peeled is none
+		}
+		return try writeFlush(out)
+	}
+
+	// ---- upload-pack -----------------------------------------------------------
+
+	// The arguments of a fetch, from either protocol.
+	internal struct FetchArgs {
+		wants         ObjectId[] = []
+		haves         ObjectId[] = []
+		clientShallow ObjectId[] = []
+		depth         int        = 0
+		relative      bool       = false
+		since         int64      = 0
+		deepenNot     string[]   = []
+		filter        ObjectFilter = ObjectFilter{}
+		filtered      bool       = false
+		thin          bool       = false
+		ofsDelta      bool       = false
+		noProgress    bool       = false
+		includeTag    bool       = false
+		done          bool       = false
+		waitForDone   bool       = false
+		sideBand      bool       = true
+	}
+
+	// Serves one protocol 2 command from `r`; returns false when the client
+	// is done (end of input or an empty request). Fails on a request git
+	// would refuse.
+	internal def serveCommandV2(repo Repository, r PktReader, out io.Writer, options ServeOptions) !bool {
+		let first = r.read() onerror recover Pkt{kind: PktKind.Flush}
+		return false when first.kind == PktKind.Flush
+		let line = pktText(first)
+		fail "git: expected a command, got {line}" unless line.startsWith("command=")
+		let command = line.slice(8)
+		// Capabilities up to the delimiter (or the end of a request without
+		// arguments).
+		let args string[] = []
+		let inArgs = false
+		for {
+			let p = try r.read()
+			break when p.kind == PktKind.Flush
+			if p.kind == PktKind.Delimiter {
+				inArgs = true
+				continue
+			}
+			args.push(pktText(p)) when inArgs
+		}
+		switch command {
+			case "ls-refs":
+				try serveLsRefs(repo, args, out)
+			case "fetch":
+				try serveFetchV2(repo, args, out, options)
+			case "object-info":
+				try serveObjectInfo(repo, args, out)
+			default:
+				fail "git: unknown command {command}"
+		}
+		return true
+	}
+
+	internal def serveLsRefs(repo Repository, args string[], out io.Writer) !none {
+		let symrefs = args.includes("symrefs")
+		let peel = args.includes("peel")
+		let unborn = args.includes("unborn")
+		let prefixes string[] = []
+		for let a in args {
+			prefixes.push(a.slice(11)) when a.startsWith("ref-prefix ")
+		}
+		let head = repo.ref("HEAD") onerror recover none
+		for let r in try servedRefs(repo) {
+			continue unless prefixes.len() == 0 || prefixes.filter(p => r.name.startsWith(p)).len() > 0
+			let id = r.id
+			continue when id is none
+			let line = "{id.str()} {r.name}"
+			line += " symref-target:{r.target}" when symrefs && r.target != ""
+			let peeled = r.peeled
+			line += " peeled:{peeled.str()}" when peel && !(peeled is none)
+			try writePkt(out, line)
+		}
+		// An unborn HEAD: a branch with no commits yet.
+		if unborn && !(head is none) && head.target != "" && (prefixes.len() == 0 || prefixes.filter(p => "HEAD".startsWith(p)).len() > 0) {
+			let target = repo.refTarget("HEAD") onerror recover none
+			try writePkt(out, "unborn HEAD symref-target:{head.target}") when target is none
+		}
+		return try writeFlush(out)
+	}
+
+	internal def serveObjectInfo(repo Repository, args string[], out io.Writer) !none {
+		let attrs string[] = []
+		for let a in args {
+			attrs.push(a) when a == "size" || a == "type"
+		}
+		for let a in attrs {
+			try writePkt(out, a)
+		}
+		for let a in args {
+			continue unless a.startsWith("oid ")
+			let id = try parseId(a.slice(4))
+			if !repo.has(id) {
+				try writePkt(out, "{id.str()} ")
+				continue
+			}
+			let (kind, size) = try repo.info(id)
+			let values string[] = []
+			for let attr in attrs {
+				values.push(attr == "size" ?? (size.str(), kindName(kind)))
+			}
+			try writePkt(out, "{id.str()} {values.join(" ")}")
+		}
+		return try writeFlush(out)
+	}
+
+	// Reads the arguments of a protocol 2 fetch.
+	internal def parseFetchArgs(args string[], options ServeOptions) !FetchArgs {
+		let f = FetchArgs{}
+		for let a in args {
+			if a.startsWith("want ") {
+				f.wants.push(try parseId(a.slice(5)))
+			} else if a.startsWith("have ") {
+				f.haves.push(try parseId(a.slice(5)))
+			} else if a.startsWith("shallow ") {
+				f.clientShallow.push(try parseId(a.slice(8)))
+			} else if a.startsWith("deepen ") {
+				f.depth = a.slice(7).toInt<int>()
+			} else if a == "deepen-relative" {
+				f.relative = true
+			} else if a.startsWith("deepen-since ") {
+				f.since = a.slice(13).toInt<int64>()
+			} else if a.startsWith("deepen-not ") {
+				f.deepenNot.push(a.slice(11))
+			} else if a.startsWith("filter ") {
+				fail "git: filtering is not allowed" unless options.allowFilter
+				f.filter = try parseFilter(a.slice(7))
+				f.filtered = true
+			} else {
+				switch a {
+					case "thin-pack":
+						f.thin = true
+					case "ofs-delta":
+						f.ofsDelta = true
+					case "no-progress":
+						f.noProgress = true
+					case "include-tag":
+						f.includeTag = true
+					case "done":
+						f.done = true
+					case "wait-for-done":
+						f.waitForDone = true
+				}
+			}
+		}
+		return f
+	}
+
+	internal def serveFetchV2(repo Repository, args string[], out io.Writer, options ServeOptions) !none {
+		let f = try parseFetchArgs(args, options)
+		try checkWants(repo, f.wants, options)
+		let common = f.haves.filter(h => repo.has(h))
+		let deepening = f.depth > 0 || f.since > 0 || f.deepenNot.len() > 0
+		if !f.done {
+			try writePkt(out, "acknowledgments")
+			if common.len() == 0 {
+				try writePkt(out, "NAK")
+			}
+			for let c in common {
+				try writePkt(out, "ACK {c.str()}")
+			}
+			let ready = !f.waitForDone && common.len() > 0 && try wantsCovered(repo, f.wants, common)
+			if !ready {
+				return try writeFlush(out)
+			}
+			try writePkt(out, "ready")
+			let _ = try out.write(pktDelim.bytes())
+		}
+		let (items, shallow, unshallow) = try fetchObjects(repo, f, common)
+		if deepening || f.clientShallow.len() > 0 {
+			if shallow.len() > 0 || unshallow.len() > 0 {
+				try writePkt(out, "shallow-info")
+				for let s in shallow {
+					try writePkt(out, "shallow {s.str()}")
+				}
+				for let u in unshallow {
+					try writePkt(out, "unshallow {u.str()}")
+				}
+				let _ = try out.write(pktDelim.bytes())
+			}
+		}
+		try writePkt(out, "packfile")
+		try sendPack(repo, items, out, f.ofsDelta, thinAllowed(f))
+		return try writeFlush(out)
+	}
+
+	// Fails when a want is not something the server lets clients ask for:
+	// a reference tip, or (with `allowReachable`) an object reachable from
+	// one.
+	internal def checkWants(repo Repository, wants ObjectId[], options ServeOptions) !none {
+		let tips map<string, bool> = {}
+		let tipIds ObjectId[] = []
+		for let r in try servedRefs(repo) {
+			let id = r.id
+			continue when id is none
+			tips[id.str()] = true
+			tipIds.push(id)
+			let p = r.peeled
+			tips[p.str()] = true unless p is none
+		}
+		for let w in wants {
+			fail "git: upload-pack: not our ref {w.str()}" unless repo.has(w)
+			continue when tips.hasKey(w.str())
+			fail "git: upload-pack: not our ref {w.str()}" unless options.allowReachable
+			let c = repo.peel(w, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			let reachable = false
+			if !c.isZero() {
+				for let t in tipIds {
+					let tc = repo.peel(t, ObjectKind.Commit) onerror recover zeroId(repo.format)
+					continue when tc.isZero()
+					if try isAncestor(repo, c, tc) {
+						reachable = true
+						break
+					}
+				}
+			} else {
+				// A tree or blob: reachable when some tip's history holds it.
+				reachable = try objectReachable(repo, w, tipIds)
+			}
+			fail "git: upload-pack: not our ref {w.str()}" unless reachable
+		}
+		return none
+	}
+
+	internal def objectReachable(repo Repository, id ObjectId, tips ObjectId[]) !bool {
+		let commits ObjectId[] = []
+		for let t in tips {
+			let c = repo.peel(t, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			commits.push(c) unless c.isZero()
+		}
+		let items = try objectsToPack(repo, commits, [])
+		return items.filter(it => it.id.equals(id)).len() > 0
+	}
+
+	// Whether every wanted commit has one of the common commits in its
+	// history, so the server has a good base and stops negotiating.
+	internal def wantsCovered(repo Repository, wants ObjectId[], common ObjectId[]) !bool {
+		for let w in wants {
+			let wc = repo.peel(w, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			continue when wc.isZero()
+			let covered = false
+			for let c in common {
+				let cc = repo.peel(c, ObjectKind.Commit) onerror recover zeroId(repo.format)
+				continue when cc.isZero()
+				if try isAncestor(repo, cc, wc) {
+					covered = true
+					break
+				}
+			}
+			return false unless covered
+		}
+		return true
+	}
+
+	// The objects a fetch sends, with the shallow boundary it draws.
+	internal def fetchObjects(repo Repository, f FetchArgs, common ObjectId[]) !(PackItem[], ObjectId[], ObjectId[]) {
+		let deepening = f.depth > 0 || f.since > 0 || f.deepenNot.len() > 0
+		let items PackItem[] = []
+		let shallow ObjectId[] = []
+		let unshallow ObjectId[] = []
+		if !deepening && f.clientShallow.len() == 0 {
+			items = try objectsToPack(repo, f.wants, common, f.filter)
+		} else {
+			let (commits, boundary) = try shallowCommitsFor(repo, f, common)
+			items = try objectsForCommits(repo, f.wants, commits, common, f.filter)
+			let clientShallow map<string, bool> = {}
+			for let s in f.clientShallow {
+				clientShallow[s.str()] = true
+			}
+			let isBoundary map<string, bool> = {}
+			for let b in boundary {
+				isBoundary[b.str()] = true
+				shallow.push(b) unless clientShallow.hasKey(b.str())
+			}
+			// A commit the client had as shallow whose parents now come along.
+			let sending map<string, bool> = {}
+			for let c in commits {
+				sending[c.id.str()] = true
+			}
+			for let s in f.clientShallow {
+				continue when isBoundary.hasKey(s.str())
+				let c = commitOrNone(repo, s)
+				continue when c is none
+				let parentsSent = c.parents.len() > 0 && c.parents.filter(p => sending.hasKey(p.str())).len() == c.parents.len()
+				unshallow.push(s) when parentsSent
+			}
+		}
+		if f.includeTag {
+			try addFollowingTags(repo, items)
+		}
+		return (items, shallow, unshallow)
+	}
+
+	// The commits a deepening fetch sends, newest first, and the boundary
+	// commits whose parents it leaves out. A client's shallow commits are
+	// boundaries it already has, from which a relative deepening counts.
+	internal def shallowCommitsFor(repo Repository, f FetchArgs, common ObjectId[]) !(Commit[], ObjectId[]) {
+		let excluded map<string, bool> = {}
+		if f.deepenNot.len() > 0 {
+			let walk = new RevWalk(repo)
+			for let name in f.deepenNot {
+				let id = try repo.resolve(name)
+				try walk.push(try repo.peel(id, ObjectKind.Commit))
+			}
+			for let c in try walk.all() {
+				excluded[c.id.str()] = true
+			}
+		}
+		let has map<string, bool> = {}
+		for let c in common {
+			has[c.str()] = true
+		}
+		let clientShallow map<string, bool> = {}
+		for let s in f.clientShallow {
+			clientShallow[s.str()] = true
+		}
+		// Breadth first with the depth each commit is reached at (the
+		// smallest), as git counts `--depth`.
+		let depthOf map<string, int> = {}
+		let order Commit[] = []
+		let queue Commit[] = []
+		let boundary ObjectId[] = []
+		let start = f.relative ?? (0, 1)
+		for let w in f.wants {
+			let id = repo.peel(w, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			continue when id.isZero() || depthOf.hasKey(id.str())
+			let c = try repo.commitAt(id)
+			depthOf[id.str()] = start
+			queue.push(c)
+		}
+		let head = 0
+		for head < queue.len() {
+			let c = queue[head]
+			head++
+			let k = c.id.str()
+			let d = depthOf[k]
+			order.push(c)
+			let parents = try commitParents(repo, c.id)
+			let cut = false
+			if f.depth > 0 && !f.relative && d >= f.depth {
+				cut = true
+			}
+			if f.relative && clientShallow.hasKey(k) {
+				// Deepen from the client's boundary.
+				depthOf[k] = 0
+				d = 0
+			}
+			if f.relative && f.depth > 0 && d >= f.depth && !clientShallow.hasKey(k) {
+				cut = true
+			}
+			let kept ObjectId[] = []
+			for let p in parents {
+				let pk = p.str()
+				continue when excluded.hasKey(pk) || has.hasKey(pk)
+				if f.since > 0 {
+					let pc = try repo.commitAt(p)
+					continue when pc.committer.date.unixNs() / 1000000000 < f.since
+				}
+				kept.push(p)
+			}
+			if parents.len() > 0 && (cut || kept.len() < parents.len() && kept.len() == 0) {
+				boundary.push(c.id) unless has.hasKey(k)
+				continue
+			}
+			if cut {
+				continue
+			}
+			for let p in kept {
+				let pk = p.str()
+				let known = depthOf.get(pk)
+				if known is none {
+					depthOf[pk] = d + 1
+					queue.push(try repo.commitAt(p))
+				} else if known > d + 1 {
+					depthOf[pk] = d + 1
+				}
+			}
+		}
+		let sent = order.filter(c => !has.hasKey(c.id.str()))
+		return (sent, boundary)
+	}
+
+	// A commit's parents as stored, even in a shallow repository serving.
+	internal def commitParents(repo Repository, id ObjectId) !ObjectId[] {
+		let c = try repo.commitAt(id)
+		return c.parents
+	}
+
+	// The commits given, their tags among the wants, and the trees and
+	// blobs they bring that the common commits' trees do not hold.
+	internal def objectsForCommits(repo Repository, wants ObjectId[], commits Commit[], common ObjectId[], filter ObjectFilter) !PackItem[] {
+		let excluded map<string, bool> = {}
+		for let c in common {
+			let cc = commitOrNone(repo, c)
+			try markTree(repo, cc.tree, excluded) unless cc is none
+		}
+		let out PackItem[] = []
+		let seen map<string, bool> = {}
+		for let w in wants {
+			let (kind, _) = try repo.info(w)
+			if kind == ObjectKind.Tag && !seen.hasKey(w.str()) {
+				seen[w.str()] = true
+				out.push(PackItem{id: w})
+			}
+		}
+		for let c in commits {
+			seen[c.id.str()] = true
+			out.push(PackItem{id: c.id})
+		}
+		for let c in commits {
+			try addTree(repo, c.tree, "", seen, excluded, out, filter, 0)
+		}
+		return out
+	}
+
+	// Annotated tags whose target is in the pack come along
+	// (`include-tag`).
+	internal def addFollowingTags(repo Repository, items PackItem[]) !none {
+		let inPack map<string, bool> = {}
+		for let it in items {
+			inPack[it.id.str()] = true
+		}
+		for let r in try repo.refs("refs/tags/") {
+			let id = r.id
+			continue when id is none || inPack.hasKey(id.str())
+			let (kind, _) = repo.info(id) onerror recover (ObjectKind.Blob, 0)
+			continue unless kind == ObjectKind.Tag
+			let t = try repo.tag(id)
+			if inPack.hasKey(t.target.str()) {
+				inPack[id.str()] = true
+				items.push(PackItem{id: id})
+			}
+		}
+		return none
+	}
+
+	// Whether the pack may lean on objects the client has: it asked, and
+	// its history is whole (a shallow client may lack a boundary's parents).
+	internal def thinAllowed(f FetchArgs) bool {
+		return f.thin && f.depth == 0 && f.since == 0 && f.deepenNot.len() == 0 && f.clientShallow.len() == 0
+	}
+
+	// Writes the pack on side-band channel 1.
+	internal def sendPack(repo Repository, items PackItem[], out io.Writer, ofsDelta bool, thin bool) !none {
+		let band = new SideBandWriter(out, 1)
+		let bases = thin ?? (try thinBases(repo, items), PackItem[])
+		let _ = try writePackStream(repo, items, band, PackOptions{ofsDelta: ofsDelta}, bases)
+		return none
+	}
+
+	// Serves protocol 0 upload-pack after the advertisement: wants, shallow
+	// and deepen lines, then rounds of haves answered with ACKs, then the
+	// pack. In a stateless exchange (HTTP) every request repeats the wants
+	// and ends the exchange.
+	internal def serveUploadPackV0(repo Repository, r PktReader, out io.Writer, options ServeOptions, stateless bool) !none {
+		let f = FetchArgs{sideBand: false}
+		let caps string[] = []
+		let first = true
+		for {
+			let p = r.read() onerror recover Pkt{kind: PktKind.Flush}
+			break when p.kind == PktKind.Flush
+			let line = pktText(p)
+			if line.startsWith("want ") {
+				let words = line.split(" ")
+				f.wants.push(try parseId(words[1]))
+				if first {
+					caps = words[2:]
+					first = false
+				}
+			} else if line.startsWith("shallow ") {
+				f.clientShallow.push(try parseId(line.slice(8)))
+			} else if line.startsWith("deepen ") {
+				f.depth = line.slice(7).toInt<int>()
+			} else if line.startsWith("deepen-since ") {
+				f.since = line.slice(13).toInt<int64>()
+			} else if line.startsWith("deepen-not ") {
+				f.deepenNot.push(line.slice(11))
+			} else if line.startsWith("filter ") {
+				fail "git: filtering is not allowed" unless options.allowFilter
+				f.filter = try parseFilter(line.slice(7))
+				f.filtered = true
+			}
+		}
+		// A client that wants nothing is done (`ls-remote`).
+		return none when f.wants.len() == 0
+		try checkWants(repo, f.wants, options)
+		f.relative = caps.includes("deepen-relative")
+		f.includeTag = caps.includes("include-tag")
+		f.ofsDelta = caps.includes("ofs-delta")
+		f.thin = caps.includes("thin-pack")
+		let sideBand = caps.includes("side-band-64k") || caps.includes("side-band")
+		let detailed = caps.includes("multi_ack_detailed")
+		let multi = detailed || caps.includes("multi_ack")
+		let noDone = caps.includes("no-done")
+		let deepening = f.depth > 0 || f.since > 0 || f.deepenNot.len() > 0
+		if deepening {
+			let (_, shallow, unshallow) = try fetchObjectsShallowOnly(repo, f)
+			for let s in shallow {
+				try writePkt(out, "shallow {s.str()}")
+			}
+			for let u in unshallow {
+				try writePkt(out, "unshallow {u.str()}")
+			}
+			try writeFlush(out)
+		}
+		let common ObjectId[] = []
+		let sentReady = false
+		for {
+			let p = r.read() onerror recover Pkt{kind: PktKind.Flush, data: "eof".bytes()}
+			if p.kind == PktKind.Flush && p.data.len() > 0 {
+				// The client went away (stateless request without `done`).
+				return none
+			}
+			if p.kind == PktKind.Flush {
+				if detailed && !sentReady && common.len() > 0 && try wantsCovered(repo, f.wants, common) {
+					sentReady = true
+					try writePkt(out, "ACK {common[common.len() - 1].str()} ready")
+				}
+				if common.len() == 0 || multi {
+					try writePkt(out, "NAK")
+				}
+				if noDone && sentReady {
+					try writePkt(out, "ACK {common[common.len() - 1].str()}")
+					break
+				}
+				return none when stateless
+				continue
+			}
+			let line = pktText(p)
+			if line == "done" {
+				if common.len() > 0 {
+					try writePkt(out, "ACK {common[common.len() - 1].str()}")
+				} else {
+					try writePkt(out, "NAK")
+				}
+				break
+			}
+			if line.startsWith("have ") {
+				let id = try parseId(line.slice(5))
+				if repo.has(id) {
+					common.push(id)
+					if detailed {
+						try writePkt(out, "ACK {id.str()} common")
+					} else if multi {
+						try writePkt(out, "ACK {id.str()} continue")
+					} else if common.len() == 1 {
+						try writePkt(out, "ACK {id.str()}")
+					}
+				}
+			}
+		}
+		let (items, _, _) = try fetchObjects(repo, f, common)
+		if sideBand {
+			try sendPack(repo, items, out, f.ofsDelta, thinAllowed(f))
+			return try writeFlush(out)
+		}
+		let _ = try writePackStream(repo, items, out, PackOptions{ofsDelta: f.ofsDelta})
+		return none
+	}
+
+	internal def fetchObjectsShallowOnly(repo Repository, f FetchArgs) !(Commit[], ObjectId[], ObjectId[]) {
+		let (commits, boundary) = try shallowCommitsFor(repo, f, [])
+		let (_, shallow, unshallow) = try fetchObjects(repo, f, [])
+		let _ = boundary
+		return (commits, shallow, unshallow)
+	}
+
+	// ---- receive-pack ----------------------------------------------------------
+
+	// Reads a pack from a stream that may go on after it (a stateful
+	// push), into `out`: entry by entry, to its checksum. Returns the bytes
+	// written; 0 when the stream ends at once. Fails when the pack is cut
+	// short or malformed.
+	internal def copyPackStream(r PktReader, out io.Writer, format ObjectFormat) !int {
+		let hashLen = idLength(format)
+		let buf byte[] = []
+		let chunk byte[]
+		chunk.len(65536)
+		// Bytes of `buf` before `pos` are written out.
+		let pos = 0
+		let total = 0
+		let need = def (n int) !bool {
+			for buf.len() - pos < n {
+				let got = try r.readRaw(chunk)
+				return false when got == 0
+				buf.push(...chunk[0:got])
+			}
+			return true
+		}
+		if !(try need(12)) {
+			fail "git: the pack is cut short" when buf.len() > 0
+			return 0
+		}
+		fail "git: not a packfile" unless string(buf[0:4]) == "PACK"
+		let count = be32(buf, 8)
+		let at = 12
+		for let n = 0; n < count; n++ {
+			// Header bytes: at most 10 for the size, 20 for an offset, a hash
+			// for a base id.
+			let _ = try need(at - pos + 2)
+			let p = at
+			let c = int(buf[p])
+			let kind = (c >> 4) & 7
+			p++
+			for (c & 0x80) != 0 {
+				fail "git: the pack is cut short" unless try need(p - pos + 1)
+				c = int(buf[p])
+				p++
+			}
+			if kind == packOfsDelta {
+				fail "git: the pack is cut short" unless try need(p - pos + 1)
+				c = int(buf[p])
+				p++
+				for (c & 0x80) != 0 {
+					fail "git: the pack is cut short" unless try need(p - pos + 1)
+					c = int(buf[p])
+					p++
+				}
+			} else if kind == packRefDelta {
+				fail "git: the pack is cut short" unless try need(p - pos + hashLen)
+				p += hashLen
+			}
+			// The compressed data: grow the window until it inflates.
+			for {
+				let used = zlibStreamLength(buf, p)
+				if used > 0 {
+					p += used
+					break
+				}
+				let want = (buf.len() - pos) * 2
+				fail "git: the pack is cut short" unless try need(want.max(4096))
+			}
+			at = p
+			// Write what is done and keep the window small.
+			if at - pos > 1 << 20 {
+				let _ = try out.write(buf[pos:at])
+				total += at - pos
+				buf = buf[at:].clone()
+				at = 0
+				pos = 0
+			}
+		}
+		fail "git: the pack is cut short" unless try need(at - pos + hashLen)
+		at += hashLen
+		let _ = try out.write(buf[pos:at])
+		total += at - pos
+		// What follows the pack stays readable.
+		r.unread(buf[at:])
+		return total
+	}
+
+	// The length of the zlib stream at `at`, 0 when `data` ends before it
+	// does. Fails when it is corrupt.
+	internal def zlibStreamLength(data byte[], at int) int {
+		let (_, used) = zlib.inflate(data, at) onerror recover (byte[], 0)
+		return used
+	}
+
+	// Serves receive-pack after the advertisement: the commands, push
+	// options, the pack, then the report. Fails when the request is
+	// malformed; refused references are reported, not failed.
+	internal def serveReceivePack(repo Repository, r PktReader, out io.Writer, options ServeOptions) !none {
+		let commands PushCommand[] = []
+		let caps string[] = []
+		for {
+			let p = r.read() onerror recover Pkt{kind: PktKind.Flush}
+			break when p.kind == PktKind.Flush
+			let raw = p.data
+			let n = raw.len()
+			n-- when n > 0 && raw[n - 1] == 0x0A
+			let nul = indexByte(raw, 0, 0, n)
+			let line = nul < 0 ?? (string(raw[0:n]), string(raw[0:nul]))
+			if nul >= 0 {
+				caps = string(raw[nul + 1:n]).split(" ")
+			}
+			continue when line.startsWith("shallow ")
+			let words = line.split(" ")
+			fail "git: bad push command {line}" unless words.len() == 3
+			commands.push(PushCommand{name: words[2], before: try parseId(words[0]), after: try parseId(words[1])})
+		}
+		return none when commands.len() == 0
+		let pushOptions string[] = []
+		if caps.includes("push-options") {
+			for let p in try r.section() {
+				pushOptions.push(pktText(p))
+			}
+		}
+		let sideBand = caps.includes("side-band-64k")
+		let allOrNone = caps.includes("atomic")
+		let reportV2 = caps.includes("report-status-v2")
+		let report = reportV2 || caps.includes("report-status")
+		// The pack, unless every command deletes.
+		let unpack = "ok"
+		if commands.filter(c => !c.after.isZero()).len() > 0 {
+			unpack = receivePushPack(repo, r) onerror (err error) {
+				recover err.message
+			}
+		}
+		let results map<string, string> = {}
+		if unpack != "ok" {
+			for let c in commands {
+				results[c.name] = "unpacker error"
+			}
+		} else {
+			try applyPushCommands(repo, commands, allOrNone, options, results)
+		}
+		if report {
+			let lines string[] = ["unpack {unpack}"]
+			for let c in commands {
+				let res = results.get(c.name)
+				let reason = res is none ?? ("", res)
+				lines.push(reason == "" ?? ("ok {c.name}", "ng {c.name} {reason}"))
+			}
+			if sideBand {
+				let body byte[] = []
+				for let l in lines {
+					body = body + try pktLine(l)
+				}
+				body = body + pktFlush.bytes()
+				let band = new SideBandWriter(out, 1)
+				let _ = try band.write(body)
+				try writeFlush(out)
+			} else {
+				for let l in lines {
+					try writePkt(out, l)
+				}
+				try writeFlush(out)
+			}
+		}
+		let ok = commands.filter(c => !results.hasKey(c.name))
+		let hook = options.onPush
+		if !(hook is none) && ok.len() > 0 {
+			try hook(ok, pushOptions)
+		}
+		return none
+	}
+
+	// Receives the pushed pack into the repository; returns "ok" or why it
+	// was refused.
+	internal def receivePushPack(repo Repository, r PktReader) !string {
+		let dir = os.join(repo.objects.dir, "pack")
+		try os.mkdir(dir, true)
+		let token = crypto.rand(8) onerror recover byte[]
+		let temp = os.join(dir, "tmp_pack_{token.hex().lower()}")
+		let f = try os.open(temp, "w")
+		let failure ?error = none
+		let size = copyPackStream(r, f, repo.format) onerror (err error) {
+			failure = err
+			recover 0
+		}
+		f.close() onerror recover none
+		if !(failure is none) || size == 0 {
+			os.remove(temp) onerror recover none
+			return failure is none ?? ("the pack is missing", failure.message)
+		}
+		let _ = indexPackFile(repo, temp) onerror (err error) {
+			os.remove(temp) onerror recover none
+			fail err
+		}
+		return "ok"
+	}
+
+	// Checks and applies the commands, recording why each refused one was;
+	// with `allOrNone`, one refusal refuses them all.
+	internal def applyPushCommands(repo Repository, commands PushCommand[], allOrNone bool, options ServeOptions, results map<string, string>) !none {
+		let current = repo.isBare() ?? ("", repo.headRef() onerror recover "")
+		let denyCurrent = repo.config.get("receive.denyCurrentBranch", "refuse")
+		let denyDeletes = repo.config.getBool("receive.denyDeletes", false) onerror recover false
+		let denyNonFF = repo.config.getBool("receive.denyNonFastForwards", false) onerror recover false
+		let updates RefUpdate[] = []
+		for let c in commands {
+			if !options.allowPush {
+				results[c.name] = "pushes are not allowed"
+				continue
+			}
+			if !validRefName(c.name, true) || !c.name.startsWith("refs/") {
+				results[c.name] = "funny refname"
+				continue
+			}
+			if c.name == current && !repo.isBare() && (denyCurrent == "refuse" || denyCurrent == "true") {
+				results[c.name] = "branch is currently checked out"
+				continue
+			}
+			if c.after.isZero() && denyDeletes {
+				results[c.name] = "deletion prohibited"
+				continue
+			}
+			if !c.after.isZero() && !repo.has(c.after) {
+				results[c.name] = "missing necessary objects"
+				continue
+			}
+			let old = repo.refTarget(c.name) onerror recover none
+			let actual = old is none ?? (zeroId(repo.format), old)
+			if !actual.equals(c.before) {
+				results[c.name] = "failed to update ref"
+				continue
+			}
+			if denyNonFF && !c.before.isZero() && !c.after.isZero() && !(try fastForwards(repo, c.before, c.after)) {
+				results[c.name] = "non-fast-forward"
+				continue
+			}
+			let auth = options.authorizePush
+			if !(auth is none) {
+				let refused = ""
+				auth(c) onerror (err error) {
+					refused = err.message
+					recover none
+				}
+				if refused != "" {
+					results[c.name] = refused
+					continue
+				}
+			}
+			if !c.after.isZero() {
+				try checkConnectedIds(repo, [c.after])
+			}
+			if c.after.isZero() {
+				updates.push(RefUpdate{name: c.name, delete: true, expected: c.before, deref: false})
+			} else {
+				updates.push(RefUpdate{name: c.name, newId: c.after, expected: c.before, message: "push"})
+			}
+		}
+		if allOrNone && results.len() > 0 {
+			for let c in commands {
+				results[c.name] = "atomic push failed" unless results.hasKey(c.name)
+			}
+			return none
+		}
+		let who = try repo.identity("committer")
+		if allOrNone {
+			repo.refStore.commit(updates, who) onerror (err error) {
+				for let u in updates {
+					results[u.name] = "failed to update ref"
+				}
+				recover none
+			}
+			return none
+		}
+		for let u in updates {
+			repo.refStore.commit([u], who) onerror (err error) {
+				results[u.name] = "failed to update ref"
+				recover none
+			}
+		}
+		return none
+	}
+
+	// Checks that the objects and everything they reach are present.
+	internal def checkConnectedIds(repo Repository, ids ObjectId[]) !none {
+		let targets FetchTarget[] = []
+		for let id in ids {
+			targets.push(FetchTarget{ref: RemoteRef{name: id.str(), id: id}, local: "", force: false, forMerge: false, pattern: false})
+		}
+		return try checkConnected(repo, targets, false)
+	}
+
+	// ---- in-process connections ------------------------------------------------
+
+	// One direction of an in-memory connection: what one task writes the
+	// other reads.
+	internal type MemPipe {
+		internal ch     channel<byte[]>
+		internal rest   byte[] = []
+		internal closed bool   = false
+
+		def new() {
+			ch = new channel<byte[]>(size = 64)
+		}
+
+		def write(data byte[]) !int {
+			fail "git: the connection is closed" when closed
+			ch <- data.clone() when data.len() > 0
+			return data.len()
+		}
+
+		def read(into byte[]) !int {
+			if rest.len() == 0 {
+				return 0 when closed && ch.len() == 0
+				let chunk = <-ch
+				if chunk.len() == 0 {
+					closed = true
+					return 0
+				}
+				rest = chunk
+			}
+			let n = rest.copy(into)
+			rest = rest[n:].clone()
+			return n
+		}
+
+		// The writer is done: the reader sees the end once it has read the
+		// rest.
+		def close() {
+			return when closed
+			ch <- byte[]
+		}
+	}
+
+	// A repository on this machine served in-process: the client talks to
+	// upload-pack or receive-pack running on a task of its own.
+	internal type LocalWire {
+		internal repo     Repository
+		internal toServer ?MemPipe = none
+		internal reader   ?PktReader = none
+		internal server   ?(async !none) = none
+
+		def new(repo Repository) {
+			self.repo = repo
+		}
+
+		def advertise(program string, version int) !PktReader {
+			let up = new MemPipe()
+			let down = new MemPipe()
+			toServer = up
+			server = async serveConnection(repo, program, version, new PktReader(up), down)
+			let r = new PktReader(down)
+			reader = r
+			return r
+		}
+
+		def request(program string, body io.Reader) !PktReader {
+			let up = toServer
+			let r = reader
+			fail "git: the connection is not open" when up is none || r is none
+			let _ = try io.copy(body, up)
+			return r
+		}
+
+		def stateless() bool {
+			return false
+		}
+
+		def close() {
+			let up = toServer
+			up.close() unless up is none
+			let s = server
+			if !(s is none) {
+				await s onerror recover none
+			}
+			repo.close()
+		}
+	}
+
+	// Serves one stateful connection to the end, closing `out` after. A
+	// failure is sent to the client as an `ERR` line.
+	internal def serveConnection(repo Repository, program string, version int, r PktReader, out MemPipe) !none {
+		serveStateful(repo, program, version, r, out) onerror (err error) {
+			let line = pktLine("ERR {err.message}") onerror recover byte[]
+			out.write(line) onerror recover 0
+			recover none
+		}
+		out.close()
+		return none
+	}
+
+	internal def serveStateful(repo Repository, program string, version int, r PktReader, out io.Writer) !none {
+		let options = ServeOptions{}
+		try advertiseService(repo, program, version, out, options)
+		if program == "git-receive-pack" {
+			return try serveReceivePack(repo, r, out, options)
+		}
+		if version == 2 {
+			for try serveCommandV2(repo, r, out, options) {
+			}
+			return none
+		}
+		return try serveUploadPackV0(repo, r, out, options, false)
+	}
+}

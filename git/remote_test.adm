@@ -1,0 +1,300 @@
+// Clone, fetch and push between repositories through the in-process
+// server, in protocol 2 and protocol 0; the same repositories pass `git
+// fsck` (checked by hand with ADM_TEST_GIT_KEEP set).
+partial module adm.dev.git {
+	use (
+		std.os
+		std.bytes
+		std.testing
+	)
+
+	// A repository with a history to serve: `writeHistory`'s commits on the
+	// default branch, `topic` and the tag `v1`.
+	internal def servedRepo(name string) !(Repository, ObjectId[]) {
+		let repo = try init(try scratch(name), InitOptions{bare: true})
+		let ids = try writeHistory(repo)
+		return (repo, ids)
+	}
+
+	// Adds a commit on top of `parent` changing README.md, and moves the
+	// branch to it.
+	internal def addCommit(repo Repository, branch string, parent ObjectId, text string) !ObjectId {
+		let blob = try repo.writeBlob(text.bytes())
+		let base = try repo.commitAt(parent)
+		let tree = try repo.tree(base.tree)
+		let entries TreeEntry[] = []
+		for let e in tree.entries {
+			entries.push(e.name == "README.md" ?? (TreeEntry{name: e.name, mode: e.mode, id: blob}, e))
+		}
+		let root = try repo.writeTree(entries)
+		let sig = testSignature()
+		let c = new Commit(zeroId(repo.format), root, [parent], sig, sig, "{text}\n")
+		let id = try repo.write(ObjectKind.Commit, c.encode())
+		try repo.setRef("refs/heads/{branch}", id, "commit: {text}")
+		return id
+	}
+
+	internal const protocols = int[2, 0]
+
+	// Text that compresses poorly: hex digests of numbers, one per line.
+	internal def noisyText(lines int, changed int) string {
+		let out string[] = []
+		for let i = 0; i < lines; i++ {
+			let h = hashObject(ObjectKind.Blob, "line {i}".bytes())
+			out.push(i == changed ?? ("changed line {i}", h.str()))
+		}
+		return out.join("\n") + "\n"
+	}
+
+	check "Remotes" {
+		@test()
+		def listsRemoteRefs() !none {
+			let (src, ids) = try servedRepo("ls-remote")
+			for let v in protocols {
+				let refs = try lsRemote(src.gitDir, [], connection = RemoteOptions{protocol: v})
+				let branch = try src.branch()
+				let head = refs.filter(r => r.name == "HEAD")
+				fail "v{v}: no HEAD" unless head.len() == 1 && head[0].target == "refs/heads/{branch}"
+				let tag = refs.filter(r => r.name == "refs/tags/v1")
+				fail "v{v}: no tag" unless tag.len() == 1
+				let peeled = tag[0].peeled
+				fail "v{v}: tag not peeled" unless !(peeled is none) && peeled.equals(ids[0])
+				let heads = try lsRemote(src.gitDir, ["refs/heads/"], connection = RemoteOptions{protocol: v})
+				fail "v{v}: prefix not applied" unless heads.filter(r => !r.name.startsWith("refs/heads/")).len() == 0 && heads.len() == 2
+			}
+			return none
+		}
+
+		@test()
+		def clonesRepositories() !none {
+			let (src, ids) = try servedRepo("clone-src")
+			let branch = try src.branch()
+			for let v in protocols {
+				let dir = try scratch("clone-v{v}")
+				let repo = try clone(src.gitDir, dir, connection = RemoteOptions{protocol: v})
+				fail "v{v}: HEAD is on {try repo.branch()}" unless (try repo.branch()) == branch
+				fail "v{v}: branch not at the tip" unless (try repo.resolve(branch)).equals(ids[1])
+				fail "v{v}: origin/topic missing" unless (try repo.resolve("origin/topic")).equals(ids[0])
+				let originHead = try repo.ref("refs/remotes/origin/HEAD")
+				fail "v{v}: origin/HEAD wrong" unless !(originHead is none) && originHead.target == "refs/remotes/origin/{branch}"
+				fail "v{v}: tag missing" unless (try repo.resolve("v1^\{commit\}")).equals(ids[0])
+				fail "v{v}: upstream not set" unless repo.config.get("branch.{branch}.merge", "") == "refs/heads/{branch}"
+				let readme = string(try os.readFile(os.join(dir, "README.md")))
+				fail "v{v}: README reads {readme}" unless readme == "# Notes\n\nMore.\n"
+				let st = try repo.status()
+				fail "v{v}: working tree not clean" unless st.entries.len() == 0
+				let log = try repo.reflog("HEAD")
+				fail "v{v}: HEAD log {log.len()}" unless log.len() == 1 && log[0].message.startsWith("clone: from ")
+				repo.close()
+				// A bare clone and a mirror.
+				let bare = try clone(src.gitDir, try scratch("bare-v{v}"), bare = true, connection = RemoteOptions{protocol: v})
+				fail "v{v}: bare clone lacks topic" unless (try bare.resolve("refs/heads/topic")).equals(ids[0])
+				fail "v{v}: bare clone has a fetch refspec" unless bare.config.all("remote.origin.fetch").len() == 0
+				bare.close()
+			}
+			return none
+		}
+
+		@test()
+		def clonesEveryFormat() !none {
+			let root = try fixtures()
+			for let v in protocols {
+				// A SHA-256 remote makes a SHA-256 clone.
+				let src = try open(os.join(root, "sha256.git"))
+				let repo = try clone(src.gitDir, try scratch("sha256-v{v}"), connection = RemoteOptions{protocol: v})
+				fail "v{v}: clone is {formatName(repo.format)}" unless repo.format == ObjectFormat.Sha256
+				fail "v{v}: HEAD differs" unless (try repo.resolve("HEAD")).equals(try src.resolve("HEAD"))
+				repo.close()
+				// Into reference tables.
+				let tables = try clone(os.join(root, "basic.git"), try scratch("reftable-v{v}"), refFormat = RefFormat.Reftable, connection = RemoteOptions{protocol: v})
+				fail "v{v}: not a reftable clone" unless tables.refFormat == RefFormat.Reftable
+				let basic = try open(os.join(root, "basic.git"))
+				fail "v{v}: origin/main differs" unless (try tables.resolve("origin/main")).equals(try basic.resolve("main"))
+				basic.close()
+				tables.close()
+				src.close()
+			}
+			return none
+		}
+
+		@test()
+		def fetchesUpdates() !none {
+			let (src, ids) = try servedRepo("fetch-src")
+			let branch = try src.branch()
+			for let v in protocols {
+				let ro = RemoteOptions{protocol: v}
+				let repo = try clone(src.gitDir, try scratch("fetch-v{v}"), connection = RemoteOptions{protocol: v})
+				let tip = try repo.resolve("origin/{branch}")
+				let next = try addCommit(src, branch, tip, "Next v{v}")
+				let result = try repo.fetch("origin", connection = ro)
+				let moved = result.changes.filter(c => c.name == "refs/remotes/origin/{branch}")
+				fail "v{v}: no fast-forward" unless moved.len() == 1 && moved[0].kind == RefChangeKind.FastForward
+				fail "v{v}: origin/{branch} not moved" unless (try repo.resolve("origin/{branch}")).equals(next)
+				let fetchHead = string(try os.readFile(os.join(repo.gitDir, "FETCH_HEAD")))
+				fail "v{v}: FETCH_HEAD reads {fetchHead}" unless fetchHead.startsWith("{next.str()}\t\tbranch '{branch}' of ")
+				// A rewritten branch only moves when forced.
+				let sig = testSignature()
+				let first = try src.commitAt(ids[0])
+				let root = try src.write(ObjectKind.Commit, (new Commit(zeroId(src.format), first.tree, [], sig, sig, "Unrelated v{v}\n")).encode())
+				try src.setRef("refs/heads/topic", root)
+				let plain = try repo.fetch("origin", connection = RemoteOptions{protocol: v}, refspecs = ["refs/heads/topic:refs/remotes/origin/topic"])
+				let refused = plain.changes.filter(c => c.name == "refs/remotes/origin/topic")
+				fail "v{v}: non-fast-forward not rejected" unless refused.len() == 1 && refused[0].kind == RefChangeKind.Rejected && refused[0].reason == "non-fast-forward"
+				let forced = try repo.fetch("origin", connection = ro)
+				let topic = forced.changes.filter(c => c.name == "refs/remotes/origin/topic")
+				fail "v{v}: forced update not made" unless topic.len() == 1 && topic[0].kind == RefChangeKind.Forced
+				// A branch gone from the remote is pruned.
+				try src.setRef("refs/heads/gone-{v}", ids[0])
+				let _ = try repo.fetch("origin", connection = ro)
+				fail "v{v}: gone not fetched" when (try repo.refTarget("refs/remotes/origin/gone-{v}")) is none
+				try src.deleteRef("refs/heads/gone-{v}")
+				let pruned = try repo.fetch("origin", connection = RemoteOptions{protocol: v}, prune = true)
+				fail "v{v}: not pruned" unless pruned.changes.filter(c => c.kind == RefChangeKind.Deleted).len() == 1
+				// Nothing new: everything is up to date and no pack comes.
+				let again = try repo.fetch("origin", connection = ro)
+				fail "v{v}: something moved" unless again.changes.filter(c => c.kind != RefChangeKind.UpToDate).len() == 0
+				try src.setRef("refs/heads/{branch}", ids[1])
+				try src.setRef("refs/heads/topic", ids[0])
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def clonesShallow() !none {
+			let (src, ids) = try servedRepo("shallow-src")
+			let branch = try src.branch()
+			for let v in protocols {
+				let repo = try clone(src.gitDir, try scratch("shallow-v{v}"), depth = 1, connection = RemoteOptions{protocol: v})
+				let walk = new RevWalk(repo)
+				try walk.push(try repo.resolve("HEAD"))
+				let commits = try walk.all()
+				fail "v{v}: {commits.len()} commits in a depth 1 clone" unless commits.len() == 1
+				fail "v{v}: shallow file wrong" unless isShallowCommit(repo, ids[1])
+				fail "v{v}: single branch expected" unless repo.config.all("remote.origin.fetch").equals(["+refs/heads/{branch}:refs/remotes/origin/{branch}"])
+				fail "v{v}: parent present" when repo.has(ids[0])
+				// Deepening by one brings the parent and clears the boundary.
+				let _ = try repo.fetch("origin", connection = RemoteOptions{protocol: v}, depth = 1, deepen = true)
+				fail "v{v}: parent not fetched" unless repo.has(ids[0])
+				let again = new RevWalk(repo)
+				try again.push(try repo.resolve("HEAD"))
+				fail "v{v}: history still cut" unless (try again.all()).len() == 2
+				fail "v{v}: still shallow" when isShallowCommit(repo, ids[1])
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def clonesPartially() !none {
+			let (src, ids) = try servedRepo("partial-src")
+			for let v in protocols {
+				let dir = try scratch("partial-v{v}")
+				let repo = try clone(src.gitDir, dir, filter = "blob:none", connection = RemoteOptions{protocol: v})
+				fail "v{v}: not a promisor remote" unless repo.config.get("remote.origin.promisor", "") == "true"
+				// The checkout fetched the blobs it needed in one go.
+				fail "v{v}: README missing" unless string(try os.readFile(os.join(dir, "README.md"))) == "# Notes\n\nMore.\n"
+				// The first commit's README is fetched when read.
+				let old = try repo.commitAt(ids[0])
+				let readme = try (try repo.tree(old.tree)).file("README.md")
+				fail "v{v}: old README reads {try readme.text()}" unless (try readme.text()) == "# Notes\n"
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def sendsThinPacks() !none {
+			let src = try init(try scratch("thin-src"), InitOptions{bare: true})
+			let sig = testSignature()
+			let big = try src.writeBlob(noisyText(500, -1).bytes())
+			let t1 = try src.writeTree([TreeEntry{name: "data.txt", mode: EntryMode.File, id: big}])
+			let c1 = try src.write(ObjectKind.Commit, (new Commit(zeroId(src.format), t1, [], sig, sig, "Data\n")).encode())
+			let branch = try src.branch()
+			try src.setRef("refs/heads/{branch}", c1)
+			for let v in protocols {
+				let ro = RemoteOptions{protocol: v}
+				let repo = try clone(src.gitDir, try scratch("thin-clone-v{v}"), connection = ro, checkout = false)
+				let edited = try repo.writeBlob(noisyText(500, 250 + v).bytes())
+				let t2 = try repo.writeTree([TreeEntry{name: "data.txt", mode: EntryMode.File, id: edited}])
+				let c2 = try repo.write(ObjectKind.Commit, (new Commit(zeroId(repo.format), t2, [c1], sig, sig, "Edit v{v}\n")).encode())
+				try repo.setRef("refs/heads/{branch}", c2)
+				// The same objects as a thin and a whole pack.
+				let items = try objectsToPack(repo, [c2], [c1])
+				let thinBuf = new bytes.Buffer()
+				let _ = try writePackStream(repo, items, thinBuf, PackOptions{}, try thinBases(repo, items))
+				let fullBuf = new bytes.Buffer()
+				let _ = try writePackStream(repo, items, fullBuf)
+				fail "v{v}: thin pack {thinBuf.len()} bytes, whole {fullBuf.len()}" unless thinBuf.len() < 1000 && fullBuf.len() > 8000
+				let before = try packBytes(src)
+				let pushed = try repo.push("origin", connection = ro)
+				fail "v{v}: not pushed: {pushed.changes[0].reason}" unless pushed.changes[0].kind == RefChangeKind.FastForward
+				// The receiver completed the thin pack with the 20 kB base; what
+				// travelled was the delta.
+				let target = try open(src.gitDir)
+				fail "v{v}: edit missing" unless target.has(edited)
+				let (_, data) = try target.raw(edited)
+				fail "v{v}: edit reads wrong" unless string(data) == noisyText(500, 250 + v)
+				target.close()
+				let added = (try packBytes(src)) - before
+				fail "v{v}: pack grew by {added} bytes" unless added > 0
+				try src.setRef("refs/heads/{branch}", c1)
+				repo.close()
+			}
+			return none
+		}
+
+		@test()
+		def pushesChanges() !none {
+			let (src, ids) = try servedRepo("push-src")
+			let branch = try src.branch()
+			for let v in protocols {
+				let target = try init(try scratch("push-target-v{v}"), InitOptions{bare: true})
+				target.close()
+				let ro = RemoteOptions{protocol: v}
+				let repo = try clone(src.gitDir, try scratch("push-v{v}"), connection = ro)
+				try repo.addRemote("target", target.gitDir)
+				// A new branch, then a fast-forward.
+				let created = try repo.push("target", connection = ro, refspecs = ["refs/heads/{branch}:refs/heads/{branch}"])
+				fail "v{v}: not created: {created.changes[0].reason}" unless created.changes.len() == 1 && created.changes[0].kind == RefChangeKind.Created
+				let served = try open(target.gitDir)
+				fail "v{v}: target not at the tip" unless (try served.resolve(branch)).equals(ids[1])
+				let next = try addCommit(repo, branch, ids[1], "Pushed v{v}")
+				let ff = try repo.push("target", connection = ro, refspecs = [branch], setUpstream = true)
+				fail "v{v}: no fast-forward: {ff.changes[0].reason}" unless ff.changes[0].kind == RefChangeKind.FastForward
+				fail "v{v}: target not moved" unless (try served.resolve(branch)).equals(next)
+				fail "v{v}: tracking not updated" unless (try repo.resolve("target/{branch}")).equals(next)
+				fail "v{v}: upstream not set" unless repo.config.get("branch.{branch}.remote", "") == "target"
+				// Rewinding is refused, then forced; a stale lease refuses.
+				let rewind = try repo.push("target", connection = ro, refspecs = ["{ids[0].str()}:refs/heads/{branch}"])
+				fail "v{v}: rewind not refused" unless rewind.changes[0].kind == RefChangeKind.Rejected && rewind.changes[0].reason == "non-fast-forward"
+				let stale = try repo.push("target", connection = ro, refspecs = ["{ids[0].str()}:refs/heads/{branch}"], leases = [Lease{name: "refs/heads/{branch}", expected: ids[1]}])
+				fail "v{v}: stale lease not refused" unless stale.changes[0].kind == RefChangeKind.Rejected && stale.changes[0].reason == "stale info"
+				let forced = try repo.push("target", connection = ro, refspecs = ["+{ids[0].str()}:refs/heads/{branch}"])
+				fail "v{v}: not forced: {forced.changes[0].reason}" unless forced.changes[0].kind == RefChangeKind.Forced
+				fail "v{v}: target not rewound" unless (try served.resolve(branch)).equals(ids[0])
+				// Tags, deletion, and all-or-nothing.
+				let tags = try repo.push("target", connection = ro, refspecs = ["refs/remotes/origin/topic:refs/heads/topic"], tags = true)
+				fail "v{v}: tag not pushed" unless tags.changes.filter(c => c.name == "refs/tags/v1" && c.kind == RefChangeKind.Created).len() == 1
+				let deleted = try repo.push("target", connection = ro, refspecs = [":refs/heads/topic"])
+				fail "v{v}: not deleted" unless deleted.changes[0].kind == RefChangeKind.Deleted
+				fail "v{v}: topic still there" unless (try served.refTarget("refs/heads/topic")) is none
+				let refusedAll = try repo.push("target", connection = ro, refspecs = ["refs/remotes/origin/topic:refs/heads/topic", "{ids[0].str()}:refs/tags/v1"], allOrNone = true)
+				fail "v{v}: atomic push partly made" unless refusedAll.changes.filter(c => c.kind != RefChangeKind.Rejected).len() == 0
+				fail "v{v}: topic pushed despite atomic" unless (try served.refTarget("refs/heads/topic")) is none
+				served.close()
+				repo.close()
+			}
+			return none
+		}
+	}
+
+	// The bytes of every pack of a repository.
+	internal def packBytes(repo Repository) !int {
+		let total = 0
+		for let e in try os.readDir(os.join(repo.objects.dir, "pack")) {
+			total += (try os.stat(e.path)).size when e.path.endsWith(".pack")
+		}
+		return total
+	}
+}

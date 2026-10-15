@@ -1,0 +1,360 @@
+partial module adm.dev.git {
+	// The marker of a directory count that is not known yet.
+	internal const unknownDir = "/"
+
+	// The folder of a path, "" at the top.
+	internal def dirOf(path string) string {
+		let slash = path.lastIndexOf("/")
+		return slash < 0 ?? ("", path.slice(0, slash))
+	}
+
+	internal def incrementCount(counts map<string, map<string, int>>, oldDir string, newDir string) {
+		let known = counts.get(oldDir)
+		if known is none {
+			let fresh map<string, int> = {}
+			fresh[newDir] = 1
+			counts[oldDir] = fresh
+			return
+		}
+		let n = known.get(newDir)
+		known[newDir] = n is none ?? (1, n + 1)
+	}
+
+	// Counts a rename towards the folder renames it implies: the source's
+	// folder to the target's, and folders further up while both paths keep
+	// the same names below them and the folder was removed (and is
+	// relevant to the other side's additions).
+	internal def updateDirCounts(counts map<string, map<string, int>>, dirsRemoved map<string, int>, oldName string, newName string) {
+		let oldDir = oldName
+		let newDir = newName
+		let first = true
+		for {
+			let oldParent = dirOf(oldDir)
+			break unless dirsRemoved.hasKey(oldParent)
+			let newParent = dirOf(newDir)
+			if !first {
+				// The part below must be the same on both sides.
+				let oldSub = oldDir.slice(oldParent == "" ?? (0, oldParent.len() + 1))
+				let newSub = newDir.slice(newParent == "" ?? (0, newParent.len() + 1))
+				break unless oldSub == newSub
+			}
+			let flag = dirsRemoved[oldParent]
+			if flag == dirForSelf || first {
+				incrementCount(counts, oldParent, newParent)
+			}
+			first = false
+			break when flag == dirNotRelevant
+			break when oldParent == "" || newParent == ""
+			oldDir = oldParent
+			newDir = newParent
+		}
+	}
+
+	// The destination with the most renames from a folder.
+	internal def highestRename(counts map<string, int>) string {
+		let best = ""
+		let max = 0
+		for let (dir, n) in counts {
+			if n > max {
+				max = n
+				best = dir
+			}
+		}
+		return best
+	}
+
+	// Whether the folder's destination is settled whatever the unknown
+	// renames turn out to be.
+	internal def renameDeterminable(counts map<string, int>) bool {
+		let first = 0
+		let second = 0
+		let unknown = 0
+		for let (dir, n) in counts {
+			if dir == unknownDir {
+				unknown = n
+			} else if n >= first {
+				second = first
+				first = n
+			} else if n >= second {
+				second = n
+			}
+		}
+		return first > second + unknown
+	}
+
+	// Finds the renames of one side among its deletions and additions, as
+	// git's diffcore-rename does for a merge: identical content first, then
+	// files of the same basename (or the place a folder rename suggests)
+	// that are similar enough, then the best-scoring of the rest, only for
+	// deletions that matter to the merge. Folder rename counts are kept.
+	internal def detectSideRenames(m TreeMerge, side int) !none {
+		let pairs = m.pairs[side]
+		// Without a deletion that matters, git does not look for renames on
+		// the side at all, not even identical ones.
+		return none when m.relevant[side].len() == 0
+		let sources SidePair[] = pairs.filter(p => p.status == 0x44)
+		let dests SidePair[] = pairs.filter(p => p.status == 0x41)
+		return none when sources.len() == 0 || dests.len() == 0
+		let emptyBlob = hashObject(ObjectKind.Blob, [], m.repo.format)
+		sources = sources.filter(p => !p.oneId.equals(emptyBlob))
+		dests = dests.filter(p => !p.twoId.equals(emptyBlob))
+		sources.sort((a, b) => compareBytes(a.onePath, b.onePath))
+		dests.sort((a, b) => compareBytes(a.twoPath, b.twoPath))
+		let minimum = m.options.renameThreshold * maxScore / 100
+		minimum = 30000 when minimum <= 0
+		let used bool[]
+		used.len(sources.len())
+		used.fill(false)
+		let pairedSrc int[]
+		pairedSrc.len(dests.len())
+		pairedSrc.fill(-1)
+		let pairedScore int[]
+		pairedScore.len(dests.len())
+		pairedScore.fill(0)
+		let counts = m.renameCount[side]
+		let removed = m.dirsRemoved[side]
+		// Exact renames: same content (and mode, unless both regular).
+		for let (d, dst) in dests {
+			let best = -1
+			let bestScore = -1
+			let tried = 0
+			for let (s, src) in sources {
+				continue unless src.oneId.equals(dst.twoId)
+				if modeType(src.oneMode) != 0o100000 || modeType(dst.twoMode) != 0o100000 {
+					continue unless src.oneMode == dst.twoMode
+				}
+				continue when used[s]
+				let score = 1 + (sameBasename(src.onePath, dst.twoPath) ?? (1, 0))
+				if score > bestScore {
+					best = s
+					bestScore = score
+					break when score == 2
+				}
+				tried++
+				break when tried >= 100
+			}
+			if best >= 0 {
+				pairedSrc[d] = best
+				pairedScore[d] = maxScore
+				used[best] = true
+			}
+		}
+		// Folder rename counts and guesses from the exact renames.
+		let idxMap map<string, int> = {}
+		for let (d, dst) in dests {
+			if pairedSrc[d] < 0 {
+				idxMap[dst.twoPath] = d
+			} else {
+				updateDirCounts(counts, removed, sources[pairedSrc[d]].onePath, dst.twoPath)
+			}
+		}
+		let guess map<string, string> = {}
+		for let (dir, c) in counts {
+			guess[dir] = highestRename(c)
+		}
+		let files = new RenameFiles(m.repo)
+		// Basenames unique among what is left on both sides.
+		let minBasename = minimum + (maxScore - minimum) / 2
+		let srcByBase map<string, int> = {}
+		for let (s, src) in sources {
+			continue when used[s]
+			let base = pathBase(src.onePath)
+			srcByBase[base] = srcByBase.hasKey(base) ?? (-1, s)
+		}
+		let dstByBase map<string, int> = {}
+		for let (d, dst) in dests {
+			continue when pairedSrc[d] >= 0
+			let base = pathBase(dst.twoPath)
+			dstByBase[base] = dstByBase.hasKey(base) ?? (-1, d)
+		}
+		let relevant = m.relevant[side]
+		for let (s, src) in sources {
+			continue when used[s] || !relevant.hasKey(src.onePath)
+			let base = pathBase(src.onePath)
+			let srcIndex = srcByBase[base]
+			let found = dstByBase.get(base)
+			continue when found is none
+			let dstIndex = found
+			let si = srcIndex
+			if si == -1 || dstIndex == -1 {
+				si = s
+				let dir = dirOf(src.onePath)
+				let to = guess.get(dir)
+				dstIndex = -1
+				if !(to is none) {
+					let candidate = idxMap.get((to == "" ?? ("", to + "/")) + base)
+					dstIndex = candidate is none ?? (-1, candidate)
+				}
+			}
+			continue when dstIndex < 0 || pairedSrc[dstIndex] >= 0
+			let score = try files.similarity(sources[si], dests[dstIndex], minimum)
+			continue when score < minBasename
+			pairedSrc[dstIndex] = si
+			pairedScore[dstIndex] = score
+			used[si] = true
+			updateDirCounts(counts, removed, sources[si].onePath, dests[dstIndex].twoPath)
+		}
+		// What is left: relevant sources only, minus those whose folder's
+		// destination is already settled.
+		let remaining int[] = []
+		for let (s, src) in sources {
+			remaining.push(s) when !used[s] && relevant.hasKey(src.onePath)
+		}
+		for let s in remaining {
+			let dir = dirOf(sources[s].onePath)
+			for dir != "" {
+				let flag = removed.get(dir)
+				break when flag is none || flag == dirNotRelevant
+				incrementCount(counts, dir, unknownDir)
+				dir = dirOf(dir)
+			}
+		}
+		for let (dir, c) in counts {
+			let flag = removed.get(dir)
+			if !(flag is none) && flag == dirForSelf && renameDeterminable(c) {
+				removed[dir] = dirForAncestor
+			}
+		}
+		let culled int[] = []
+		for let s in remaining {
+			if relevant[sources[s].onePath] == sourceLocation {
+				let removable = true
+				let dir = dirOf(sources[s].onePath)
+				for {
+					let flag = removed.get(dir)
+					break when flag is none || flag == dirNotRelevant
+					if flag == dirForSelf {
+						removable = false
+						break
+					}
+					dir = dirOf(dir)
+				}
+				continue when removable
+			}
+			culled.push(s)
+		}
+		let openDests int[] = []
+		for let d = 0; d < dests.len(); d++ {
+			openDests.push(d) when pairedSrc[d] < 0
+		}
+		let limit = m.options.renameLimit > 0 ?? (m.options.renameLimit, 7000)
+		let tooMany = int64(openDests.len()) * int64(culled.len()) > int64(limit) * int64(limit)
+		if openDests.len() > 0 && culled.len() > 0 && !tooMany {
+			let all RenameCandidate[] = []
+			for let d in openDests {
+				let best RenameCandidate[] = []
+				for let s in culled {
+					let score = try files.similarity(sources[s], dests[d], minimum)
+					let cand = RenameCandidate{src: s, dst: d, score: score, name: sameBasename(sources[s].onePath, dests[d].twoPath) ?? (1, 0)}
+					if best.len() < 4 {
+						best.push(cand)
+						continue
+					}
+					let worst = 0
+					for let k = 1; k < 4; k++ {
+						worst = k when candidateBefore(best[k], best[worst]) > 0
+					}
+					best[worst] = cand when candidateBefore(best[worst], cand) > 0
+				}
+				all.push(...best)
+			}
+			all = stableSort(all)
+			for let c in all {
+				break when c.score < minimum
+				continue when pairedSrc[c.dst] >= 0 || used[c.src]
+				pairedSrc[c.dst] = c.src
+				pairedScore[c.dst] = c.score
+				used[c.src] = true
+				updateDirCounts(counts, removed, sources[c.src].onePath, dests[c.dst].twoPath)
+			}
+		}
+		// Counts stay only for removed folders that matter, without the
+		// unknown marker.
+		let keep map<string, map<string, int>> = {}
+		for let (dir, c) in counts {
+			let flag = removed.get(dir)
+			continue when flag is none || flag == dirNotRelevant
+			let copy map<string, int> = {}
+			for let (k, v) in c {
+				copy[k] = v unless k == unknownDir
+			}
+			keep[dir] = copy
+		}
+		m.renameCount[side] = keep
+		// The side's pairs: renames, and the deletions and additions left.
+		let out SidePair[] = []
+		let takenSrc map<string, bool> = {}
+		for let (d, dst) in dests {
+			let s = pairedSrc[d]
+			continue when s < 0
+			let src = sources[s]
+			takenSrc[src.onePath] = true
+			let r = new SidePair(0x52, src.onePath, src.oneMode, src.oneId, dst.twoPath, dst.twoMode, dst.twoId)
+			r.score = pairedScore[d]
+			out.push(r)
+		}
+		let takenDst map<string, bool> = {}
+		for let r in out {
+			takenDst[r.twoPath] = true
+		}
+		for let p in pairs {
+			if p.status == 0x44 {
+				out.push(p) unless takenSrc.hasKey(p.onePath)
+			} else {
+				out.push(p) unless takenDst.hasKey(p.twoPath)
+			}
+		}
+		m.pairs[side] = out
+		return none
+	}
+
+	// Content and span profiles of the files rename detection compares,
+	// read once.
+	internal type RenameFiles {
+		repo     Repository
+		data     map<string, byte[]>        = {}
+		profiles map<string, map<int, int>> = {}
+
+		def new(repo Repository) {
+			self.repo = repo
+		}
+
+		def content(id ObjectId) !byte[] {
+			let key = id.str()
+			let known = data.get(key)
+			return known unless known is none
+			let (_, d) = try repo.raw(id)
+			data[key] = d
+			return d
+		}
+
+		def profile(id ObjectId) !map<int, int> {
+			let key = id.str()
+			let known = profiles.get(key)
+			return known unless known is none
+			let p = spanProfile(try content(id))
+			profiles[key] = p
+			return p
+		}
+
+		// git's similarity of a deleted and an added file (see similarity).
+		def similarity(src SidePair, dst SidePair, minimum int) !int {
+			return 0 unless modeType(src.oneMode) == 0o100000 && modeType(dst.twoMode) == 0o100000
+			let (_, ss) = try repo.info(src.oneId)
+			let (_, ds) = try repo.info(dst.twoId)
+			let maxSize = ss > ds ?? (ss, ds)
+			let baseSize = ss < ds ?? (ss, ds)
+			return 0 when int64(maxSize) * int64(maxScore - minimum) < int64(maxSize - baseSize) * int64(maxScore)
+			return 0 when ds == 0
+			let a = try profile(src.oneId)
+			let b = try profile(dst.twoId)
+			let copied = int64(0)
+			for let (h, n) in a {
+				let c = b.get(h)
+				continue when c is none
+				copied += int64(n < c ?? (n, c))
+			}
+			return int(copied * int64(maxScore) / int64(maxSize))
+		}
+	}
+}

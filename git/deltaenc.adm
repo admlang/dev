@@ -1,0 +1,166 @@
+partial module adm.dev.git {
+	// Bytes in a block the delta encoder indexes the source by.
+	internal const deltaBlock = 16
+
+	// An index of a delta source: the positions of its 16-byte blocks by
+	// hash, built once to delta many targets against it.
+	internal type DeltaIndex {
+		src    byte[]
+		// Hash slot to the first block position + 1 (0: none), and each
+		// position to the next one with the same slot.
+		heads  int[]
+		chain  int[]
+		mask   int
+
+		def new(src byte[]) {
+			self.src = src
+			let blocks = src.len() / deltaBlock
+			let size = 16
+			for size < blocks * 2 {
+				size <<= 1
+			}
+			mask = size - 1
+			heads.len(size)
+			heads.fill(0)
+			chain.len(blocks + 1)
+			chain.fill(0)
+			// Later blocks first in each chain, so the search finds the last
+			// occurrence first, as it is the one most likely to continue.
+			for let b = 0; b < blocks; b++ {
+				let h = blockHash(src, b * deltaBlock) & mask
+				chain[b + 1] = heads[h]
+				heads[h] = b + 1
+			}
+		}
+	}
+
+	// The hash of the 16 bytes at `at`.
+	internal def blockHash(data byte[], at int) int {
+		let h = uint32(0)
+		for let k = 0; k < deltaBlock; k++ {
+			h = h * uint32(0x01000193) ^ uint32(data[at + k])
+		}
+		return int(h >> 1)
+	}
+
+	// A git delta that rebuilds `target` from the indexed source: copy
+	// instructions for runs found in the source (16 bytes or longer),
+	// insert instructions for the rest. None when the delta would not be
+	// smaller than `limit` bytes (0: no limit).
+	internal def makeDelta(index DeltaIndex, target byte[], limit int = 0) ?byte[] {
+		let src = index.src
+		let out byte[] = []
+		deltaVarintOut(out, src.len())
+		deltaVarintOut(out, target.len())
+		let pending = 0
+		let pendingAt = 0
+		let n = target.len()
+		let i = 0
+		for i < n {
+			let bestLen = 0
+			let bestOff = 0
+			if i + deltaBlock <= n && src.len() >= deltaBlock {
+				let h = blockHash(target, i) & index.mask
+				let b = index.heads[h]
+				let tries = 0
+				for b > 0 && tries < 64 {
+					let off = (b - 1) * deltaBlock
+					// Extend forward from the block.
+					let len = 0
+					for off + len < src.len() && i + len < n && src[off + len] == target[i + len] {
+						len++
+					}
+					if len >= deltaBlock && len > bestLen {
+						bestLen = len
+						bestOff = off
+					}
+					b = index.chain[b]
+					tries++
+				}
+			}
+			if bestLen < deltaBlock {
+				if pending == 0 {
+					pendingAt = i
+				}
+				pending++
+				i++
+				if pending == 127 {
+					flushInsert(out, target, pendingAt, pending)
+					pending = 0
+				}
+				continue
+			}
+			// Extend backward into bytes still waiting to be inserted.
+			let back = 0
+			for back < pending && bestOff - back > 0 && src[bestOff - back - 1] == target[i - back - 1] {
+				back++
+			}
+			if pending - back > 0 {
+				flushInsert(out, target, pendingAt, pending - back)
+			}
+			pending = 0
+			let off = bestOff - back
+			let len = bestLen + back
+			i += bestLen
+			for len > 0 {
+				let chunk = len > 0x10000 ?? (0x10000, len)
+				copyOp(out, off, chunk)
+				off += chunk
+				len -= chunk
+			}
+			return none when limit > 0 && out.len() >= limit
+		}
+		if pending > 0 {
+			flushInsert(out, target, pendingAt, pending)
+		}
+		return none when limit > 0 && out.len() >= limit
+		return out
+	}
+
+	// A git delta from `src` to `target`, none when it would not be smaller
+	// than `limit` bytes.
+	internal def delta(src byte[], target byte[], limit int = 0) ?byte[] {
+		return makeDelta(new DeltaIndex(src), target, limit)
+	}
+
+	internal def flushInsert(out byte[], data byte[], at int, count int) {
+		out.push(byte(count))
+		for let k = 0; k < count; k++ {
+			out.push(data[at + k])
+		}
+	}
+
+	// A copy instruction: offset and size as their non-zero bytes, flagged
+	// in the first byte; a size of 0x10000 is written as none.
+	internal def copyOp(out byte[], offset int, size int) {
+		let op = 0x80
+		let tail byte[] = []
+		for let k = 0; k < 4; k++ {
+			let b = (offset >> (k * 8)) & 0xFF
+			if b != 0 {
+				op |= 1 << k
+				tail.push(byte(b))
+			}
+		}
+		let s = size == 0x10000 ?? (0, size)
+		for let k = 0; k < 3; k++ {
+			let b = (s >> (k * 8)) & 0xFF
+			if b != 0 {
+				op |= 0x10 << k
+				tail.push(byte(b))
+			}
+		}
+		out.push(byte(op))
+		out.push(...tail)
+	}
+
+	// The size varint of a delta header.
+	internal def deltaVarintOut(out byte[], value int) {
+		let v = value
+		for v >= 0x80 {
+			out.push(byte((v & 0x7F) | 0x80))
+			v >>= 7
+		}
+		out.push(byte(v))
+	}
+}

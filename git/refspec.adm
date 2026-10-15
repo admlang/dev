@@ -1,0 +1,113 @@
+partial module adm.dev.git {
+	// Refspec maps references of one side to the other, as fetch and push
+	// configuration writes it: `+refs/heads/*:refs/remotes/origin/*`,
+	// `main:main`, `:refs/heads/old` (delete on push), `^refs/heads/tmp/*`
+	// (exclude), or `:` (push branches with matching names).
+	internal struct Refspec {
+		source  string
+		target  string = ""
+		// `+`: update even when it is not a fast-forward.
+		force   bool   = false
+		// Both sides hold one `*`.
+		pattern bool   = false
+		// `^<source>`: references matching it are left out.
+		negative bool  = false
+		// `:` alone.
+		matching bool  = false
+	}
+
+	// Reads a refspec. Fails when a side is not a valid reference name or
+	// pattern, or only one side has a `*`.
+	internal def parseRefspec(text string) !Refspec {
+		let t = text.trim()
+		fail "git: empty refspec" when t == ""
+		if t.startsWith("^") {
+			let src = t.slice(1)
+			fail "git: negative refspec '{text}' cannot have a destination" when src.contains(":")
+			fail "git: invalid refspec '{text}'" unless validRefName(src, true, true)
+			return Refspec{source: src, negative: true, pattern: src.contains("*")}
+		}
+		let force = t.startsWith("+")
+		let body = force ?? (t.slice(1), t)
+		if body == ":" {
+			return Refspec{source: "", target: "", force: force, matching: true}
+		}
+		let colon = body.lastIndexOf(":")
+		let src = colon < 0 ?? (body, body.slice(0, colon))
+		let dst = colon < 0 ?? ("", body.slice(colon + 1))
+		let srcStars = src.split("*").len() - 1
+		let dstStars = dst.split("*").len() - 1
+		fail "git: invalid refspec '{text}': a pattern needs one * on each side" when srcStars > 1 || dstStars > 1 || (colon >= 0 && dst != "" && srcStars != dstStars)
+		if src != "" && !refspecSideValid(src) {
+			fail "git: invalid refspec '{text}'"
+		}
+		if dst != "" && !refspecSideValid(dst) {
+			fail "git: invalid refspec '{text}'"
+		}
+		return Refspec{source: src, target: dst, force: force, pattern: srcStars == 1}
+	}
+
+	// A refspec side: a reference name or pattern, or (on the source side
+	// of a fetch or push) an object id or revision such as `HEAD~1`.
+	internal def refspecSideValid(side string) bool {
+		return true when validRefName(side, true, true)
+		return true when side == "@" || side.startsWith("HEAD")
+		// A revision with operators, or an id.
+		return !side.contains("*") && !side.contains(" ") && side != ""
+	}
+
+	// Where a source reference goes under the refspec: the target with the
+	// `*` filled in, or for a plain refspec the target when the source is
+	// its source; none when it does not apply.
+	internal def mapSource(spec Refspec, ref string) ?string {
+		return none when spec.negative || spec.matching
+		if !spec.pattern {
+			return spec.target when ref == spec.source
+			return none
+		}
+		let star = spec.source.indexOf("*")
+		let before = spec.source.slice(0, star)
+		let after = spec.source.slice(star + 1)
+		return none unless ref.startsWith(before) && ref.endsWith(after) && ref.len() >= before.len() + after.len()
+		let middle = ref.slice(before.len(), ref.len() - after.len())
+		return spec.target.replace("*", middle)
+	}
+
+	// Where a target reference came from under the refspec, the reverse of
+	// mapSource; none when it does not apply.
+	internal def mapTarget(spec Refspec, ref string) ?string {
+		return none when spec.negative || spec.matching || spec.target == ""
+		if !spec.pattern {
+			return spec.source when ref == spec.target
+			return none
+		}
+		let star = spec.target.indexOf("*")
+		let before = spec.target.slice(0, star)
+		let after = spec.target.slice(star + 1)
+		return none unless ref.startsWith(before) && ref.endsWith(after) && ref.len() >= before.len() + after.len()
+		let middle = ref.slice(before.len(), ref.len() - after.len())
+		return spec.source.replace("*", middle)
+	}
+
+	// Whether a negative refspec in the list excludes the reference.
+	internal def excludedBy(specs Refspec[], ref string) bool {
+		for let s in specs {
+			continue unless s.negative
+			if s.pattern {
+				return true when wildmatch(s.source, ref, false)
+			} else {
+				return true when s.source == ref
+			}
+		}
+		return false
+	}
+
+	// The refspec as configuration writes it.
+	internal def refspecText(spec Refspec) string {
+		return "^{spec.source}" when spec.negative
+		let plus = spec.force ?? ("+", "")
+		return "{plus}:" when spec.matching
+		return "{plus}{spec.source}" when spec.target == ""
+		return "{plus}{spec.source}:{spec.target}"
+	}
+}

@@ -1,0 +1,453 @@
+partial module adm.dev.git {
+	use std.os
+
+	// How directory renames on one side move paths the other side added
+	// (merge.directoryRenames).
+	enum DirectoryRenames {
+		// Leave them where they were added.
+		Off,
+		// Move them into the renamed directory.
+		On,
+		// Move them, and report each as a conflict (git's default).
+		Conflict
+	}
+
+	// Options for merging trees.
+	struct MergeOptions {
+		// Find renames (merge.renames).
+		renames          bool             = true
+		directoryRenames DirectoryRenames = DirectoryRenames.Conflict
+		// The similarity a rename needs, 0 to 100.
+		renameThreshold  int              = 50
+		// merge.renameLimit; 0 for git's default of 7000.
+		renameLimit      int              = 0
+		// Content merges (style, favor `-X ours`/`theirs`, diff algorithm).
+		text             TextMergeOptions = TextMergeOptions{}
+		// The names conflict markers give the two sides.
+		ours             string           = "HEAD"
+		theirs           string           = "theirs"
+		// The name of the base in diff3 markers; empty: the base commit's
+		// abbreviated id.
+		base             string           = ""
+	}
+
+	// One message of a merge, as `git merge` prints it: `Auto-merging x`,
+	// `CONFLICT (content): Merge conflict in x`, ...
+	struct MergeMessage {
+		// The paths it concerns.
+		paths    string[]
+		conflict bool
+		text     string
+	}
+
+	// One stage of a conflicted path: 1 base, 2 ours, 3 theirs.
+	struct ConflictStage {
+		path  string
+		stage int
+		mode  int
+		id    ObjectId
+	}
+
+	// The outcome of a tree merge: the merged tree (conflicted files hold
+	// conflict markers), whether it is clean, the stages of each conflicted
+	// path, and the messages.
+	struct MergeResult {
+		tree     ObjectId
+		clean    bool
+		stages   ConflictStage[]
+		messages MergeMessage[]
+	}
+
+	internal const (
+		dirNotRelevant      = 0
+		dirForAncestor      = 1
+		dirForSelf          = 2
+		sourceLocation      = 1
+		sourceContent       = 2
+	)
+
+	// One version of a path: mode 0 for none; a folder has mode 040000 and
+	// its tree.
+	internal struct Version {
+		mode int
+		id   ObjectId
+	}
+
+	// What the merge knows about one path (merge-ort's conflict_info).
+	internal type MergePath {
+		path        string
+		stages      Version[]
+		pathnames   string[]
+		filemask    int     = 0
+		dirmask     int     = 0
+		matchMask   int     = 0
+		dfConflict  bool    = false
+		pathConflict bool   = false
+		// Resolved while collecting (no conflict possible).
+		resolved    bool    = false
+		result      Version
+		isNull      bool    = false
+		clean       bool    = false
+
+		def new(path string, zero ObjectId) {
+			self.path = path
+			stages = [Version{mode: 0, id: zero}, Version{mode: 0, id: zero}, Version{mode: 0, id: zero}]
+			pathnames = [path, path, path]
+			result = Version{mode: 0, id: zero}
+		}
+	}
+
+	// A deletion, addition or rename on one side against the base.
+	internal type SidePair {
+		// 'A', 'D' or 'R'.
+		status  byte
+		onePath string
+		oneMode int
+		oneId   ObjectId
+		twoPath string
+		twoMode int
+		twoId   ObjectId
+		score   int = 0
+		side    int = 0
+
+		def new(status byte, onePath string, oneMode int, oneId ObjectId, twoPath string, twoMode int, twoId ObjectId) {
+			self.status = status
+			self.onePath = onePath
+			self.oneMode = oneMode
+			self.oneId = oneId
+			self.twoPath = twoPath
+			self.twoMode = twoMode
+			self.twoId = twoId
+		}
+	}
+
+	// One merge of three trees in progress.
+	internal type TreeMerge {
+		repo       Repository
+		options    MergeOptions
+		branch1    string
+		branch2    string
+		ancestor   string
+		callDepth  int
+		zero       ObjectId
+		paths      map<string, MergePath> = {}
+		order      string[]               = []
+		messages   MergeMessage[]         = []
+		pairs      SidePair[][]           = [[], [], []]
+		// One per side (index 0 unused), made in the constructor.
+		relevant   map<string, int>[]     = []
+		dirsRemoved map<string, int>[]    = []
+		renameCount map<string, map<string, int>>[] = []
+		dirRenames map<string, string>[]  = []
+		cleanFlag  bool                   = true
+		// Paths left conflicted, with their stages.
+		conflicted map<string, MergePath> = {}
+
+		def new(repo Repository, options MergeOptions, branch1 string, branch2 string, ancestor string, callDepth int) {
+			self.repo = repo
+			self.options = options
+			self.branch1 = branch1
+			self.branch2 = branch2
+			self.ancestor = ancestor
+			self.callDepth = callDepth
+			zero = zeroId(repo.format)
+			for let k = 0; k < 3; k++ {
+				let r map<string, int> = {}
+				relevant.push(r)
+				let d map<string, int> = {}
+				dirsRemoved.push(d)
+				let c map<string, map<string, int>> = {}
+				renameCount.push(c)
+				let n map<string, string> = {}
+				dirRenames.push(n)
+			}
+		}
+
+		def message(paths string[], conflict bool, text string) {
+			messages.push(MergeMessage{paths: paths, conflict: conflict, text: text})
+		}
+
+		def entry(path string) MergePath {
+			let known = paths.get(path)
+			return known unless known is none
+			let p = new MergePath(path, zero)
+			paths[path] = p
+			order.push(path)
+			return p
+		}
+	}
+
+	// ---- collecting the three trees --------------------------------------------------
+
+	// The entries of a tree by name; none for the zero id (no tree).
+	internal def treeByName(repo Repository, id ObjectId) !map<string, TreeEntry> {
+		let out map<string, TreeEntry> = {}
+		return out when id.isZero()
+		let t = try repo.tree(id)
+		for let e in t.entries {
+			out[e.name] = e
+		}
+		return out
+	}
+
+	// Walks the three trees together, recording every path that is not the
+	// same on all sides, the deletions and additions of each side, and
+	// which deletions matter for renames (merge-ort's
+	// collect_merge_info): a deletion matters when the other side changed
+	// the file, or when it is inside a folder removed on its side where
+	// the other side added files (`dirMask` 7 there).
+	internal def collectMerge(m TreeMerge, prefix string, trees ObjectId[], dirMask int) !none {
+		let sides map<string, TreeEntry>[] = [try treeByName(m.repo, trees[0]), try treeByName(m.repo, trees[1]), try treeByName(m.repo, trees[2])]
+		let names string[] = []
+		for let s in sides {
+			for let (n, _) in s {
+				names.push(n) unless names.includes(n)
+			}
+		}
+		names.sort((a, b) => compareBytes(a, b))
+		let currentDir = prefix == "" ?? ("", prefix.slice(0, prefix.len() - 1))
+		for let name in names {
+			let fullpath = prefix + name
+			let filemask = 0
+			let dirmask = 0
+			let versions Version[] = []
+			for let k = 0; k < 3; k++ {
+				let e = sides[k].get(name)
+				if e is none {
+					versions.push(Version{mode: 0, id: m.zero})
+					continue
+				}
+				versions.push(Version{mode: int(e.mode), id: e.id})
+				if isTree(e.mode) {
+					dirmask |= 1 << k
+				} else {
+					filemask |= 1 << k
+				}
+			}
+			let side1Base = versions[1].mode != 0 && versions[0].mode != 0 && versions[0].mode == versions[1].mode && versions[0].id.equals(versions[1].id)
+			let side2Base = versions[2].mode != 0 && versions[0].mode != 0 && versions[0].mode == versions[2].mode && versions[0].id.equals(versions[2].id)
+			let sidesMatch = versions[1].mode != 0 && versions[2].mode != 0 && versions[1].mode == versions[2].mode && versions[1].id.equals(versions[2].id)
+			let matchMask = 0
+			if side1Base {
+				matchMask = side2Base ?? (7, 3)
+			} else if side2Base {
+				matchMask = 5
+			} else if sidesMatch {
+				matchMask = 6
+			}
+			// Same everywhere, or settled by one side alone.
+			if side1Base && side2Base {
+				recordResolved(m, fullpath, versions[0])
+				continue
+			}
+			if sidesMatch && filemask == 7 {
+				recordResolved(m, fullpath, versions[1])
+				continue
+			}
+			if side1Base && filemask == 7 {
+				recordResolved(m, fullpath, versions[2])
+				continue
+			}
+			if side2Base && filemask == 7 {
+				recordResolved(m, fullpath, versions[1])
+				continue
+			}
+			// A folder removed on one side: renames inside it may decide
+			// where the other side's new files go.
+			let mask = dirMask
+			if mask != 7 && (dirmask == 3 || dirmask == 5) {
+				mask = dirmask & ~1
+			}
+			if dirmask == 1 || dirmask == 3 || dirmask == 5 {
+				let absent = (7 - dirmask) / 2
+				let relevance = mask == 7 ?? (dirForAncestor, dirNotRelevant)
+				m.dirsRemoved[1][fullpath] = relevance when (absent & 1) != 0
+				m.dirsRemoved[2][fullpath] = relevance when (absent & 2) != 0
+			}
+			if mask == 7 && (filemask == 2 || filemask == 4) {
+				let side = 3 - (filemask >> 1)
+				m.dirsRemoved[side][currentDir] = dirForSelf
+			}
+			if filemask != 0 && filemask != 7 {
+				for let side = 1; side <= 2; side++ {
+					let sideMask = 1 << side
+					if (filemask & 1) != 0 && (filemask & sideMask) == 0 {
+						let mm = matchMask & filemask
+						if mm == 0 || mask == 7 {
+							m.relevant[side][fullpath] = mm == 0 ?? (sourceContent, sourceLocation)
+						}
+						m.pairs[side].push(new SidePair(0x44, fullpath, versions[0].mode, versions[0].id, fullpath, 0, m.zero))
+					}
+					if (filemask & 1) == 0 && (filemask & sideMask) != 0 {
+						m.pairs[side].push(new SidePair(0x41, fullpath, 0, m.zero, fullpath, versions[side].mode, versions[side].id))
+					}
+				}
+			}
+			let p = m.entry(fullpath)
+			for let k = 0; k < 3; k++ {
+				// Only the file parts are stages; a folder is kept apart.
+				p.stages[k] = (filemask & (1 << k)) != 0 ?? (versions[k], Version{mode: 0, id: m.zero})
+			}
+			p.filemask = filemask
+			p.dirmask = dirmask
+			p.matchMask = matchMask
+			p.dfConflict = filemask != 0 && dirmask != 0
+			if dirmask != 0 {
+				// Inside a folder removed on one side, a file added by the
+				// other side marks every deletion there as relevant.
+				let childMask = mask
+				let subtrees ObjectId[] = []
+				for let k = 0; k < 3; k++ {
+					let e = sides[k].get(name)
+					if !(e is none) && isTree(e.mode) {
+						subtrees.push(e.id)
+					} else {
+						subtrees.push(m.zero)
+					}
+				}
+				if childMask == 2 || childMask == 4 {
+					childMask = try prescanAdded(m, subtrees, childMask)
+				}
+				p.matchMask = p.matchMask & filemask
+				try collectMerge(m, fullpath + "/", subtrees, childMask)
+			}
+		}
+		return none
+	}
+
+	// The folder mask after looking at a removed folder's entries: 7 when
+	// one of them is a file only the side that kept the folder has.
+	internal def prescanAdded(m TreeMerge, trees ObjectId[], mask int) !int {
+		let sides map<string, TreeEntry>[] = [try treeByName(m.repo, trees[0]), try treeByName(m.repo, trees[1]), try treeByName(m.repo, trees[2])]
+		let names string[] = []
+		for let s in sides {
+			for let (n, _) in s {
+				names.push(n) unless names.includes(n)
+			}
+		}
+		for let name in names {
+			let filemask = 0
+			for let k = 0; k < 3; k++ {
+				let e = sides[k].get(name)
+				filemask |= 1 << k when !(e is none) && !isTree(e.mode)
+			}
+			return 7 when filemask != 0 && filemask == mask
+		}
+		return mask
+	}
+
+	internal def recordResolved(m TreeMerge, path string, v Version) {
+		let p = m.entry(path)
+		p.resolved = true
+		p.clean = true
+		p.result = v
+		p.isNull = v.mode == 0
+	}
+
+	// ---- running a merge ------------------------------------------------------------
+
+	// Merges three trees as merge-ort does and returns the result. `ours`
+	// and `theirs` name the sides in markers and messages, `ancestor` the
+	// base. Fails when an object is missing.
+	internal def mergeTreesWith(repo Repository, base ?ObjectId, ours ?ObjectId, theirs ?ObjectId, options MergeOptions, ancestor string, callDepth int) !MergeResult {
+		let m = new TreeMerge(repo, options, options.ours, options.theirs, ancestor, callDepth)
+		let zero = zeroId(repo.format)
+		let roots ObjectId[] = [base is none ?? (zero, base), ours is none ?? (zero, ours), theirs is none ?? (zero, theirs)]
+		try collectMerge(m, "", roots, 0)
+		try detectAndProcessRenames(m)
+		let tree = try processEntries(m)
+		let stages ConflictStage[] = []
+		let paths = m.conflicted.keys()
+		paths.sort((a, b) => compareBytes(a, b))
+		for let p in paths {
+			let e = m.conflicted[p]
+			for let k = 0; k < 3; k++ {
+				if (e.filemask & (1 << k)) != 0 {
+					stages.push(ConflictStage{path: p, stage: k + 1, mode: e.stages[k].mode, id: e.stages[k].id})
+				}
+			}
+		}
+		return MergeResult{tree: tree, clean: m.cleanFlag && m.conflicted.len() == 0, stages: stages, messages: m.messages}
+	}
+
+	// Merges two commits as `git merge` does: from their merge base, or
+	// when there are several, from a virtual base made by merging those
+	// recursively (`merged common ancestors`); with no common history,
+	// from the empty tree. Nothing is written but objects.
+	// Fails when an object of either side or their merge bases cannot be read.
+	def mergeCommits(repo Repository, ours ObjectId, theirs ObjectId, options MergeOptions = MergeOptions{}) !MergeResult {
+		let bases = try mergeBases(repo, ours, theirs)
+		return try mergeWithBases(repo, bases, ours, theirs, options, 0)
+	}
+
+	internal def mergeWithBases(repo Repository, bases0 ObjectId[], ours ObjectId, theirs ObjectId, options MergeOptions, depth int) !MergeResult {
+		let oursTree = (try repo.commitAt(ours)).tree
+		let theirsTree = (try repo.commitAt(theirs)).tree
+		if bases0.len() == 0 {
+			return try mergeTreesWith(repo, none, oursTree, theirsTree, options, "empty tree", depth)
+		}
+		// git merges the bases in the reverse of the order it finds them.
+		let bases = bases0.clone().reverse()
+		let baseTree = (try repo.commitAt(bases[0])).tree
+		let ancestor = options.base
+		if bases.len() > 1 {
+			ancestor = "merged common ancestors"
+			let virtual ObjectId = baseTree
+			for let k = 1; k < bases.len(); k++ {
+				let inner = MergeOptions{...options, ours: "Temporary merge branch 1", theirs: "Temporary merge branch 2"}
+				let deeper = try mergeBases(repo, bases[0], bases[k])
+				// Both bases are commits; their own bases come from history.
+				let r = try mergeVirtual(repo, virtual, bases[k], deeper, inner, depth + 1)
+				virtual = r
+			}
+			baseTree = virtual
+		} else if ancestor == "" {
+			ancestor = uniqueAbbrev(repo, bases[0], abbrevLength(repo))
+		}
+		return try mergeTreesWith(repo, baseTree, oursTree, theirsTree, options, ancestor, depth)
+	}
+
+	// The tree of a virtual base: the tree so far merged with another base
+	// commit, conflicts left in.
+	internal def mergeVirtual(repo Repository, tree ObjectId, other ObjectId, bases ObjectId[], options MergeOptions, depth int) !ObjectId {
+		let otherTree = (try repo.commitAt(other)).tree
+		let baseTree ?ObjectId = none
+		let ancestor = "empty tree"
+		if bases.len() > 0 {
+			baseTree = (try repo.commitAt(bases[0])).tree
+			ancestor = bases.len() > 1 ?? ("merged common ancestors", uniqueAbbrev(repo, bases[0], abbrevLength(repo)))
+		}
+		let r = try mergeTreesWith(repo, baseTree, tree, otherTree, options, ancestor, depth)
+		return r.tree
+	}
+
+	// The result as `git merge-tree --write-tree` prints it: the tree, the
+	// stages of each conflicted path, then a blank line and the messages
+	// grouped by path (only when there are conflicts).
+	def mergeTreeText(r MergeResult) string {
+		let lines string[] = [r.tree.str()]
+		for let s in r.stages {
+			lines.push("{"%06o".format(s.mode)} {s.id.str()} {s.stage}\t{quotePath(s.path)}")
+		}
+		if !r.clean {
+			lines.push("")
+			// Messages by the path they concern first, in path order.
+			let byPath map<string, string[]> = {}
+			for let msg in r.messages {
+				let key = msg.paths.len() > 0 ?? (msg.paths[0], "")
+				let known = byPath.get(key)
+				if known is none {
+					byPath[key] = [msg.text]
+				} else {
+					known.push(msg.text)
+				}
+			}
+			let keys = byPath.keys()
+			keys.sort((a, b) => compareBytes(a, b))
+			for let k in keys {
+				lines.push(...byPath[k])
+			}
+		}
+		return lines.join("\n") + "\n"
+	}
+}

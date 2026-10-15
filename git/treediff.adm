@@ -1,0 +1,500 @@
+partial module adm.dev.git {
+	// What happened to a path between two snapshots.
+	enum ChangeKind {
+		Added,
+		Deleted,
+		Modified,
+		Renamed,
+		Copied,
+		// A file became a symbolic link or a submodule, or the other way.
+		TypeChanged,
+		// Both sides of a conflict are in the index (a worktree diff only).
+		Unmerged
+	}
+
+	// FileChange is one path's change between two snapshots: the old and
+	// new mode and object (mode 0 and the zero id for a side that does not
+	// have it).
+	struct FileChange {
+		kind       ChangeKind
+		oldPath    string
+		newPath    string
+		oldMode    int
+		newMode    int
+		oldId      ObjectId
+		newId      ObjectId
+		// For a rename or copy, how similar the two are: 0 to 100.
+		similarity int = 0
+		// The raw score (0 to 60000) git ranks rename candidates by.
+		internal score int = 0
+		// The new side is the file in the working tree, read on demand.
+		internal inWorktree bool = false
+	}
+
+	// Options for comparing snapshots.
+	struct ChangeOptions {
+		// Find renames (diff.renames, on by default).
+		renames          bool     = true
+		// Find copies of files changed in the same snapshot pair too.
+		copies           bool     = false
+		// Look for copy sources among unchanged files as well (`-C -C`).
+		copiesHarder     bool     = false
+		// The similarity, 0 to 100, a rename or copy needs (`-M50%`).
+		renameThreshold  int      = 50
+		// Most sources times destinations compared for inexact renames is
+		// this squared (diff.renameLimit).
+		renameLimit      int      = 1000
+		// Empty files take part in rename detection.
+		renameEmpty      bool     = false
+		// Pathspecs that limit the paths compared; empty for all.
+		paths            string[] = []
+	}
+
+	internal const maxScore = 60000
+
+	// One side of a comparison: path, mode and object of every file.
+	internal struct SnapshotEntry {
+		path string
+		mode int
+		id   ObjectId
+	}
+
+	// The files of a tree, recursively, in path order, limited to the
+	// pathspec.
+	internal def treeFiles(repo Repository, tree ?ObjectId, spec Pathspec, prefix string, out SnapshotEntry[]) !none {
+		return none when tree is none
+		let t = try repo.tree(tree)
+		for let e in t.entries {
+			let path = prefix + e.name
+			if isTree(e.mode) {
+				try treeFiles(repo, e.id, spec, path + "/", out) when spec.mayMatchDir(path)
+				continue
+			}
+			out.push(SnapshotEntry{path: path, mode: int(e.mode), id: e.id}) when spec.matches(path)
+		}
+		return none
+	}
+
+	// The changes between two trees (none for an empty side), with renames
+	// and copies found as the options ask, in git's order (by path).
+	// Fails when a tree or blob is missing.
+	def diffTrees(repo Repository, oldTree ?ObjectId, newTree ?ObjectId, options ChangeOptions = ChangeOptions{}) !FileChange[] {
+		let spec = try newPathspec(options.paths)
+		let a SnapshotEntry[] = []
+		let b SnapshotEntry[] = []
+		try treeFiles(repo, oldTree, spec, "", a)
+		try treeFiles(repo, newTree, spec, "", b)
+		return try compareSnapshots(repo, a, b, options, false)
+	}
+
+	// The type of a mode as git distinguishes changes by it: regular file,
+	// symbolic link or submodule.
+	internal def modeType(mode int) int {
+		return mode & 0o170000
+	}
+
+	// Pairs two sorted snapshots path by path, then finds renames.
+	internal def compareSnapshots(repo Repository, a SnapshotEntry[], b SnapshotEntry[], options ChangeOptions, worktree bool) !FileChange[] {
+		let zero = zeroId(repo.format)
+		let changes FileChange[] = []
+		// Unchanged files, as copy sources for copiesHarder.
+		let unchanged FileChange[] = []
+		let i = 0
+		let j = 0
+		for i < a.len() || j < b.len() {
+			let c = 0
+			if i >= a.len() {
+				c = 1
+			} else if j >= b.len() {
+				c = -1
+			} else {
+				c = compareBytes(a[i].path, b[j].path)
+			}
+			if c < 0 {
+				changes.push(FileChange{kind: ChangeKind.Deleted, oldPath: a[i].path, newPath: a[i].path, oldMode: a[i].mode, newMode: 0, oldId: a[i].id, newId: zero})
+				i++
+				continue
+			}
+			if c > 0 {
+				changes.push(FileChange{kind: ChangeKind.Added, oldPath: b[j].path, newPath: b[j].path, oldMode: 0, newMode: b[j].mode, oldId: zero, newId: b[j].id, inWorktree: worktree})
+				j++
+				continue
+			}
+			let x = a[i]
+			let y = b[j]
+			i++
+			j++
+			if x.id.equals(y.id) && x.mode == y.mode {
+				unchanged.push(FileChange{kind: ChangeKind.Modified, oldPath: x.path, newPath: y.path, oldMode: x.mode, newMode: y.mode, oldId: x.id, newId: y.id})
+				continue
+			}
+			let kind = modeType(x.mode) == modeType(y.mode) ?? (ChangeKind.Modified, ChangeKind.TypeChanged)
+			changes.push(FileChange{kind: kind, oldPath: x.path, newPath: y.path, oldMode: x.mode, newMode: y.mode, oldId: x.id, newId: y.id, inWorktree: worktree})
+		}
+		return changes unless options.renames || options.copies
+		return try detectRenames(repo, changes, unchanged, options)
+	}
+
+	// A file's content for rename scoring: its blob, or the working tree
+	// file for a new side that is not stored.
+	internal def changeContent(repo Repository, c FileChange, newSide bool) !byte[] {
+		if newSide && c.inWorktree {
+			return try worktreeContent(repo, c.newPath)
+		}
+		let (_, data) = try repo.raw(newSide ?? (c.newId, c.oldId))
+		return data
+	}
+
+	// The span-hash profile of a file, as git compares files for renames:
+	// for each 64-byte or newline-ended chunk's hash, the bytes it covers.
+	// In text, a carriage return before a newline does not count.
+	internal def spanProfile(data byte[]) map<int, int> {
+		let text = !isBinaryContent(data)
+		let out map<int, int> = {}
+		let accum1 = uint32(0)
+		let accum2 = uint32(0)
+		let n = 0
+		let size = data.len()
+		for let i = 0; i < size; i++ {
+			let c = uint32(data[i])
+			if text && c == 0x0D && i + 1 < size && data[i + 1] == 0x0A {
+				continue
+			}
+			let old1 = accum1
+			accum1 = (accum1 << 7) ^ (accum2 >> 25)
+			accum2 = (accum2 << 7) ^ (old1 >> 25)
+			accum1 = accum1 + c
+			n++
+			if n < 64 && c != 0x0A {
+				continue
+			}
+			let h = int((accum1 + accum2 * uint32(0x61)) % uint32(107927))
+			let prev = out.get(h)
+			out[h] = prev is none ?? (n, prev + n)
+			n = 0
+			accum1 = 0
+			accum2 = 0
+		}
+		if n > 0 {
+			let h = int((accum1 + accum2 * uint32(0x61)) % uint32(107927))
+			let prev = out.get(h)
+			out[h] = prev is none ?? (n, prev + n)
+		}
+		return out
+	}
+
+	// Whether content looks binary as git decides it: a NUL in its first
+	// 8000 bytes.
+	internal def isBinaryContent(data byte[]) bool {
+		let n = data.len() < 8000 ?? (data.len(), 8000)
+		return indexByte(data, 0, 0, n) >= 0
+	}
+
+	// A file's content and span profile, computed once.
+	internal type RenameFile {
+		change  FileChange
+		newSide bool
+		size    int     = -1
+		data    ?byte[] = none
+		profile ?map<int, int> = none
+		used    bool    = false
+
+		def new(change FileChange, newSide bool) {
+			self.change = change
+			self.newSide = newSide
+		}
+
+		def path() string {
+			return newSide ?? (change.newPath, change.oldPath)
+		}
+
+		def mode() int {
+			return newSide ?? (change.newMode, change.oldMode)
+		}
+
+		def id() ObjectId {
+			return newSide ?? (change.newId, change.oldId)
+		}
+
+		def content(repo Repository) !byte[] {
+			let d = data
+			return d unless d is none
+			let loaded = try changeContent(repo, change, newSide)
+			data = loaded
+			size = loaded.len()
+			return loaded
+		}
+
+		def length(repo Repository) !int {
+			return size when size >= 0
+			if !(newSide && change.inWorktree) {
+				let (_, n) = try repo.info(id())
+				size = n
+				return n
+			}
+			return (try content(repo)).len()
+		}
+
+		def spans(repo Repository) !map<int, int> {
+			let p = profile
+			return p unless p is none
+			let made = spanProfile(try content(repo))
+			profile = made
+			return made
+		}
+	}
+
+	// git's similarity of a source and a destination, 0 to 60000: the share
+	// of the larger file that the smaller one's chunks cover. Files of very
+	// different sizes are not compared (0); only regular files are.
+	internal def similarity(repo Repository, src RenameFile, dst RenameFile, minimum int) !int {
+		return 0 unless modeType(src.mode()) == 0o100000 && modeType(dst.mode()) == 0o100000
+		let ss = try src.length(repo)
+		let ds = try dst.length(repo)
+		let maxSize = ss > ds ?? (ss, ds)
+		let baseSize = ss < ds ?? (ss, ds)
+		let delta = maxSize - baseSize
+		return 0 when int64(maxSize) * int64(maxScore - minimum) < int64(delta) * int64(maxScore)
+		return 0 when ds == 0
+		let a = try src.spans(repo)
+		let b = try dst.spans(repo)
+		let copied = int64(0)
+		for let (h, n) in a {
+			let m = b.get(h)
+			continue when m is none
+			copied += int64(n < m ?? (n, m))
+		}
+		return int(copied * int64(maxScore) / int64(maxSize))
+	}
+
+	// Whether two paths have the same last component.
+	internal def sameBasename(a string, b string) bool {
+		return pathBase(a) == pathBase(b)
+	}
+
+	internal def pathBase(path string) string {
+		let slash = path.lastIndexOf("/")
+		return slash < 0 ?? (path, path.slice(slash + 1))
+	}
+
+	// One scored candidate pairing for inexact renames.
+	internal struct RenameCandidate {
+		src   int
+		dst   int
+		score int
+		name  int
+	}
+
+	// git's order of candidates: higher score first, then same basename.
+	internal def candidateBefore(a RenameCandidate, b RenameCandidate) int {
+		return b.name - a.name when a.score == b.score
+		return b.score - a.score
+	}
+
+	// Turns deletions and additions (and with copies, changed files) into
+	// renames and copies as git's diffcore-rename does: identical content
+	// first, then files of the same unique basename that are similar
+	// enough, then the best-scoring pairs of what is left.
+	internal def detectRenames(repo Repository, changes FileChange[], unchanged FileChange[], options ChangeOptions) !FileChange[] {
+		let minimum = options.renameThreshold * maxScore / 100
+		minimum = 30000 when minimum <= 0
+		let wantCopies = options.copies || options.copiesHarder
+		let emptyBlob = hashObject(ObjectKind.Blob, [], repo.format)
+		let sources RenameFile[] = []
+		let dests RenameFile[] = []
+		let destOf int[] = []
+		for let (k, c) in changes {
+			if c.kind == ChangeKind.Added {
+				continue when !options.renameEmpty && c.newId.equals(emptyBlob)
+				dests.push(new RenameFile(c, true))
+				destOf.push(k)
+			} else if c.kind == ChangeKind.Deleted {
+				continue when !options.renameEmpty && c.oldId.equals(emptyBlob)
+				sources.push(new RenameFile(c, false))
+			} else if wantCopies && c.kind == ChangeKind.Modified {
+				let s = new RenameFile(c, false)
+				// A source that stays in place counts as used once already.
+				s.used = true
+				sources.push(s)
+			}
+		}
+		if options.copiesHarder {
+			for let c in unchanged {
+				let s = new RenameFile(c, false)
+				s.used = true
+				sources.push(s)
+			}
+		}
+		sources.sort((x, y) => compareBytes(x.path(), y.path()))
+		return changes when dests.len() == 0 || sources.len() == 0
+		// The source each destination takes, with its score.
+		let pairedSrc int[]
+		pairedSrc.len(dests.len())
+		pairedSrc.fill(-1)
+		let pairedScore int[]
+		pairedScore.len(dests.len())
+		pairedScore.fill(0)
+		// Exact matches: the first unused source with the same content
+		// (and mode, unless both are regular files), preferring the same
+		// basename.
+		for let (d, dst) in dests {
+			let best = -1
+			let bestScore = -1
+			let tried = 0
+			for let (s, src) in sources {
+				continue unless src.id().equals(dst.id())
+				if modeType(src.mode()) != 0o100000 || modeType(dst.mode()) != 0o100000 {
+					continue unless src.mode() == dst.mode()
+				}
+				continue when src.used && !wantCopies
+				let score = (src.used ?? (0, 1)) + (sameBasename(src.path(), dst.path()) ?? (1, 0))
+				if score > bestScore {
+					best = s
+					bestScore = score
+					break when score == 2
+				}
+				tried++
+				break when tried >= 100
+			}
+			if best >= 0 {
+				pairedSrc[d] = best
+				pairedScore[d] = maxScore
+				sources[best].used = true
+			}
+		}
+		if minimum < maxScore {
+			let remaining int[] = []
+			for let (s, src) in sources {
+				remaining.push(s) unless src.used && !wantCopies
+			}
+			if !wantCopies {
+				// Same basename, unique among what is left on both sides.
+				let srcByBase map<string, int> = {}
+				for let s in remaining {
+					let base = pathBase(sources[s].path())
+					srcByBase[base] = srcByBase.hasKey(base) ?? (-1, s)
+				}
+				let dstByBase map<string, int> = {}
+				for let (d, dst) in dests {
+					continue when pairedSrc[d] >= 0
+					let base = pathBase(dst.path())
+					dstByBase[base] = dstByBase.hasKey(base) ?? (-1, d)
+				}
+				let minBasename = minimum + (maxScore - minimum) / 2
+				for let s in remaining {
+					let base = pathBase(sources[s].path())
+					let si = srcByBase[base]
+					let di = dstByBase.get(base)
+					continue when si < 0 || di is none || di < 0
+					continue when pairedSrc[di] >= 0
+					let score = try similarity(repo, sources[s], dests[di], minimum)
+					continue when score < minBasename
+					pairedSrc[di] = s
+					pairedScore[di] = score
+					sources[s].used = true
+				}
+				remaining = remaining.filter(s => !sources[s].used)
+			}
+			let openDests int[] = []
+			for let d = 0; d < dests.len(); d++ {
+				openDests.push(d) when pairedSrc[d] < 0
+			}
+			let limit = options.renameLimit
+			let tooMany = limit > 0 && int64(openDests.len()) * int64(remaining.len()) > int64(limit) * int64(limit)
+			if openDests.len() > 0 && remaining.len() > 0 && !tooMany {
+				// The four best sources for each destination, then every
+				// candidate by score.
+				let all RenameCandidate[] = []
+				for let d in openDests {
+					let best RenameCandidate[] = []
+					for let s in remaining {
+						let score = try similarity(repo, sources[s], dests[d], minimum)
+						let cand = RenameCandidate{src: s, dst: d, score: score, name: sameBasename(sources[s].path(), dests[d].path()) ?? (1, 0)}
+						if best.len() < 4 {
+							best.push(cand)
+							continue
+						}
+						let worst = 0
+						for let k = 1; k < 4; k++ {
+							worst = k when candidateBefore(best[k], best[worst]) > 0
+						}
+						best[worst] = cand when candidateBefore(best[worst], cand) > 0
+					}
+					all.push(...best)
+				}
+				all = stableSort(all)
+				for let c in all {
+					break when c.score < minimum
+					continue when pairedSrc[c.dst] >= 0
+					continue when sources[c.src].used && !wantCopies
+					pairedSrc[c.dst] = c.src
+					pairedScore[c.dst] = c.score
+					sources[c.src].used = true
+				}
+			}
+		}
+		// Rewrite the change list as git resolves pairs: each source counts
+		// its users (one more when it stays in place); in path order every
+		// pair but a deleted source's last is a copy, that last a rename.
+		let uses int[]
+		uses.len(sources.len())
+		for let (s, src) in sources {
+			uses[s] = src.change.kind == ChangeKind.Deleted ?? (0, 1)
+		}
+		for let d = 0; d < dests.len(); d++ {
+			let s = pairedSrc[d]
+			uses[s] = uses[s] + 1 when s >= 0
+		}
+		let removed map<string, bool> = {}
+		for let (d, dst) in dests {
+			let s = pairedSrc[d]
+			continue when s < 0
+			let src = sources[s]
+			uses[s] = uses[s] - 1
+			let kind = uses[s] > 0 ?? (ChangeKind.Copied, ChangeKind.Renamed)
+			removed[src.path()] = true when src.change.kind == ChangeKind.Deleted
+			let k = destOf[d]
+			changes[k] = FileChange{
+				kind: kind,
+				oldPath: src.path(),
+				newPath: dst.path(),
+				oldMode: src.mode(),
+				newMode: dst.mode(),
+				oldId: src.id(),
+				newId: dst.id(),
+				similarity: pairedScore[d] * 100 / maxScore,
+				score: pairedScore[d],
+				inWorktree: dst.change.inWorktree,
+			}
+		}
+		// A deleted source that went somewhere is no longer a deletion.
+		let out FileChange[] = []
+		for let c in changes {
+			continue when c.kind == ChangeKind.Deleted && removed.hasKey(c.oldPath)
+			out.push(c)
+		}
+		return out
+	}
+
+	// Sorts rename candidates by git's order, keeping equal ones in place.
+	internal def stableSort(items RenameCandidate[]) RenameCandidate[] {
+		// Merge sort: the prelude sort is not guaranteed stable.
+		return items when items.len() < 2
+		let mid = items.len() / 2
+		let left = stableSort(items.slice(0, mid).clone())
+		let right = stableSort(items.slice(mid, items.len() - mid).clone())
+		let out RenameCandidate[] = []
+		let i = 0
+		let j = 0
+		for i < left.len() || j < right.len() {
+			if j >= right.len() || (i < left.len() && candidateBefore(left[i], right[j]) <= 0) {
+				out.push(left[i])
+				i++
+			} else {
+				out.push(right[j])
+				j++
+			}
+		}
+		return out
+	}
+}

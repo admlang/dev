@@ -1,0 +1,221 @@
+partial module adm.dev.git {
+	use std.os
+
+	// The state of an attribute for a path: set (`text`), unset (`-text`),
+	// unspecified (no rule, or `!text`), or a value (`eol=crlf`).
+	struct AttrValue {
+		state string = "unspecified"
+		value string = ""
+	}
+
+	// Whether the attribute is set (`name` alone, or `name=true`-like values
+	// do not count: only the bare form).
+	def isSet(v AttrValue) bool {
+		return v.state == "set"
+	}
+
+	// Whether the attribute is unset (`-name`).
+	def isUnset(v AttrValue) bool {
+		return v.state == "unset"
+	}
+
+	// Whether no rule says anything about the attribute.
+	def isUnspecified(v AttrValue) bool {
+		return v.state == "unspecified"
+	}
+
+	// The attribute's value for `name=value`, empty otherwise.
+	def attrText(v AttrValue) string {
+		return v.state == "value" ?? (v.value, "")
+	}
+
+	// One line of an attributes file: a pattern and what it says about each
+	// attribute, macros expanded.
+	internal struct AttrRule {
+		pattern  string
+		basename bool
+		base     string
+		// Attribute names and what the line sets them to, in order.
+		names    string[]
+		values   AttrValue[]
+	}
+
+	// AttributeRules answers what gitattributes say about a path:
+	// `.gitattributes` files from the path's folder up to the top, over
+	// core.attributesFile (default `~/.config/git/attributes`), under
+	// `info/attributes`. Macros (`[attr]name ...`) are read from the top
+	// `.gitattributes` and the files outside the tree; `binary` is built in
+	// as `-diff -merge -text`.
+	type AttributeRules {
+		workDir  string
+		caseFold bool
+		internal macros   map<string, (string, AttrValue)[]> = {}
+		internal low      AttrRule[]                       = []
+		internal high     AttrRule[]                       = []
+		internal perDir   map<string, AttrRule[]>           = {}
+		// Read from a tree instead of the working tree (for checkout and
+		// archive), keyed by folder.
+		internal fromTree ?map<string, string>              = none
+
+		def new(workDir string) {
+			self.workDir = workDir
+			macros["binary"] = [("diff", AttrValue{state: "unset"}), ("merge", AttrValue{state: "unset"}), ("text", AttrValue{state: "unset"})]
+		}
+
+		internal def rulesIn(dir string) AttrRule[] {
+			let known = perDir.get(dir)
+			return known unless known is none
+			let text = ""
+			let tree = fromTree
+			if tree is none {
+				text = string(os.readFile(os.join(workDir, dir, ".gitattributes")) onerror recover byte[])
+			} else {
+				let found = tree.get(dir)
+				text = found is none ?? ("", found)
+			}
+			let rules = parseAttributes(self, text, dir == "" ?? ("", dir + "/"), dir == "")
+			perDir[dir] = rules
+			return rules
+		}
+
+		// Every attribute the rules give the path, by name.
+		def all(path string) map<string, AttrValue> {
+			let out map<string, AttrValue> = {}
+			let decided map<string, bool> = {}
+			// Highest precedence first: info/attributes, then .gitattributes
+			// from the deepest folder up, then the global and system files.
+			let layers AttrRule[][] = [high]
+			let dir = os.dir(path)
+			dir = "" when !path.contains("/")
+			for {
+				layers.push(rulesIn(dir))
+				break when dir == ""
+				let up = os.dir(dir)
+				dir = up == "." || !dir.contains("/") ?? ("", up)
+			}
+			layers.push(low)
+			for let rules in layers {
+				for let i = rules.len() - 1; i >= 0; i-- {
+					let r = rules[i]
+					continue unless attrRuleMatches(r, path, caseFold)
+					for let (k, name) in r.names {
+						applyAttr(out, decided, name, r.values[k], 0)
+					}
+				}
+			}
+			return out
+		}
+
+		// Sets an attribute unless a stronger rule did, expanding a macro.
+		internal def applyAttr(out map<string, AttrValue>, decided map<string, bool>, name string, v AttrValue, depth int) {
+			return when decided.hasKey(name)
+			decided[name] = true
+			out[name] = v unless v.state == "unspecified"
+			let expansion = macros.get(name)
+			if !(expansion is none) && v.state == "set" && depth < 8 {
+				for let e in expansion {
+					let (n, value) = e
+					applyAttr(out, decided, n, value, depth + 1)
+				}
+			}
+		}
+
+		// The value of one attribute for the path.
+		def get(path string, name string) AttrValue {
+			let v = all(path).get(name)
+			return v is none ?? (AttrValue{}, v)
+		}
+	}
+
+	// Reads a file's lines into rules; macros are taken from it when
+	// `macrosAllowed`.
+	internal def parseAttributes(rules AttributeRules, text string, base string, macrosAllowed bool) AttrRule[] {
+		let out AttrRule[] = []
+		for let raw in text.split("\n") {
+			let line = raw.trim()
+			continue when line == "" || line.startsWith("#")
+			let (pattern, rest) = splitAttrLine(line)
+			continue when pattern == ""
+			let assigns = parseAssignments(rest)
+			if pattern.startsWith("[attr]") {
+				rules.macros[pattern.slice(6)] = assigns when macrosAllowed
+				continue
+			}
+			// Negative patterns are not allowed in attributes files.
+			continue when pattern.startsWith("!")
+			let p = pattern
+			// A pattern for folders only never matches a file.
+			continue when p.endsWith("/")
+			let basename = !p.contains("/")
+			p = p.slice(1) when p.startsWith("/")
+			let names string[] = []
+			let values AttrValue[] = []
+			for let a in assigns {
+				let (n, v) = a
+				names.push(n)
+				values.push(v)
+			}
+			out.push(AttrRule{pattern: p, basename: basename, base: base, names: names, values: values})
+		}
+		return out
+	}
+
+	// `pattern attrs...`, with a quoted pattern allowed.
+	internal def splitAttrLine(line string) (string, string) {
+		let b = line.bytes()
+		if b.len() > 0 && b[0] == 0x22 {
+			let close = indexByte(b, 0x22, 1, b.len())
+			if close > 0 {
+				return (string(b[1:close]), string(b[close + 1:]).trim())
+			}
+		}
+		let i = 0
+		for i < b.len() && b[i] != 0x20 && b[i] != 0x09 {
+			i++
+		}
+		return (string(b[0:i]), string(b[i:]).trim())
+	}
+
+	internal def parseAssignments(text string) (string, AttrValue)[] {
+		let out (string, AttrValue)[] = []
+		for let word in text.replace("\t", " ").split(" ") {
+			continue when word == ""
+			if word.startsWith("-") {
+				out.push((word.slice(1), AttrValue{state: "unset"}))
+			} else if word.startsWith("!") {
+				out.push((word.slice(1), AttrValue{state: "unspecified"}))
+			} else {
+				let eq = word.indexOf("=")
+				if eq < 0 {
+					out.push((word, AttrValue{state: "set"}))
+				} else {
+					out.push((word.slice(0, eq), AttrValue{state: "value", value: word.slice(eq + 1)}))
+				}
+			}
+		}
+		return out
+	}
+
+	internal def attrRuleMatches(rule AttrRule, path string, caseFold bool) bool {
+		return false unless rule.base == "" || path.startsWith(rule.base)
+		let rel = path.slice(rule.base.len())
+		return wildmatch(rule.pattern, rule.basename ?? (pathBase(rel), rel), true, caseFold)
+	}
+
+	// The attributes rules of a repository: its working tree's files, and the
+	// global, system and info/attributes files.
+	def attributeRules(repo Repository) AttributeRules {
+		let rules = new AttributeRules(repo.workDir)
+		rules.caseFold = repo.config.getBool("core.ignorecase", false) onerror recover false
+		let home = os.homeDir() onerror recover ""
+		let xdgDefault = home == "" ?? ("", os.join(home, ".config", "git", "attributes"))
+		for let path in ["/etc/gitattributes", repo.config.getPath("core.attributesfile", xdgDefault)] {
+			continue when path == ""
+			let text = string(os.readFile(path) onerror recover byte[])
+			rules.low.push(...parseAttributes(rules, text, "", true))
+		}
+		let info = string(os.readFile(os.join(repo.commonDir, "info", "attributes")) onerror recover byte[])
+		rules.high = parseAttributes(rules, info, "", true)
+		return rules
+	}
+}

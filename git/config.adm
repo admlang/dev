@@ -1,0 +1,754 @@
+partial module adm.dev.git {
+	use std.os
+
+	// Where a configuration value came from, from the widest to the
+	// narrowest; a narrower one wins.
+	enum ConfigScope {
+		System,
+		Global,
+		Local,
+		Worktree,
+		// Set by the program for this repository object only.
+		Program
+	}
+
+	// One value: `section.subsection.key = value` from a file.
+	struct ConfigEntry {
+		// Lower case.
+		section    string
+		// As written: subsections are case-sensitive. Empty when there is none.
+		subsection string
+		// Lower case.
+		key        string
+		// none for a key written without `=` (boolean true).
+		value      ?string
+		scope      ConfigScope
+		// The file it came from; empty for a program value.
+		file       string
+	}
+
+	// What conditional includes are decided on.
+	internal struct IncludeContext {
+		gitDir   string = ""
+		worktree string = ""
+		branch   string = ""
+		// remote.*.url values of every file, for hasconfig:remote.*.url.
+		urls     string[] = []
+	}
+
+	// One file a Config reads, and the scope it gives its values.
+	internal struct ConfigSource {
+		path  string
+		scope ConfigScope
+	}
+
+	// Config is the configuration a repository sees: the system, global,
+	// repository and worktree files with their includes, then the values
+	// the program set. The last value of a key wins.
+	type Config {
+		entries   ConfigEntry[]  = []
+		// The repository's own file, which `set` and `unset` write.
+		file      string         = ""
+		sources   ConfigSource[] = []
+		context   IncludeContext = IncludeContext{}
+		overrides ConfigEntry[]  = []
+
+		def new() {}
+
+		// The last value of `name` (`section.key` or
+		// `section.subsection.key`), none when it is not set. A key written
+		// without `=` reads as "true".
+		def get(name string) ?string {
+			let (section, subsection, key) = splitConfigName(name)
+			for let i = entries.len() - 1; i >= 0; i-- {
+				let e = entries[i]
+				if e.key == key && e.section == section && e.subsection == subsection {
+					let v = e.value
+					return v is none ?? ("true", v)
+				}
+			}
+			return none
+		}
+
+		// The last value of `name`, `fallback` when it is not set.
+		def get(name string, fallback string) string {
+			let v = get(name)
+			return v is none ?? (fallback, v)
+		}
+
+		// Every value of a multi-valued key, in order.
+		def all(name string) string[] {
+			let (section, subsection, key) = splitConfigName(name)
+			let out string[] = []
+			for let e in entries {
+				if e.key == key && e.section == section && e.subsection == subsection {
+					let v = e.value
+					out.push(v is none ?? ("true", v))
+				}
+			}
+			return out
+		}
+
+		// The value as git reads a boolean (`true`, `yes`, `on`, `1`, or a
+		// key without `=`; `false`, `no`, `off`, `0` or empty), `fallback`
+		// when unset. Fails on anything else.
+		def getBool(name string, fallback bool) !bool {
+			let v = get(name)
+			return fallback when v is none
+			return try parseConfigBool(v)
+		}
+
+		// The value as git reads an integer, with an optional `k`, `m` or `g`
+		// suffix, `fallback` when unset. Fails when it is not a number.
+		def getInt(name string, fallback int) !int {
+			let v = get(name)
+			return fallback when v is none
+			return try parseConfigInt(v)
+		}
+
+		// The value as a path: `~/` expands to the home folder. `fallback`
+		// when unset.
+		def getPath(name string, fallback string) string {
+			let v = get(name)
+			return fallback when v is none
+			return expandHome(v)
+		}
+
+		// The subsections that have a value under the section, in order of
+		// first appearance: the remote names of `remote`, the branch names of
+		// `branch`.
+		def subsections(section string) string[] {
+			let s = section.lower()
+			let out string[] = []
+			for let e in entries {
+				out.push(e.subsection) when e.section == s && e.subsection != "" && !out.includes(e.subsection)
+			}
+			return out
+		}
+
+		// Sets a value for this repository object only, over every file.
+		def override(name string, value string) {
+			let (section, subsection, key) = splitConfigName(name)
+			let e = ConfigEntry{section: section, subsection: subsection, key: key, value: value, scope: ConfigScope.Program, file: ""}
+			overrides.push(e)
+			entries.push(e)
+		}
+
+		// Sets `name` in the repository's own file, replacing its last value
+		// there (or every value with `replaceAll`). Fails when the name is
+		// malformed or the file cannot be written.
+		def set(name string, value string, replaceAll bool = false) !none {
+			try checkConfigName(name)
+			let f = try readConfigFile(file)
+			f.set(name, value, replaceAll)
+			try f.write()
+			try reload()
+			return none
+		}
+
+		// Adds a value to a multi-valued key in the repository's own file.
+		// Fails when the name is malformed or the file cannot be written.
+		def add(name string, value string) !none {
+			try checkConfigName(name)
+			let f = try readConfigFile(file)
+			f.add(name, value)
+			try f.write()
+			try reload()
+			return none
+		}
+
+		// Removes `name` from the repository's own file: its last value, or
+		// every value with `all`. Fails when the file cannot be written.
+		def unset(name string, all bool = false) !none {
+			let f = try readConfigFile(file)
+			f.unset(name, all)
+			try f.write()
+			try reload()
+			return none
+		}
+
+		// Removes a whole section (`remote.origin`) from the repository's own
+		// file. Fails when the file cannot be written.
+		def removeSection(name string) !none {
+			let f = try readConfigFile(file)
+			f.removeSection(name)
+			try f.write()
+			try reload()
+			return none
+		}
+
+		// Renames a section (`branch.old` to `branch.new`) in the repository's
+		// own file. Fails when the file cannot be written.
+		def renameSection(from string, to string) !none {
+			let f = try readConfigFile(file)
+			f.renameSection(from, to)
+			try f.write()
+			try reload()
+			return none
+		}
+
+		// Reads every file again, then the program's values. Fails when a
+		// file is malformed.
+		def reload() !none {
+			// hasconfig:remote.*.url looks at every file's remote URLs first.
+			entries = []
+			let first = context
+			first.urls = []
+			for let src in sources {
+				try load(src.path, src.scope, first, 0)
+			}
+			let urls string[] = []
+			for let e in entries {
+				let v = e.value
+				urls.push(v) when e.section == "remote" && e.key == "url" && !(v is none)
+			}
+			context = IncludeContext{...context, urls: urls}
+			entries = []
+			for let src in sources {
+				try load(src.path, src.scope, context, 0)
+			}
+			entries = entries + overrides
+			return none
+		}
+
+		// Reads a file and the files it includes into the entries. A missing
+		// file adds nothing. Fails when it is malformed.
+		internal def load(path string, scope ConfigScope, ctx IncludeContext, depth int) !none {
+			fail "git: config includes nest too deep at {path}" when depth > 10
+			return none unless os.exists(path) onerror recover false
+			let text = string(try os.readFile(path))
+			let parsed = try parseConfigText(text, path)
+			for let p in parsed {
+				let e = ConfigEntry{section: p.section, subsection: p.subsection, key: p.key, value: p.value, scope: scope, file: path}
+				entries.push(e)
+				let v = p.value
+				continue when v is none || p.key != "path"
+				let include = p.section == "include" && p.subsection == ""
+				let conditional = p.section == "includeif" && p.subsection != ""
+				continue unless include || conditional
+				continue when conditional && !includeApplies(p.subsection, path, ctx)
+				let target = expandHome(v)
+				target = os.join(os.dir(path), target) unless os.isAbs(target)
+				try load(target, scope, ctx, depth + 1)
+			}
+			return none
+		}
+	}
+
+	// Whether an includeIf condition holds.
+	internal def includeApplies(condition string, file string, ctx IncludeContext) bool {
+		let colon = condition.indexOf(":")
+		return false when colon < 0
+		let keyword = condition.slice(0, colon)
+		let pattern = condition.slice(colon + 1)
+		switch keyword {
+			case "gitdir", "gitdir/i":
+				return false when ctx.gitDir == ""
+				return wildmatch(includePattern(pattern, file, true), withSlash(ctx.gitDir), true, keyword == "gitdir/i")
+			case "worktree", "worktree/i":
+				return false when ctx.worktree == ""
+				return wildmatch(includePattern(pattern, file, true), withSlash(ctx.worktree), true, keyword == "worktree/i")
+			case "onbranch":
+				return false when ctx.branch == ""
+				return wildmatch(includePattern(pattern, file, false), ctx.branch, true, false)
+			case "hasconfig":
+				let rest = pattern
+				return false unless rest.startsWith("remote.*.url:")
+				let glob = rest.slice("remote.*.url:".len())
+				for let u in ctx.urls {
+					return true when wildmatch(glob, u, true, false)
+				}
+				return false
+		}
+		return false
+	}
+
+	internal def withSlash(path string) string {
+		return path.endsWith("/") ?? (path, path + "/")
+	}
+
+	// A gitdir/worktree/onbranch pattern as matched: `~/` and `./`
+	// expanded, `**/` in front of a relative path, `**` after a trailing `/`.
+	internal def includePattern(raw string, file string, isPath bool) string {
+		let p = raw
+		if isPath {
+			if p.startsWith("~/") {
+				p = expandHome(p)
+			} else if p.startsWith("./") {
+				p = os.join(os.dir(file), p.slice(2))
+			} else if !p.startsWith("/") {
+				p = "**/" + p
+			}
+		}
+		p = p + "**" when p.endsWith("/")
+		return p
+	}
+
+	// `~/x` as a path in the home folder; anything else unchanged.
+	internal def expandHome(path string) string {
+		return path unless path == "~" || path.startsWith("~/")
+		let home = os.homeDir() onerror recover ""
+		return path.len() == 1 ?? (home, os.join(home, path.slice(2)))
+	}
+
+	// git's reading of a boolean value. Fails on anything else.
+	def parseConfigBool(value string) !bool {
+		let v = value.lower()
+		return true when v := "true" || "yes" || "on" || "1"
+		return false when v := "false" || "no" || "off" || "0" || ""
+		fail "git: bad boolean config value '{value}'"
+	}
+
+	// git's reading of an integer value with a `k`, `m` or `g` suffix.
+	// Fails when it is not a number.
+	def parseConfigInt(value string) !int {
+		let v = value.trim()
+		fail "git: bad numeric config value '{value}'" when v == ""
+		let scale = 1
+		let last = v.lower().slice(v.len() - 1)
+		switch last {
+			case "k":
+				scale = 1024
+			case "m":
+				scale = 1024 * 1024
+			case "g":
+				scale = 1024 * 1024 * 1024
+		}
+		let digits = scale == 1 ?? (v, v.slice(0, v.len() - 1))
+		let negative = digits.startsWith("-")
+		let body = negative || digits.startsWith("+") ?? (digits.slice(1), digits)
+		fail "git: bad numeric config value '{value}'" unless body != "" && body.isNumeric() && !body.contains(".")
+		let n = body.toInt<int>() * scale
+		return negative ?? (-n, n)
+	}
+
+	// `section.key` or `section.sub.section.key` as section (lower case),
+	// subsection (as written) and key (lower case).
+	internal def splitConfigName(name string) (string, string, string) {
+		let first = name.indexOf(".")
+		let last = name.lastIndexOf(".")
+		return (name.lower(), "", "") when first < 0
+		let section = name.slice(0, first).lower()
+		let key = name.slice(last + 1).lower()
+		let subsection = first == last ?? ("", name.slice(first + 1, last))
+		return (section, subsection, key)
+	}
+
+	// Fails unless the name has a section and a key git accepts.
+	internal def checkConfigName(name string) !none {
+		let (section, _, key) = splitConfigName(name)
+		fail "git: invalid config key '{name}'" when section == "" || key == ""
+		for let c in key.bytes() {
+			fail "git: invalid config key '{name}'" unless isConfigKeyChar(c)
+		}
+		let k0 = key.bytes()[0]
+		fail "git: invalid config key '{name}'" unless (k0 >= 0x61 && k0 <= 0x7A) || (k0 >= 0x41 && k0 <= 0x5A)
+		return none
+	}
+
+	internal def isConfigKeyChar(c byte) bool {
+		return (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) || (c >= 0x30 && c <= 0x39) || c == 0x2D
+	}
+
+	// One variable as a file holds it, with where its line starts and ends
+	// (end includes the newline).
+	internal struct ParsedEntry {
+		section    string
+		subsection string
+		key        string
+		value      ?string
+		start      int
+		end        int
+	}
+
+	// One section header as a file holds it: its names and where the
+	// header's line starts and the section's last line ends.
+	internal struct ParsedSection {
+		section    string
+		subsection string
+		start      int
+		end        int
+	}
+
+	// The entries of a configuration file's text. Fails on a malformed line.
+	internal def parseConfigText(text string, path string) !ParsedEntry[] {
+		let (entries, _) = try parseConfigLayout(text.bytes(), path)
+		return entries
+	}
+
+	// The entries and section headers of a configuration file, with where
+	// each sits in the text.
+	internal def parseConfigLayout(data byte[], path string) !(ParsedEntry[], ParsedSection[]) {
+		let entries ParsedEntry[] = []
+		let sections ParsedSection[] = []
+		let n = data.len()
+		let i = 0
+		let line = 1
+		let section = ""
+		let subsection = ""
+		// A byte-order mark at the start is skipped.
+		i = 3 when n >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF
+		for i < n {
+			let lineStart = i
+			for i < n && (data[i] == 0x20 || data[i] == 0x09 || data[i] == 0x0D) {
+				i++
+			}
+			break when i >= n
+			let c = data[i]
+			if c == 0x0A {
+				i++
+				line++
+				continue
+			}
+			if c == 0x23 || c == 0x3B {
+				for i < n && data[i] != 0x0A {
+					i++
+				}
+				continue
+			}
+			if c == 0x5B {
+				let (s, sub, next) = try parseSectionHeader(data, i + 1, path, line)
+				section = s
+				subsection = sub
+				let last = sections.len() - 1
+				if last >= 0 {
+					sections[last] = ParsedSection{...sections[last], end: lineStart}
+				}
+				sections.push(ParsedSection{section: s, subsection: sub, start: lineStart, end: n})
+				i = next
+				// The rest of the header's line may hold a variable.
+				for i < n && (data[i] == 0x20 || data[i] == 0x09) {
+					i++
+				}
+				continue
+			}
+			fail "git: bad config line {line} in {path}" when section == ""
+			let keyStart = i
+			for i < n && isConfigKeyChar(data[i]) {
+				i++
+			}
+			fail "git: bad config line {line} in {path}" when i == keyStart
+			let key = string(data[keyStart:i]).lower()
+			for i < n && (data[i] == 0x20 || data[i] == 0x09) {
+				i++
+			}
+			let value ?string = none
+			if i < n && data[i] == 0x3D {
+				let (v, next, lines) = try parseConfigValue(data, i + 1, path, line)
+				value = v
+				i = next
+				line += lines
+			} else {
+				fail "git: bad config line {line} in {path}" unless i >= n || data[i] == 0x0A || data[i] == 0x23 || data[i] == 0x3B || data[i] == 0x0D
+				for i < n && data[i] != 0x0A {
+					i++
+				}
+			}
+			let end = i < n ?? (i + 1, i)
+			entries.push(ParsedEntry{section: section, subsection: subsection, key: key, value: value, start: lineStart, end: end})
+			i = end
+			line++ when end > 0 && data[end - 1] == 0x0A
+		}
+		let last = sections.len() - 1
+		if last >= 0 {
+			sections[last] = ParsedSection{...sections[last], end: n}
+		}
+		return (entries, sections)
+	}
+
+	// A section header after its `[`: the section (lower case), the
+	// subsection, and where the text goes on after the `]`.
+	internal def parseSectionHeader(data byte[], from int, path string, line int) !(string, string, int) {
+		let n = data.len()
+		let i = from
+		let start = i
+		for i < n && (isConfigKeyChar(data[i]) || data[i] == 0x2E) {
+			i++
+		}
+		let name = string(data[start:i])
+		fail "git: bad section header on line {line} in {path}" when name == ""
+		if i < n && data[i] == 0x5D {
+			let dot = name.indexOf(".")
+			// The old `[section.subsection]` form: the subsection in lower case.
+			if dot >= 0 {
+				return (name.slice(0, dot).lower(), name.slice(dot + 1).lower(), i + 1)
+			}
+			return (name.lower(), "", i + 1)
+		}
+		fail "git: bad section header on line {line} in {path}" unless i < n && (data[i] == 0x20 || data[i] == 0x09)
+		for i < n && (data[i] == 0x20 || data[i] == 0x09) {
+			i++
+		}
+		fail "git: bad section header on line {line} in {path}" unless i < n && data[i] == 0x22
+		i++
+		let sub byte[] = []
+		for {
+			fail "git: bad section header on line {line} in {path}" when i >= n || data[i] == 0x0A
+			let c = data[i]
+			if c == 0x22 {
+				i++
+				break
+			}
+			if c == 0x5C {
+				i++
+				fail "git: bad section header on line {line} in {path}" when i >= n || data[i] == 0x0A
+				sub.push(data[i])
+				i++
+				continue
+			}
+			sub.push(c)
+			i++
+		}
+		fail "git: bad section header on line {line} in {path}" unless i < n && data[i] == 0x5D
+		return (name.lower(), string(sub), i + 1)
+	}
+
+	// A value after its `=`: unquoted text with surrounding blanks dropped,
+	// quoted parts kept as written, escapes, `\` line continuations, and a
+	// comment ending it. Returns the value, where the line ends (at its
+	// newline), and how many continuation lines it took.
+	internal def parseConfigValue(data byte[], from int, path string, line int) !(string, int, int) {
+		let n = data.len()
+		let i = from
+		let out byte[] = []
+		let quoted = false
+		// Length of out up to the last character that is not trailing blank
+		// outside quotes.
+		let keep = 0
+		let lines = 0
+		for i < n && (data[i] == 0x20 || data[i] == 0x09) {
+			i++
+		}
+		for i < n {
+			let c = data[i]
+			if c == 0x0A {
+				fail "git: unterminated quote on line {line} in {path}" when quoted
+				break
+			}
+			if !quoted && (c == 0x23 || c == 0x3B) {
+				for i < n && data[i] != 0x0A {
+					i++
+				}
+				break
+			}
+			if c == 0x22 {
+				quoted = !quoted
+				i++
+				continue
+			}
+			if c == 0x5C {
+				i++
+				fail "git: bad escape on line {line} in {path}" when i >= n
+				let e = data[i]
+				i++
+				switch int(e) {
+					case 0x0A:
+						lines++
+						continue
+					case 0x0D:
+						if i < n && data[i] == 0x0A {
+							i++
+							lines++
+							continue
+						}
+						fail "git: bad escape on line {line} in {path}"
+					case 0x6E:
+						out.push(0x0A)
+					case 0x74:
+						out.push(0x09)
+					case 0x62:
+						out.push(0x08)
+					case 0x5C, 0x22:
+						out.push(e)
+					default:
+						fail "git: bad escape on line {line} in {path}"
+				}
+				keep = out.len()
+				continue
+			}
+			if c == 0x0D && i + 1 < n && data[i + 1] == 0x0A && !quoted {
+				i++
+				continue
+			}
+			out.push(c)
+			if quoted || !(c == 0x20 || c == 0x09) {
+				keep = out.len()
+			}
+			i++
+		}
+		fail "git: unterminated quote on line {line} in {path}" when quoted
+		out.len(keep)
+		return (string(out), i, lines)
+	}
+
+	// A value written so that reading it gives it back: quoted when it has
+	// blanks at either end or a comment character, with `\`, `"`, newline
+	// and tab escaped.
+	internal def quoteConfigValue(value string) string {
+		let b = value.bytes()
+		let needs = b.len() > 0 && (b[0] == 0x20 || b[0] == 0x09 || b[b.len() - 1] == 0x20 || b[b.len() - 1] == 0x09)
+		let out byte[] = []
+		for let c in b {
+			switch int(c) {
+				case 0x5C:
+					out.push(0x5C, 0x5C)
+				case 0x22:
+					out.push(0x5C, 0x22)
+				case 0x0A:
+					out.push(0x5C, 0x6E)
+				case 0x09:
+					out.push(0x5C, 0x74)
+				case 0x08:
+					out.push(0x5C, 0x62)
+				case 0x23, 0x3B:
+					needs = true
+					out.push(c)
+				default:
+					out.push(c)
+			}
+		}
+		let s = string(out)
+		return needs ?? ("\"{s}\"", s)
+	}
+
+	// A section header for writing: `[section]` or `[section "sub"]`.
+	internal def sectionHeader(section string, subsection string) string {
+		return "[{section}]" when subsection == ""
+		let sub = subsection.replace("\\", "\\\\").replace("\"", "\\\"")
+		return "[{section} \"{sub}\"]"
+	}
+
+	// The configuration file at path, empty when it does not exist. Fails
+	// when it cannot be read.
+	internal def readConfigFile(path string) !ConfigFile {
+		fail "git: no configuration file to write" when path == ""
+		let exists = os.exists(path) onerror recover false
+		let data byte[] = []
+		data = try os.readFile(path) when exists
+		return new ConfigFile(path, data)
+	}
+
+	// ConfigFile is one configuration file as text, edited in place so that
+	// comments, order and layout stay as the user wrote them.
+	internal type ConfigFile {
+		path string
+		text byte[]
+
+		def new(path string, text byte[]) {
+			self.path = path
+			self.text = text
+		}
+
+		def write() !none {
+			try writeAtomically(path, text)
+			return none
+		}
+
+		def layout() (ParsedEntry[], ParsedSection[]) {
+			return parseConfigLayout(text, path) onerror recover (ParsedEntry[], ParsedSection[])
+		}
+
+		def splice(start int, end int, insert string) {
+			text = text[0:start] + insert.bytes() + text[end:]
+		}
+
+		def set(name string, value string, replaceAll bool) {
+			let (section, subsection, key) = splitConfigName(name)
+			let line = "\t{key} = {quoteConfigValue(value)}\n"
+			let (entries, sections) = layout()
+			let matches ParsedEntry[] = entries.filter(e => e.section == section && e.subsection == subsection && e.key == key)
+			if matches.len() > 0 {
+				let last = matches[matches.len() - 1]
+				if replaceAll {
+					for let i = matches.len() - 2; i >= 0; i-- {
+						let m = matches[i]
+						// Removed from the end back, so earlier offsets hold.
+						splice(m.start, m.end, "")
+					}
+					let (again, _) = layout()
+					let remaining = again.filter(e => e.section == section && e.subsection == subsection && e.key == key)
+					let only = remaining[remaining.len() - 1]
+					splice(only.start, only.end, line)
+					return
+				}
+				splice(last.start, last.end, line)
+				return
+			}
+			insert(section, subsection, line, sections)
+		}
+
+		def add(name string, value string) {
+			let (section, subsection, key) = splitConfigName(name)
+			let (entries, sections) = layout()
+			let line = "\t{key} = {quoteConfigValue(value)}\n"
+			let matches = entries.filter(e => e.section == section && e.subsection == subsection && e.key == key)
+			if matches.len() > 0 {
+				let last = matches[matches.len() - 1]
+				splice(last.end, last.end, line)
+				return
+			}
+			insert(section, subsection, line, sections)
+		}
+
+		// Adds the line at the end of the last matching section, or in a new
+		// section at the end of the file.
+		def insert(section string, subsection string, line string, sections ParsedSection[]) {
+			for let i = sections.len() - 1; i >= 0; i-- {
+				let s = sections[i]
+				if s.section == section && s.subsection == subsection {
+					let at = s.end
+					let prefix = at > 0 && text[at - 1] != 0x0A ?? ("\n", "")
+					splice(at, at, prefix + line)
+					return
+				}
+			}
+			let prefix = text.len() > 0 && text[text.len() - 1] != 0x0A ?? ("\n", "")
+			text = text + (prefix + sectionHeader(section, subsection) + "\n" + line).bytes()
+		}
+
+		def unset(name string, all bool) {
+			let (section, subsection, key) = splitConfigName(name)
+			let (entries, _) = layout()
+			let matches = entries.filter(e => e.section == section && e.subsection == subsection && e.key == key)
+			return when matches.len() == 0
+			if !all {
+				let last = matches[matches.len() - 1]
+				splice(last.start, last.end, "")
+				return
+			}
+			for let i = matches.len() - 1; i >= 0; i-- {
+				splice(matches[i].start, matches[i].end, "")
+			}
+		}
+
+		def removeSection(name string) {
+			let dot = name.indexOf(".")
+			let section = dot < 0 ?? (name.lower(), name.slice(0, dot).lower())
+			let subsection = dot < 0 ?? ("", name.slice(dot + 1))
+			let (_, sections) = layout()
+			for let i = sections.len() - 1; i >= 0; i-- {
+				let s = sections[i]
+				splice(s.start, s.end, "") when s.section == section && s.subsection == subsection
+			}
+		}
+
+		def renameSection(from string, to string) {
+			let dot = from.indexOf(".")
+			let section = dot < 0 ?? (from.lower(), from.slice(0, dot).lower())
+			let subsection = dot < 0 ?? ("", from.slice(dot + 1))
+			let toDot = to.indexOf(".")
+			let newSection = toDot < 0 ?? (to.lower(), to.slice(0, toDot).lower())
+			let newSub = toDot < 0 ?? ("", to.slice(toDot + 1))
+			let (_, sections) = layout()
+			for let i = sections.len() - 1; i >= 0; i-- {
+				let s = sections[i]
+				continue unless s.section == section && s.subsection == subsection
+				// Replace the header only: up to its `]`.
+				let close = indexByte(text, 0x5D, s.start, s.end)
+				continue when close < 0
+				let open = indexByte(text, 0x5B, s.start, close)
+				splice(open, close + 1, sectionHeader(newSection, newSub))
+			}
+		}
+	}
+}

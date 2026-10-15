@@ -1,0 +1,65 @@
+partial module adm.dev.git {
+	// The funcname patterns this library uses for git's built-in diff driver
+	// names (`*.c diff=cpp` in .gitattributes), in xfuncname syntax, and
+	// whether they ignore case; ("", false) for a name that is not one.
+	// They find the same kinds of lines git's do (definitions, classes,
+	// sections); git's own expressions are not reproduced, so a header can
+	// name a different line in unusual code.
+	internal def builtinFuncname(name string) (string, bool) {
+		switch name {
+			case "ada":
+				return ("!^(.*[ \\t])?(is[ \\t]+new|renames|is[ \\t]+separate)([ \\t].*)?$\n!^[ \\t]*with[ \\t].*$\n^[ \\t]*((procedure|function)[ \\t]+.*)$\n^[ \\t]*((package|protected|task)[ \\t]+.*)$", true)
+			case "bash":
+				return ("^[ \\t]*((function[ \\t]+)?[a-zA-Z_][a-zA-Z0-9_]*[ \\t]*\\(\\)[ \\t]*.*|function[ \\t]+[a-zA-Z_][a-zA-Z0-9_]*.*)$", false)
+			case "bibtex":
+				return ("^(@[a-zA-Z]+\\\{[^,]*,?).*$", false)
+			case "cpp":
+				return ("!^[ \\t]*[A-Za-z_][A-Za-z_0-9]*:[[:space:]]*($|/[/*])\n^((::[[:space:]]*)?[A-Za-z_].*)$", false)
+			case "csharp":
+				return ("!^[ \\t]*(do|while|for|foreach|if|else|new|default|return|switch|case|throw|catch|using|lock|fixed)\\b\n^[ \\t]*(((static|public|internal|private|protected|new|unsafe|sealed|abstract|partial|virtual|override|async|extern|readonly)[ \\t]+)*[][<>@.~_[:alnum:]]+[ \\t]+[<>@._[:alnum:]]+[ \\t]*\\(.*\\))[ \\t]*$\n^[ \\t]*(((static|public|internal|private|protected|new|abstract|sealed|partial)[ \\t]+)*(class|enum|interface|struct|record|namespace)[ \\t]+.*)$", false)
+			case "css":
+				return ("!^.*;\n^[_a-z0-9].*$", true)
+			case "dts":
+				return ("!;\n!=\n^[ \\t]*((/[ \\t]*\\\{|&?[a-zA-Z_]).*)", false)
+			case "elixir":
+				return ("^[ \\t]*((def(macro|module|impl|protocol|p)?|test)[ \\t].*)$", false)
+			case "fortran":
+				return ("!^([C*]|[ \\t]*!)\n!^[ \\t]*MODULE[ \\t]+PROCEDURE[ \\t]\n^[ \\t]*((END[ \\t]+)?(PROGRAM|MODULE|BLOCK[ \\t]+DATA|([^!'\" \\t]+[ \\t]+)*(SUBROUTINE|FUNCTION))[ \\t]+[A-Z].*)$", true)
+			case "fountain":
+				return ("^((\\.[^.]|(int|ext|est|int\\.?/ext|i/e)[. ]).*)$", true)
+			case "golang":
+				return ("^[ \\t]*(func[ \\t]*.*(\\\{[ \\t]*)?)\n^[ \\t]*(type[ \\t].*(struct|interface)[ \\t]*(\\\{[ \\t]*)?)", false)
+			case "html":
+				return ("^[ \\t]*(<[Hh][1-6]([ \\t].*)?>.*)$", false)
+			case "java":
+				return ("!^[ \\t]*(catch|do|for|if|instanceof|new|return|switch|throw|while)\n^[ \\t]*(([a-z-]+[ \\t]+)*(class|enum|interface|record)[ \\t]+.*)$\n^[ \\t]*(([A-Za-z_<>&][][?&<>.,A-Za-z_0-9]*[ \\t]+)+[A-Za-z_][A-Za-z_0-9]*[ \\t]*\\([^;]*)$", false)
+			case "kotlin":
+				return ("^[ \\t]*(([a-z]+[ \\t]+)*(fun|class|interface|object)[ \\t]+.*)$", false)
+			case "markdown":
+				return ("^ \{0,3\}#\{1,6\}[ \\t].*", false)
+			case "matlab":
+				return ("^[ \\t]*((classdef|function)[ \\t].*)$\n^(%%%?|##)[ \\t].*$", false)
+			case "objc":
+				return ("!^[ \\t]*(do|for|if|else|return|switch|while)\n^[ \\t]*([-+][ \\t]*\\([ \\t]*[A-Za-z_][A-Za-z_0-9* \\t]*\\)[ \\t]*[A-Za-z_].*)$\n^[ \\t]*(([A-Za-z_][A-Za-z_0-9]*[ \\t]+)+[A-Za-z_][A-Za-z_0-9]*[ \\t]*\\([^;]*)$\n^(@(implementation|interface|protocol)[ \\t].*)$", false)
+			case "pascal":
+				return ("^(((class[ \\t]+)?(procedure|function)|constructor|destructor|interface|implementation|initialization|finalization)[ \\t]*.*)$\n^(.*=[ \\t]*(class|record).*)$", false)
+			case "perl":
+				return ("^package .*\n^sub [[:alnum:]_':]+[ \\t]*(\\([^)]*\\)[ \\t]*)?(:[^;#]*)?(\\\{[ \\t]*)?(#.*)?$\n^(BEGIN|END|INIT|CHECK|UNITCHECK|AUTOLOAD|DESTROY)[ \\t]*(\\\{[ \\t]*)?(#.*)?$\n^=head[0-9] .*", false)
+			case "php":
+				return ("^[\\t ]*(((public|protected|private|static|abstract|final)[\\t ]+)*function.*)$\n^[\\t ]*((((final|abstract|readonly)[\\t ]+)?class|enum|interface|trait).*)$", false)
+			case "python":
+				return ("^[ \\t]*((class|(async[ \\t]+)?def)[ \\t].*)$", false)
+			case "ruby":
+				return ("^[ \\t]*((class|module|def)[ \\t].*)$", false)
+			case "rust":
+				return ("^[\\t ]*((pub(\\([^\\)]+\\))?[\\t ]+)?((async|const|unsafe|extern([\\t ]+\"[^\"]+\"))[\\t ]+)?(struct|enum|union|mod|trait|fn|impl|macro_rules!)[< \\t]+[^;]*)$", false)
+			case "scheme":
+				return ("^[\\t ]*(\\((([Dd][Ee][Ff][^ \\t]*)|(library|module|struct|class))[\\t ]+.*)$", false)
+			case "swift":
+				return ("^[ \\t]*(((public|private|fileprivate|internal|open|static|final|override|mutating)[ \\t]+)*(func|class|struct|enum|protocol|extension|init)[ \\t]?.*)$", false)
+			case "tex":
+				return ("^(\\\\((sub)*section|chapter|part)\\*?\\\{.*)$", false)
+		}
+		return ("", false)
+	}
+}

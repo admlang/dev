@@ -1,0 +1,554 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.crypto.hash
+	)
+
+	// When `merge` may move the branch without a merge commit.
+	enum FastForward {
+		// When possible (the default).
+		Allow,
+		// Always make a merge commit (`--no-ff`).
+		Never,
+		// Only fast-forward; fail otherwise (`--ff-only`).
+		Only
+	}
+
+	// Options for `merge`.
+	struct MergeCommandOptions {
+		fastForward FastForward  = FastForward.Allow
+		// Make the merge commit when the merge is clean (`--no-commit` off).
+		commit      bool         = true
+		// Stage the merged result without recording a merge (`--squash`).
+		squash      bool         = false
+		// The commit message; empty for git's (`Merge branch 'x'`).
+		message     string       = ""
+		merge       MergeOptions = MergeOptions{}
+	}
+
+	// What `merge`, `cherryPick`, `revert` and `rebase` did.
+	enum SequenceOutcome {
+		UpToDate,
+		FastForward,
+		Committed,
+		// Merged into the index and working tree without a commit
+		// (`--no-commit`, `--squash`).
+		Staged,
+		// Stopped with conflicts in the index and working tree; resolve,
+		// stage and `commit` (or `rebaseContinue`), or abort.
+		Conflicts
+	}
+
+	// The outcome and, when one was made, the new commit, with the
+	// conflicted paths and merge messages.
+	struct SequenceResult {
+		outcome   SequenceOutcome
+		commit    ?ObjectId = none
+		conflicts string[]  = []
+		messages  MergeMessage[] = []
+	}
+
+	// The way git names a revision in a merge message: `branch 'x'`,
+	// `remote-tracking branch 'origin/x'`, `tag 'v1'`, or `commit 'abc'`.
+	internal def mergeSubject(repo Repository, name string) !string {
+		let full = try repo.expandRef(name)
+		if !(full is none) {
+			if full.startsWith("refs/heads/") {
+				return "branch '{full.slice(11)}'"
+			}
+			if full.startsWith("refs/remotes/") {
+				return "remote-tracking branch '{full.slice(13)}'"
+			}
+			if full.startsWith("refs/tags/") {
+				return "tag '{full.slice(10)}'"
+			}
+		}
+		return "commit '{name}'"
+	}
+
+	// Writes a merge result into the index and working tree: the tree's
+	// files, and stages 1 to 3 for each conflicted path. Fails when local
+	// changes would be overwritten.
+	internal def checkoutMergeResult(repo Repository, from ?ObjectId, r MergeResult) !Index {
+		let idx = try switchTrees(repo, from, r.tree, false)
+		if r.stages.len() == 0 {
+			return idx
+		}
+		let lock = try acquireLock(idx.path)
+		let conflicted string[] = []
+		for let s in r.stages {
+			conflicted.push(s.path) unless conflicted.includes(s.path)
+		}
+		// The files keep the conflicted content of the result tree; the index
+		// holds the stages instead of it.
+		for let p in conflicted {
+			idx.remove(p)
+		}
+		for let s in r.stages {
+			idx.add(IndexEntry{path: s.path, id: s.id, mode: s.mode, stage: s.stage}) onerror (err error) {
+				lock.release()
+				fail err
+			}
+		}
+		idx.tree = none
+		lock.write(encodeIndex(idx)) onerror (err error) {
+			lock.release()
+			fail err
+		}
+		try lock.commit()
+		return idx
+	}
+
+	// The conflicted paths of a result, in order.
+	internal def conflictedPaths(r MergeResult) string[] {
+		let out string[] = []
+		for let s in r.stages {
+			out.push(s.path) unless out.includes(s.path)
+		}
+		return out
+	}
+
+	// A message with git's `# Conflicts:` list appended.
+	internal def withConflicts(message string, paths string[]) string {
+		return message when paths.len() == 0
+		let lines = ["", "# Conflicts:"]
+		for let p in paths {
+			lines.push("#\t{p}")
+		}
+		let body = message.endsWith("\n") ?? (message, message + "\n")
+		return body + lines.join("\n") + "\n"
+	}
+
+	// Merges a revision into the current branch as `git merge` does.
+	internal def mergeRevision(repo Repository, rev string, options MergeCommandOptions) !SequenceResult {
+		fail "git: you have not concluded your merge (MERGE_HEAD exists)" when os.exists(os.join(repo.gitDir, "MERGE_HEAD")) onerror recover false
+		let head = try repo.headId()
+		let theirs = try repo.peel(try repo.resolve(rev), ObjectKind.Commit)
+		let branch = try repo.branch()
+		let subject = try mergeSubject(repo, rev)
+		let defaultBranch = branch == "" || branch == "main" || branch == "master"
+		let message = options.message
+		if message == "" {
+			message = defaultBranch ?? ("Merge {subject}\n", "Merge {subject} into {branch}\n")
+		}
+		if head is none {
+			// An unborn branch takes the other side as it is.
+			try switchTrees(repo, none, (try repo.commitAt(theirs)).tree, false)
+			try repo.setRef("HEAD", theirs, "merge {rev}: Fast-forward", zeroId(repo.format))
+			return SequenceResult{outcome: SequenceOutcome.FastForward, commit: theirs}
+		}
+		let ours ObjectId = head
+		if try isAncestor(repo, theirs, ours) {
+			return SequenceResult{outcome: SequenceOutcome.UpToDate}
+		}
+		let canFastForward = try isAncestor(repo, ours, theirs)
+		fail "git: not possible to fast-forward, aborting" when options.fastForward == FastForward.Only && !canFastForward
+		let oursTree = (try repo.commitAt(ours)).tree
+		if canFastForward && options.fastForward != FastForward.Never && !options.squash {
+			try switchTrees(repo, oursTree, (try repo.commitAt(theirs)).tree, false)
+			try os.writeFile(os.join(repo.gitDir, "ORIG_HEAD"), "{ours.str()}\n".bytes())
+			try repo.setRef("HEAD", theirs, "merge {rev}: Fast-forward", ours)
+			return SequenceResult{outcome: SequenceOutcome.FastForward, commit: theirs}
+		}
+		let mo = MergeOptions{...options.merge, ours: "HEAD", theirs: rev}
+		let r = try mergeCommits(repo, ours, theirs, mo)
+		try checkoutMergeResult(repo, oursTree, r)
+		try os.writeFile(os.join(repo.gitDir, "ORIG_HEAD"), "{ours.str()}\n".bytes())
+		let conflicts = conflictedPaths(r)
+		if options.squash {
+			try os.writeFile(os.join(repo.gitDir, "SQUASH_MSG"), "Squashed commit of the following:\n".bytes())
+			return SequenceResult{outcome: conflicts.len() > 0 ?? (SequenceOutcome.Conflicts, SequenceOutcome.Staged), conflicts: conflicts, messages: r.messages}
+		}
+		if conflicts.len() > 0 || !r.clean || !options.commit {
+			try os.writeFile(os.join(repo.gitDir, "MERGE_HEAD"), "{theirs.str()}\n".bytes())
+			try os.writeFile(os.join(repo.gitDir, "MERGE_MSG"), withConflicts(message, conflicts).bytes())
+			try os.writeFile(os.join(repo.gitDir, "MERGE_MODE"), byte[])
+			try os.writeFile(os.join(repo.gitDir, "AUTO_MERGE"), "{r.tree.str()}\n".bytes()) when conflicts.len() > 0
+			let outcome = conflicts.len() > 0 || !r.clean ?? (SequenceOutcome.Conflicts, SequenceOutcome.Staged)
+			return SequenceResult{outcome: outcome, conflicts: conflicts, messages: r.messages}
+		}
+		let who = try repo.identity("committer")
+		let author = try repo.identity("author")
+		let c = new Commit(zeroId(repo.format), r.tree, [ours, theirs], author, who, message)
+		let id = try repo.write(ObjectKind.Commit, c.encode())
+		try repo.setRef("HEAD", id, "merge {rev}: Merge made by the 'ort' strategy.", ours)
+		return SequenceResult{outcome: SequenceOutcome.Committed, commit: id, messages: r.messages}
+	}
+
+	// Throws away a merge, cherry-pick or revert that stopped with
+	// conflicts: the index and working tree go back to HEAD (ORIG_HEAD for a
+	// merge) and the state files are removed.
+	internal def abortSequence(repo Repository) !none {
+		let head = try repo.headId()
+		fail "git: there is nothing to abort" when head is none
+		let tree = (try repo.commitAt(head)).tree
+		try switchTrees(repo, tree, tree, true)
+		for let name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE", "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG"] {
+			os.remove(os.join(repo.gitDir, name)) onerror recover none
+		}
+		return none
+	}
+
+	// Whether a message ends in a block of trailers (`Signed-off-by: x`,
+	// `(cherry picked from commit ...)`), as git's interpret-trailers reads
+	// them: the last paragraph after the subject, all trailers, or a
+	// quarter of them with one git writes itself.
+	def hasTrailers(message string) bool {
+		let paragraphs string[][] = []
+		let current string[] = []
+		for let line in message.split("\n") {
+			if line.trim() == "" {
+				paragraphs.push(current) when current.len() > 0
+				current = []
+				continue
+			}
+			current.push(line)
+		}
+		paragraphs.push(current) when current.len() > 0
+		return false when paragraphs.len() < 2
+		let last = paragraphs[paragraphs.len() - 1]
+		let trailers = 0
+		let gitMade = false
+		let others = 0
+		for let line in last {
+			if line.startsWith(" ") || line.startsWith("\t") {
+				continue
+			}
+			if line.startsWith("(cherry picked from commit ") {
+				trailers++
+				gitMade = true
+				continue
+			}
+			let colon = line.indexOf(":")
+			let token = colon > 0 ?? (line.slice(0, colon).trim(), "")
+			if token != "" && /^[A-Za-z0-9-]+$/.test(token) {
+				trailers++
+				gitMade = true when token.lower() := "signed-off-by" || "co-authored-by"
+			} else {
+				others++
+			}
+		}
+		return true when trailers > 0 && others == 0
+		return gitMade && trailers * 3 >= others
+	}
+
+	// The label git gives a commit in conflict markers: `abc1234 (subject)`.
+	internal def commitLabel(repo Repository, c Commit) string {
+		return "{uniqueAbbrev(repo, c.id, abbrevLength(repo))} ({c.summary})"
+	}
+
+	// Applies the change a commit made (its diff against its parent, or
+	// the `mainline` parent of a merge) onto HEAD, as `git cherry-pick`
+	// does; with `revert`, the reverse of it, as `git revert` does. Fails
+	// when the commit is a merge and no mainline is given.
+	internal def pickCommit(repo Repository, rev string, revert bool, mainline int, recordOrigin bool, commitIt bool, options MergeOptions) !SequenceResult {
+		let c = try repo.commitAt(rev)
+		fail "git: commit {c.id.str()} is a merge but no mainline was given" when c.parents.len() > 1 && mainline == 0
+		fail "git: commit {c.id.str()} does not have parent {mainline}" when mainline > c.parents.len()
+		let head = try repo.headId()
+		fail "git: cannot {revert ?? ("revert", "cherry-pick")} onto an unborn branch" when head is none
+		let parent ?ObjectId = none
+		if c.parents.len() > 0 {
+			parent = c.parents[mainline > 0 ?? (mainline - 1, 0)]
+		}
+		let parentTree ?ObjectId = none
+		parentTree = (try repo.commitAt(parent)).tree unless parent is none
+		let label = commitLabel(repo, c)
+		let base = revert ?? (c.tree, parentTree)
+		let theirs = revert ?? (parentTree, c.tree)
+		let theirsLabel = revert ?? ("parent of {label}", label)
+		let baseLabel = revert ?? (label, "parent of {label}")
+		let headTree = (try repo.commitAt(head)).tree
+		let mo = MergeOptions{...options, ours: "HEAD", theirs: theirsLabel}
+		let r = try mergeTreesWith(repo, base, headTree, theirs, mo, baseLabel, 0)
+		try checkoutMergeResult(repo, headTree, r)
+		let message = c.message
+		if revert {
+			let s = c.summary
+			let quoted = s.startsWith("Revert \"") && s.endsWith("\"") ?? ("Reapply \"{s.slice(8, s.len() - 1)}\"", "Revert \"{s}\"")
+			message = "{quoted}\n\nThis reverts commit {c.id.str()}.\n"
+		} else if recordOrigin {
+			let body = message.endsWith("\n") ?? (message, message + "\n")
+			// A blank line first unless the message ends in trailers.
+			body = body + "\n" unless hasTrailers(body)
+			message = body + "(cherry picked from commit {c.id.str()})\n"
+		}
+		let conflicts = conflictedPaths(r)
+		if conflicts.len() > 0 || !r.clean || !commitIt {
+			let marker = revert ?? ("REVERT_HEAD", "CHERRY_PICK_HEAD")
+			try os.writeFile(os.join(repo.gitDir, marker), "{c.id.str()}\n".bytes()) when conflicts.len() > 0 || !r.clean
+			try os.writeFile(os.join(repo.gitDir, "MERGE_MSG"), withConflicts(message, conflicts).bytes())
+			let outcome = conflicts.len() > 0 || !r.clean ?? (SequenceOutcome.Conflicts, SequenceOutcome.Staged)
+			return SequenceResult{outcome: outcome, conflicts: conflicts, messages: r.messages}
+		}
+		let who = try repo.identity("committer")
+		let author = revert ?? (try repo.identity("author"), c.author)
+		let made = new Commit(zeroId(repo.format), r.tree, [head], author, who, message)
+		made.encoding = c.encoding unless revert
+		let id = try repo.write(ObjectKind.Commit, made.encode())
+		let verb = revert ?? ("revert", "cherry-pick")
+		try repo.setRef("HEAD", id, "{verb}: {made.summary}", head)
+		return SequenceResult{outcome: SequenceOutcome.Committed, commit: id, messages: r.messages}
+	}
+
+	// The commit HEAD is at. Fails on a branch with no commits yet.
+	internal def headCommit(repo Repository) !ObjectId {
+		let head = try repo.headId()
+		fail "git: HEAD has no commit" when head is none
+		return head
+	}
+
+	// ---- rebase ----------------------------------------------------------------------
+
+	// A stable id of the change a commit makes against its first parent: the
+	// same for two commits that change the same lines of the same files,
+	// whatever their history (as git's patch-id, used to drop commits
+	// already upstream).
+	internal def patchId(repo Repository, c Commit) !string {
+		let parentTree ?ObjectId = none
+		parentTree = (try repo.commitAt(c.parents[0])).tree when c.parents.len() > 0
+		let changes = try diffTrees(repo, parentTree, c.tree, ChangeOptions{renames: false})
+		let h = new hash.SHA1()
+		for let ch in changes {
+			h.write("{ch.oldPath}\n{ch.newPath}\n{ch.oldMode} {ch.newMode}\n".bytes())
+			let old = try sideContent(repo, ch, false)
+			let new0 = try sideContent(repo, ch, true)
+			if isBinaryContent(old) || isBinaryContent(new0) {
+				h.write(ch.oldId.bytes)
+				h.write(ch.newId.bytes)
+				continue
+			}
+			let a = splitLines(old)
+			let b = splitLines(new0)
+			for let e in diffLines(old, new0) {
+				for let i = e.oldStart; i < e.oldStart + e.oldCount; i++ {
+					h.write(byte[0x2D] + comparable(a[i], DiffOptions{whitespace: Whitespace.All}))
+				}
+				for let j = e.newStart; j < e.newStart + e.newCount; j++ {
+					h.write(byte[0x2B] + comparable(b[j], DiffOptions{whitespace: Whitespace.All}))
+				}
+			}
+		}
+		return h.hash().hex()
+	}
+
+	// The commits of HEAD not in upstream, oldest first: no merges, and none
+	// whose change is already upstream.
+	internal def rebaseTodo(repo Repository, upstream ObjectId, head ObjectId) !ObjectId[] {
+		let walk = new RevWalk(repo)
+		try walk.push(head)
+		try walk.hide(upstream)
+		walk.order = WalkOrder.Topological
+		walk.reverse = true
+		walk.noMerges = true
+		let mine = try walk.all()
+		// Changes already in upstream since the merge base.
+		let theirsWalk = new RevWalk(repo)
+		try theirsWalk.push(upstream)
+		try theirsWalk.hide(head)
+		theirsWalk.noMerges = true
+		let upstreamIds map<string, bool> = {}
+		for let c in try theirsWalk.all() {
+			upstreamIds[try patchId(repo, c)] = true
+		}
+		let out ObjectId[] = []
+		for let c in mine {
+			out.push(c.id) unless upstreamIds.hasKey(try patchId(repo, c))
+		}
+		return out
+	}
+
+	internal def rebaseDir(repo Repository) string {
+		return os.join(repo.gitDir, "rebase-merge")
+	}
+
+	// Writes the state of a rebase in git's layout, so `git rebase
+	// --continue` (or `rebaseContinue`) can carry on.
+	internal def writeRebaseState(repo Repository, headName string, onto ObjectId, origHead ObjectId, todo ObjectId[], done ObjectId[], stopped ?ObjectId) !none {
+		let dir = rebaseDir(repo)
+		try os.mkdir(dir, true)
+		try os.writeFile(os.join(dir, "head-name"), "{headName}\n".bytes())
+		try os.writeFile(os.join(dir, "onto"), "{onto.str()}\n".bytes())
+		try os.writeFile(os.join(dir, "orig-head"), "{origHead.str()}\n".bytes())
+		let lines string[] = []
+		for let id in todo {
+			let c = try repo.commitAt(id)
+			lines.push("pick {id.str()} {c.summary}")
+		}
+		try os.writeFile(os.join(dir, "git-rebase-todo"), (lines.join("\n") + (lines.len() > 0 ?? ("\n", ""))).bytes())
+		let doneLines string[] = []
+		for let id in done {
+			let c = try repo.commitAt(id)
+			doneLines.push("pick {id.str()} {c.summary}")
+		}
+		try os.writeFile(os.join(dir, "done"), (doneLines.join("\n") + (doneLines.len() > 0 ?? ("\n", ""))).bytes())
+		try os.writeFile(os.join(dir, "msgnum"), "{done.len()}\n".bytes())
+		try os.writeFile(os.join(dir, "end"), "{done.len() + todo.len()}\n".bytes())
+		if !(stopped is none) {
+			let c = try repo.commitAt(stopped)
+			try os.writeFile(os.join(dir, "stopped-sha"), "{stopped.str()}\n".bytes())
+			try os.writeFile(os.join(dir, "message"), c.message.bytes())
+			let a = c.author
+			let seconds = a.date.unixNs() / 1000000000
+			let zone = a.str().slice(a.str().lastIndexOf(" ") + 1)
+			let script = "GIT_AUTHOR_NAME='{a.name.replace("'", "'\\''")}'\nGIT_AUTHOR_EMAIL='{a.email.replace("'", "'\\''")}'\nGIT_AUTHOR_DATE='@{seconds} {zone}'\n"
+			try os.writeFile(os.join(dir, "author-script"), script.bytes())
+		}
+		return none
+	}
+
+	// Replays the commits of the current branch that upstream lacks onto
+	// `onto` (upstream by default), as `git rebase upstream` does for a
+	// linear history: one cherry-pick each, keeping authors and messages,
+	// then the branch moves to the result. Stops at a conflict, leaving the
+	// rebase state in git's format. Fails when HEAD is detached or the
+	// working tree has changes.
+	internal def rebaseOnto(repo Repository, upstream string, onto string) !SequenceResult {
+		fail "git: a rebase is already in progress" when os.exists(rebaseDir(repo)) onerror recover false
+		let headRef = try repo.headRef()
+		fail "git: cannot rebase a detached HEAD" when headRef == ""
+		let head = try repo.headId()
+		fail "git: nothing to rebase" when head is none
+		let status = try repo.status(StatusOptions{untracked: UntrackedMode.No})
+		fail "git: cannot rebase: you have unstaged or staged changes" unless isClean(status)
+		let up = try repo.peel(try repo.resolve(upstream), ObjectKind.Commit)
+		let target = try repo.peel(try repo.resolve(onto == "" ?? (upstream, onto)), ObjectKind.Commit)
+		let todo = try rebaseTodo(repo, up, head)
+		let headId ObjectId = head
+		// Already on top of onto: nothing moves.
+		if try isAncestor(repo, target, headId) {
+			return SequenceResult{outcome: SequenceOutcome.UpToDate}
+		}
+		// Detach at onto, then pick each commit.
+		let headTree = (try repo.commitAt(headId)).tree
+		try switchTrees(repo, headTree, (try repo.commitAt(target)).tree, false)
+		let who = try repo.identity("committer")
+		try repo.refStore.commit([RefUpdate{name: "HEAD", newId: target, message: "rebase (start): checkout {onto == "" ?? (upstream, onto)}", deref: false}], who)
+		try os.writeFile(os.join(repo.gitDir, "ORIG_HEAD"), "{headId.str()}\n".bytes())
+		return try runRebase(repo, headRef, target, headId, todo, [])
+	}
+
+	// Picks the commits left, then finishes; stops at a conflict.
+	internal def runRebase(repo Repository, headRef string, onto ObjectId, origHead ObjectId, todo ObjectId[], done ObjectId[]) !SequenceResult {
+		let left = todo.clone()
+		let finished = done.clone()
+		let messages MergeMessage[] = []
+		for left.len() > 0 {
+			let id = left.shift()
+			finished.push(id)
+			let c = try repo.commitAt(id)
+			let head = try headCommit(repo)
+			let headTree = (try repo.commitAt(head)).tree
+			let parentTree ?ObjectId = none
+			parentTree = (try repo.commitAt(c.parents[0])).tree when c.parents.len() > 0
+			let label = commitLabel(repo, c)
+			let mo = MergeOptions{ours: "HEAD", theirs: label}
+			let r = try mergeTreesWith(repo, parentTree, headTree, c.tree, mo, "parent of {label}", 0)
+			messages.push(...r.messages)
+			try checkoutMergeResult(repo, headTree, r)
+			let conflicts = conflictedPaths(r)
+			if conflicts.len() > 0 || !r.clean {
+				try writeRebaseState(repo, headRef, onto, origHead, left, finished, id)
+				try os.writeFile(os.join(repo.gitDir, "MERGE_MSG"), withConflicts(c.message, conflicts).bytes())
+				try os.writeFile(os.join(repo.gitDir, "REBASE_HEAD"), "{id.str()}\n".bytes())
+				return SequenceResult{outcome: SequenceOutcome.Conflicts, conflicts: conflicts, messages: messages}
+			}
+			if r.tree.equals(headTree) {
+				// The change is already there: nothing to commit.
+				continue
+			}
+			let who = try repo.identity("committer")
+			let made = new Commit(zeroId(repo.format), r.tree, [head], c.author, who, c.message)
+			made.encoding = c.encoding
+			let newId = try repo.write(ObjectKind.Commit, made.encode())
+			try repo.refStore.commit([RefUpdate{name: "HEAD", newId: newId, message: "rebase (pick): {c.summary}", deref: false}], who)
+		}
+		return try finishRebase(repo, headRef, onto, messages)
+	}
+
+	// Moves the branch to where the picks ended, reattaches HEAD and removes
+	// the state.
+	internal def finishRebase(repo Repository, headRef string, onto ObjectId, messages MergeMessage[]) !SequenceResult {
+		let id = try headCommit(repo)
+		let who = try repo.identity("committer")
+		try repo.refStore.commit([RefUpdate{name: headRef, newId: id, message: "rebase (finish): {headRef} onto {onto.str()}", deref: false}], who)
+		try repo.refStore.commit([RefUpdate{name: "HEAD", newTarget: headRef, message: "rebase (finish): returning to {headRef}", deref: false}], who)
+		let dir = rebaseDir(repo)
+		for let e in os.readDir(dir) onerror recover os.DirEntry[] {
+			os.remove(e.path) onerror recover none
+		}
+		os.rmdir(dir) onerror recover none
+		os.remove(os.join(repo.gitDir, "REBASE_HEAD")) onerror recover none
+		os.remove(os.join(repo.gitDir, "MERGE_MSG")) onerror recover none
+		return SequenceResult{outcome: SequenceOutcome.Committed, commit: id, messages: messages}
+	}
+
+	// The commits listed in a rebase todo or done file.
+	internal def readRebaseList(path string) !ObjectId[] {
+		let out ObjectId[] = []
+		let text = string(os.readFile(path) onerror recover byte[])
+		for let line in text.split("\n") {
+			let t = line.trim()
+			continue when t == "" || t.startsWith("#")
+			let parts = t.split(" ")
+			continue unless parts.len() >= 2 && (parts[0] == "pick" || parts[0] == "p")
+			out.push(try parseId(parts[1]))
+		}
+		return out
+	}
+
+	// Carries on a rebase stopped at a conflict once it is resolved and
+	// staged: commits the stopped pick (unless its change came to
+	// nothing), then picks the rest. Fails when conflicts remain.
+	internal def continueRebase(repo Repository) !SequenceResult {
+		let dir = rebaseDir(repo)
+		fail "git: no rebase in progress" unless os.exists(dir) onerror recover false
+		let idx = try repo.index()
+		fail "git: you must resolve all conflicts first ({idx.conflicts().join(", ")})" when idx.conflicts().len() > 0
+		let headRef = string(try os.readFile(os.join(dir, "head-name"))).trim()
+		let onto = try parseId(string(try os.readFile(os.join(dir, "onto"))).trim())
+		let orig = try parseId(string(try os.readFile(os.join(dir, "orig-head"))).trim())
+		let todo = try readRebaseList(os.join(dir, "git-rebase-todo"))
+		let done = try readRebaseList(os.join(dir, "done"))
+		let stoppedPath = os.join(dir, "stopped-sha")
+		if os.exists(stoppedPath) onerror recover false {
+			let stopped = try repo.commitAt(try parseId(string(try os.readFile(stoppedPath)).trim()))
+			let tree = try indexTree(repo, idx)
+			try idx.write()
+			let head = try headCommit(repo)
+			let headTree = (try repo.commitAt(head)).tree
+			if !tree.equals(headTree) {
+				let messagePath = os.join(repo.gitDir, "MERGE_MSG")
+				let message = string(os.readFile(messagePath) onerror recover stopped.message.bytes())
+				let who = try repo.identity("committer")
+				let made = new Commit(zeroId(repo.format), tree, [head], stopped.author, who, cleanMessage(message))
+				let id = try repo.write(ObjectKind.Commit, made.encode())
+				try repo.refStore.commit([RefUpdate{name: "HEAD", newId: id, message: "rebase (continue): {made.summary}", deref: false}], who)
+			}
+			os.remove(stoppedPath) onerror recover none
+		}
+		return try runRebase(repo, headRef, onto, orig, todo, done)
+	}
+
+	// Stops a rebase and puts the branch, index and working tree back as
+	// they were before it.
+	internal def abortRebase(repo Repository) !none {
+		let dir = rebaseDir(repo)
+		fail "git: no rebase in progress" unless os.exists(dir) onerror recover false
+		let headRef = string(try os.readFile(os.join(dir, "head-name"))).trim()
+		let orig = try parseId(string(try os.readFile(os.join(dir, "orig-head"))).trim())
+		let head = try repo.headId()
+		let fromTree ?ObjectId = none
+		fromTree = (try repo.commitAt(head)).tree unless head is none
+		try switchTrees(repo, fromTree, (try repo.commitAt(orig)).tree, true)
+		let who = try repo.identity("committer")
+		try repo.refStore.commit([RefUpdate{name: headRef, newId: orig, message: "rebase (abort): updating {headRef}", deref: false}], who)
+		try repo.refStore.commit([RefUpdate{name: "HEAD", newTarget: headRef, message: "rebase (abort): returning to {headRef}", deref: false}], who)
+		for let e in os.readDir(dir) onerror recover os.DirEntry[] {
+			os.remove(e.path) onerror recover none
+		}
+		os.rmdir(dir) onerror recover none
+		os.remove(os.join(repo.gitDir, "REBASE_HEAD")) onerror recover none
+		return none
+	}
+}

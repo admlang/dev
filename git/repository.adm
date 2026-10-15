@@ -1,0 +1,1066 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// The reference store a repository uses (`extensions.refStorage`).
+	enum RefFormat {
+		Files,
+		Reftable
+	}
+
+	// Repository is a git repository on disk: its object database,
+	// references and configuration, and its working tree unless it is bare.
+	// A repository object is meant for one task at a time.
+	type Repository {
+		// The folder holding HEAD for this worktree (`.git`, or
+		// `.git/worktrees/<name>` for a linked worktree, or the repository
+		// itself when bare).
+		gitDir    string
+		// The folder holding objects, shared refs and config.
+		commonDir string
+		// The working tree; empty for a bare repository.
+		workDir   string
+		format    ObjectFormat
+		refFormat RefFormat
+		config    Config
+		internal objects  ObjectDatabase
+		internal refStore RefBackend
+		internal graph       ?CommitGraph = none
+		internal graphLoaded bool         = false
+		// The commits whose parents the repository lacks (`shallow`), by id.
+		internal shallowIds    map<string, bool> = {}
+		internal shallowLoaded bool              = false
+		// The reachability bitmap, read on first use.
+		internal bitmap        ?PackBitmap       = none
+		internal bitmapLoaded  bool              = false
+		internal attrs       ?AttributeRules = none
+		// Long-running filter processes, by driver name.
+		internal filters     map<string, FilterProcess> = {}
+
+		def new(gitDir string, commonDir string, workDir string, format ObjectFormat, refFormat RefFormat, config Config, objects ObjectDatabase, refStore RefBackend) {
+			self.gitDir = gitDir
+			self.commonDir = commonDir
+			self.workDir = workDir
+			self.format = format
+			self.refFormat = refFormat
+			self.config = config
+			self.objects = objects
+			self.refStore = refStore
+		}
+
+		// Whether the repository has no working tree.
+		def isBare() bool {
+			return workDir == ""
+		}
+
+		// Closes the repository when the last reference to it goes.
+		def dispose() {
+			close()
+		}
+
+		// Unmaps the packs. The repository is not usable after it.
+		def close() {
+			for let (_, f) in filters {
+				f.process.input.close() onerror recover none
+				f.process.wait() onerror recover 0
+			}
+			filters = {}
+			objects.close()
+			let g = graph
+			g.close() unless g is none
+			let b = bitmap
+			b.close() unless b is none
+		}
+
+		// ---- objects -----------------------------------------------------
+
+		// Whether the object is in the repository.
+		def has(id ObjectId) bool {
+			return objects.has(id)
+		}
+
+		// The object with the id. Fails when it is missing or corrupt.
+		def object(id ObjectId) !Object {
+			let (kind, data) = try objects.readRaw(id)
+			let o = try parseObject(kind, id, data)
+			attach(o)
+			return o
+		}
+
+		// The object a revision names (see `resolve`). Fails when it names
+		// nothing or the object is missing.
+		def object(rev string) !Object {
+			return try object(try resolve(rev))
+		}
+
+		// The kind and size of an object, without reading a packed object's
+		// content. Fails when it is missing.
+		def info(id ObjectId) !(ObjectKind, int) {
+			return try objects.info(id)
+		}
+
+		// The raw content of an object and its kind. Fails when it is missing.
+		def raw(id ObjectId) !(ObjectKind, byte[]) {
+			return try objects.readRaw(id)
+		}
+
+		internal def attach(o Object) {
+			if o is Commit {
+				let c Commit = o
+				c.repo = self
+				c.parents = [] when isShallowCommit(self, c.id)
+			} else if o is Tree {
+				let t Tree = o
+				t.repo = self
+			} else if o is Tag {
+				let t Tag = o
+				t.repo = self
+			}
+		}
+
+		// The commit with the id. Fails when it is missing or not a commit.
+		def commitAt(id ObjectId) !Commit {
+			let (kind, data) = try objects.readRaw(id)
+			fail "git: {id.short()} is a {kindName(kind)}, not a commit" unless kind == ObjectKind.Commit
+			let c = try parseCommit(id, data)
+			c.repo = self
+			c.parents = [] when isShallowCommit(self, id)
+			return c
+		}
+
+		// The commit a revision names, peeling tags. Fails when it names no
+		// commit.
+		def commitAt(rev string) !Commit {
+			return try commitAt(try peel(try resolve(rev), ObjectKind.Commit))
+		}
+
+		// The tree with the id. Fails when it is missing or not a tree.
+		def tree(id ObjectId) !Tree {
+			let (kind, data) = try objects.readRaw(id)
+			fail "git: {id.short()} is a {kindName(kind)}, not a tree" unless kind == ObjectKind.Tree
+			let t = try parseTree(id, data)
+			t.repo = self
+			return t
+		}
+
+		// The tree a revision names: a tree, or a commit's or tag's tree.
+		// Fails when it names neither.
+		def tree(rev string) !Tree {
+			return try tree(try peel(try resolve(rev), ObjectKind.Tree))
+		}
+
+		// The blob with the id. Fails when it is missing or not a blob.
+		def blob(id ObjectId) !Blob {
+			let (kind, data) = try objects.readRaw(id)
+			fail "git: {id.short()} is a {kindName(kind)}, not a blob" unless kind == ObjectKind.Blob
+			return new Blob(id, data)
+		}
+
+		// The blob a revision names (`main:README.md`). Fails when it names
+		// no blob.
+		def blob(rev string) !Blob {
+			return try blob(try resolve(rev))
+		}
+
+		// The annotated tag with the id. Fails when it is missing or not a tag.
+		def tag(id ObjectId) !Tag {
+			let (kind, data) = try objects.readRaw(id)
+			fail "git: {id.short()} is a {kindName(kind)}, not a tag" unless kind == ObjectKind.Tag
+			let t = try parseTag(id, data)
+			t.repo = self
+			return t
+		}
+
+		// Follows tags (and for a tree, a commit's tree) from the object until
+		// one of the kind. Fails when the chain ends elsewhere.
+		def peel(id ObjectId, kind ObjectKind) !ObjectId {
+			let current = id
+			for let depth = 0; depth < 64; depth++ {
+				let (k, data) = try objects.readRaw(current)
+				return current when k == kind
+				if k == ObjectKind.Tag {
+					current = (try parseTag(current, data)).target
+					continue
+				}
+				if k == ObjectKind.Commit && kind == ObjectKind.Tree {
+					return (try parseCommit(current, data)).tree
+				}
+				fail "git: {id.short()} is a {kindName(k)}, not a {kindName(kind)}"
+			}
+			fail "git: tag chain at {id.short()} is too long"
+		}
+
+		// Stores an object and returns its id. Fails when it cannot be
+		// written.
+		def write(kind ObjectKind, content byte[]) !ObjectId {
+			return try objects.write(kind, content)
+		}
+
+		// Stores a blob and returns its id.
+		// Fails when the object cannot be written.
+		def writeBlob(data byte[]) !ObjectId {
+			return try objects.write(ObjectKind.Blob, data)
+		}
+
+		// Stores a tree of the entries, sorted as trees must be, and returns
+		// its id. Fails on a duplicate or invalid name.
+		def writeTree(entries TreeEntry[]) !ObjectId {
+			let sorted = sortEntries(entries.clone())
+			for let i = 0; i < sorted.len(); i++ {
+				let n = sorted[i].name
+				fail "git: invalid tree entry name '{n}'" when n == "" || n == "." || n == ".." || n.contains("/") || n == ".git"
+				fail "git: duplicate tree entry '{n}'" when i > 0 && sorted[i - 1].name == n
+			}
+			let t = new Tree(zeroId(format), sorted)
+			return try objects.write(ObjectKind.Tree, t.encode())
+		}
+
+		// ---- references ----------------------------------------------------
+
+		// The reference as stored, symbolic references not followed; none when
+		// it does not exist. Fails when the store is unreadable.
+		def ref(name string) !?Reference {
+			return try refStore.read(name)
+		}
+
+		// Every reference under the prefix (`refs/heads/`, `refs/tags/`; ""
+		// for all), sorted by name.
+		// Fails when the reference store cannot be read.
+		def refs(prefix string = "refs/") !Reference[] {
+			return try refStore.list(prefix)
+		}
+
+		// The object a reference leads to, following symbolic references;
+		// none when it or what it names does not exist.
+		// Fails when the reference store cannot be read.
+		def refTarget(name string) !?ObjectId {
+			let current = name
+			for let depth = 0; depth < 6; depth++ {
+				let r = try refStore.read(current)
+				return none when r is none
+				let id = r.id
+				return id unless id is none
+				current = r.target
+			}
+			fail "git: symbolic reference {name} loops"
+		}
+
+		// The reference HEAD names: `refs/heads/main` on a branch, empty when
+		// detached. Fails when HEAD is missing.
+		def headRef() !string {
+			let r = try refStore.read("HEAD")
+			fail "git: HEAD is missing" when r is none
+			return r.target
+		}
+
+		// The commit HEAD is at, none on a branch with no commits yet.
+		// Fails when HEAD cannot be read.
+		def headId() !?ObjectId {
+			return try refTarget("HEAD")
+		}
+
+		// The branch HEAD is on (`main`), empty when detached.
+		// Fails when HEAD cannot be read.
+		def branch() !string {
+			let target = try headRef()
+			return target.startsWith("refs/heads/") ?? (target.slice(11), "")
+		}
+
+		// Points a reference at an object, writing a reflog entry. With
+		// `expected` set, the reference must hold that id first (the zero id:
+		// must not exist). Fails when it does not, or the name is invalid.
+		def setRef(name string, id ObjectId, message string = "", expected ?ObjectId = none) !none {
+			fail "git: invalid reference name {name}" unless validRefName(name, true)
+			let u = RefUpdate{name: name, newId: id, expected: expected, message: message}
+			try refStore.commit([u], try identity("committer"))
+			return none
+		}
+
+		// Makes a symbolic reference name another (HEAD to a branch). Fails
+		// when either name is invalid.
+		def setSymbolicRef(name string, target string, message string = "") !none {
+			fail "git: invalid reference name {target}" unless validRefName(target, true)
+			let u = RefUpdate{name: name, newTarget: target, message: message, deref: false}
+			try refStore.commit([u], try identity("committer"))
+			return none
+		}
+
+		// Deletes a reference and its log. With `expected` set, it must hold
+		// that id. Fails when it does not.
+		def deleteRef(name string, expected ?ObjectId = none) !none {
+			let u = RefUpdate{name: name, delete: true, expected: expected, deref: false}
+			try refStore.commit([u], try identity("committer"))
+			return none
+		}
+
+		// The reference's log, oldest first.
+		// Fails when the log cannot be read.
+		def reflog(name string) !ReflogEntry[] {
+			return try refStore.reflog(name)
+		}
+
+		// ---- revisions --------------------------------------------------------
+
+		// The object a revision names, as `git rev-parse` reads it: a full or
+		// abbreviated id, `git describe` output, a reference (`main`,
+		// `origin/main`, `v1.0`, `HEAD`, `@`), a reflog entry (`main@\{2\}`,
+		// `@\{yesterday\}`, `@\{-1\}` the branch checked out before),
+		// `@\{upstream\}` and `@\{push\}`, then any of `^`, `^n`, `~n`, `^\{\}`,
+		// `^\{commit\}` (or tree, blob, tag, object) and `^\{/regex\}`; also
+		// `<rev>:<path>`, `:<path>` and `:<n>:<path>` in the index, and
+		// `:/regex` for the youngest commit whose message matches.
+		// Fails when the revision names nothing or is ambiguous.
+		def resolve(rev string) !ObjectId {
+			return try resolveRevision(self, rev)
+		}
+
+		// The full reference a short name means by git's rules (`main` is
+		// `refs/heads/main`), none when no reference matches.
+		// Fails when the reference store cannot be read.
+		def expandRef(name string) !?string {
+			return try expandRefName(self, name)
+		}
+
+		// The object whose id starts with the hex digits. Fails when none or
+		// more than one does.
+		def expandShortId(prefix string) !ObjectId {
+			return try expandShortIdIn(self, prefix)
+		}
+
+		// The remote-tracking reference a branch merges from
+		// (`branch.<name>.remote` and `.merge`), empty without one.
+		// Fails when one of the remote's fetch refspecs is malformed.
+		def upstreamOf(branch string) !string {
+			return try upstreamRef(self, branch)
+		}
+
+		// The remote-tracking reference a push of the branch updates
+		// (`branch.<name>.pushRemote`, `remote.pushDefault`, `push.default`),
+		// empty without one.
+		// Fails when one of the remote's fetch refspecs is malformed.
+		def pushBranchOf(branch string) !string {
+			return try pushRef(self, branch)
+		}
+
+		// ---- attributes -------------------------------------------------------------
+
+		// What gitattributes say about paths of the working tree, read once.
+		// Fails when an attributes file cannot be read.
+		def attributes() !AttributeRules {
+			let known = attrs
+			return known unless known is none
+			let made = attributeRules(self)
+			attrs = made
+			return made
+		}
+
+		// ---- index ----------------------------------------------------------------
+
+		// The index (staging area) as its file holds it now; empty when there
+		// is none. Fails when it is corrupt.
+		def index() !Index {
+			return try readIndexFile(os.join(gitDir, "index"), format, gitDir)
+		}
+
+		// ---- working tree -----------------------------------------------------------
+
+		// The state of the working tree and index against HEAD, as `git
+		// status` reports it. Fails when the index or an object cannot be
+		// read.
+		def status(options StatusOptions = StatusOptions{}) !Status {
+			return try statusOf(self, options)
+		}
+
+		// Stages what the pathspecs select, as `git add` does: new and
+		// changed files and removals ("." or no pathspec for everything).
+		// Fails when a pathspec matches nothing or a file is ignored.
+		def add(paths ...string) !none {
+			try addPaths(self, paths, AddOptions{})
+			return none
+		}
+
+		// `add` with options (`force`, `update`, `intentToAdd`).
+		// Fails as `add(paths)` does.
+		def add(paths string[], options AddOptions) !none {
+			try addPaths(self, paths, options)
+			return none
+		}
+
+		// Unstages and deletes what the pathspecs select (`git rm`); with
+		// `cached` the files stay in the working tree. Fails when nothing
+		// matches, or a file has changes not in HEAD or the index and
+		// `force` is off.
+		def remove(paths string[], cached bool = false, force bool = false) !none {
+			try removePaths(self, paths, cached, force)
+			return none
+		}
+
+		// Renames a tracked file or folder (`git mv`). Fails when it is not
+		// tracked or the destination exists.
+		def move(from string, to string) !none {
+			try movePath(self, from, to)
+			return none
+		}
+
+		// Records the index as a new commit on the current branch (or a
+		// detached HEAD) and returns its id; a merge in progress adds its
+		// other parents. Fails when nothing changed (unless allowEmpty), the
+		// index has conflicts, or no identity is configured.
+		def commit(message string, options CommitOptions = CommitOptions{}) !ObjectId {
+			return try commitIndex(self, message, options)
+		}
+
+		// `commit` with the author given.
+		// Fails as `commit(message, options)` does.
+		def commit(message string, author Signature) !ObjectId {
+			return try commitIndex(self, message, CommitOptions{author: author})
+		}
+
+		// Writes the index as trees and returns the root tree's id (`git
+		// write-tree`). Fails when the index has conflicts.
+		def writeIndexTree() !ObjectId {
+			let idx = try index()
+			let id = try indexTree(self, idx)
+			try idx.write()
+			return id
+		}
+
+		// ---- branches and checkout -------------------------------------------------
+
+		// Switches the working tree, index and HEAD to a branch, or to a
+		// commit (detached) for any other revision (`git checkout`, `git
+		// switch`). Fails when local changes or untracked files would be
+		// overwritten, unless forced.
+		def checkout(rev string, options CheckoutOptions = CheckoutOptions{}) !none {
+			try checkoutRevision(self, rev, options)
+			return none
+		}
+
+		// Creates a branch at a revision (HEAD by default). Fails when it
+		// exists, unless `force`, or the name is invalid.
+		def createBranch(name string, start string = "HEAD", force bool = false) !none {
+			let ref = "refs/heads/" + name
+			fail "git: '{name}' is not a valid branch name" unless validRefName(ref) && !name.startsWith("-")
+			let id = try peel(try resolve(start), ObjectKind.Commit)
+			let expected ?ObjectId = force ?? (none, zeroId(format))
+			try setRef(ref, id, "branch: Created from {start}", expected)
+			return none
+		}
+
+		// Deletes a branch. Fails when it is the current branch, or (unless
+		// `force`) it is not merged into HEAD.
+		def deleteBranch(name string, force bool = false) !none {
+			let ref = "refs/heads/" + name
+			let id = try refTarget(ref)
+			fail "git: branch '{name}' not found" when id is none
+			fail "git: cannot delete branch '{name}' checked out" when (try branch()) == name
+			if !force {
+				let head = try headId()
+				let merged = !(head is none) && (try isAncestor(self, id, head))
+				fail "git: the branch '{name}' is not fully merged" unless merged
+			}
+			try deleteRef(ref, id)
+			config.removeSection("branch.{name}") onerror recover none
+			return none
+		}
+
+		// Renames a branch with its configuration and log, and HEAD with it
+		// when it is the current branch. Fails when the new name exists.
+		def renameBranch(from string, to string) !none {
+			let oldRef = "refs/heads/" + from
+			let newRef = "refs/heads/" + to
+			fail "git: '{to}' is not a valid branch name" unless validRefName(newRef)
+			let id = try refTarget(oldRef)
+			fail "git: branch '{from}' not found" when id is none
+			fail "git: a branch named '{to}' already exists" unless (try ref(newRef)) is none
+			let log = try reflog(oldRef)
+			let current = (try branch()) == from
+			try setRef(newRef, id, "Branch: renamed {oldRef} to {newRef}", zeroId(format))
+			try refStore.rewriteReflog(newRef, log + [ReflogEntry{oldId: id, newId: id, who: try identity("committer"), message: "Branch: renamed {oldRef} to {newRef}"}])
+			try deleteRef(oldRef, id)
+			try setSymbolicRef("HEAD", newRef) when current
+			config.renameSection("branch.{from}", "branch.{to}") onerror recover none
+			return none
+		}
+
+		// The local branches, sorted.
+		def branches() !string[] {
+			return (try refs("refs/heads/")).mapElem(r => r.name.slice(11))
+		}
+
+		// Moves the current branch to a revision; Mixed resets the index too
+		// and Hard the working tree as well (`git reset`).
+		// Fails when the revision does not resolve, or the index or a file cannot be written.
+		def reset(rev string = "HEAD", mode ResetMode = ResetMode.Mixed) !none {
+			try resetTo(self, rev, mode)
+			return none
+		}
+
+		// Restores paths (`git restore`): with `staged` the index from
+		// `source` (HEAD by default), with `worktree` the files from the
+		// index, or from `source` when given without `staged`.
+		// Fails when a path matches nothing, the source does not resolve, or a file cannot be written.
+		def restore(paths string[], source string = "", staged bool = false, worktree bool = true) !none {
+			try restorePaths(self, paths, source, staged, worktree)
+			return none
+		}
+
+		// ---- maintenance -------------------------------------------------
+
+		// Packs every reachable object into one pack and removes the old
+		// packs and the loose objects it holds (`git repack -a -d`), writing
+		// a reachability bitmap for a bare repository unless told otherwise.
+		// Returns the new pack's checksum, none when there was nothing to
+		// pack. Fails when a file cannot be written.
+		def repack(options RepackOptions = RepackOptions{}) !?ObjectId {
+			return try repackAll(self, options)
+		}
+
+		// Removes loose objects that nothing reaches and that are older than
+		// `expiry` (`git prune --expire`). Returns how many went. Fails when
+		// the object folders cannot be read.
+		def prune(expiry time.Time) !int {
+			return try pruneUnreachable(self, expiry)
+		}
+
+		// Tidies the repository as `git gc` does: references into
+		// packed-refs, objects into one pack, unreachable loose objects older
+		// than two weeks removed. Reflogs are kept whole. Fails when a file
+		// cannot be written.
+		def gc() !none {
+			let store = refStore
+			if store is FileRefs {
+				let files FileRefs = store
+				try files.pack(id => peelOrNone(self, id, ObjectKind.Commit))
+			}
+			let _ = try repackAll(self, RepackOptions{})
+			let _ = try pruneUnreachable(self, time.now() - 336h)
+			return none
+		}
+
+		// ---- remotes ----------------------------------------------------
+
+		// The configured remotes' names.
+		def remotes() string[] {
+			return config.subsections("remote").filter(n => !(config.get("remote.{n}.url") is none))
+		}
+
+		// Adds a remote fetching every branch into `refs/remotes/<name>/`.
+		// Fails when one by that name exists or the name is invalid.
+		def addRemote(name string, url string) !none {
+			fail "git: remote {name} already exists" unless config.get("remote.{name}.url") is none
+			fail "git: invalid remote name {name}" unless validRefName("refs/remotes/{name}/x")
+			try config.set("remote.{name}.url", url)
+			try config.add("remote.{name}.fetch", "+refs/heads/*:refs/remotes/{name}/*")
+			return none
+		}
+
+		// Removes a remote: its configuration, its remote-tracking references
+		// and the upstream settings that name it. Fails when there is none.
+		def removeRemote(name string) !none {
+			fail "git: no remote named {name}" when config.get("remote.{name}.url") is none
+			for let r in try refs("refs/remotes/{name}/") {
+				try deleteRef(r.name)
+			}
+			for let b in config.subsections("branch") {
+				if config.get("branch.{b}.remote", "") == name {
+					try config.unset("branch.{b}.remote")
+					try config.unset("branch.{b}.merge", true)
+				}
+			}
+			try config.removeSection("remote.{name}")
+			return none
+		}
+
+		// Fetches from a remote (a configured name or a URL) and moves the
+		// references its refspecs map (`git fetch`): `refspecs` instead of
+		// `remote.<name>.fetch`; `prune` deletes remote-tracking references
+		// whose branch is gone (none takes `fetch.prune`); `tags` follows
+		// tags, takes all or none; `depth`, `deepen`, `shallowSince`,
+		// `shallowExclude` and `unshallow` move a shallow history's boundary;
+		// `filter` asks for a partial fetch; `force` moves references that do
+		// not fast-forward. Returns what happened to each reference.
+		// Fails when the remote cannot be reached or sends something bad;
+		// references that cannot move are reported as rejected.
+		def fetch(remote string = "origin", refspecs string[] = [], prune ?bool = none, tags TagMode = TagMode.Follow, depth int = 0, deepen bool = false, shallowSince ?time.Time = none, shallowExclude string[] = [], unshallow bool = false, filter string = "", force bool = false, writeFetchHead bool = true, credentials ?Credentials = none, connection RemoteOptions = RemoteOptions{}) !FetchResult {
+			let options = FetchOptions{remote: withCredentials(connection, credentials), refspecs: refspecs, tags: tags, prune: prune, depth: depth, deepen: deepen, shallowSince: shallowSince, shallowExclude: shallowExclude, unshallow: unshallow, filter: filter, force: force, writeFetchHead: writeFetchHead}
+			return try fetchRemote(self, remote, options)
+		}
+
+		// Pushes to a remote (a configured name or a URL) and reports what it
+		// did with each reference (`git push`). `refspec` names what goes
+		// where (`main`, `HEAD:refs/heads/topic`, `:old` to delete, `+`
+		// forcing); empty takes `remote.<name>.push`, else the current branch
+		// to the branch of the same name. `force` allows updates that are not
+		// fast-forwards, `leases` only while the remote holds what is
+		// expected; `allOrNone` updates every reference or none;
+		// `pushOptions` go to the remote's hooks; `followTags` and `tags`
+		// send annotated tags of pushed commits, or every tag; `setUpstream`
+		// records the remote branch as the local one's upstream.
+		// Fails when the remote cannot be reached or refuses the pack;
+		// references it does not update are reported as rejected.
+		def push(remote string = "origin", refspec string = "", credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}) !PushResult {
+			return try push(remote, refspec == "" ?? (string[], [refspec]), credentials, force, leases, allOrNone, pushOptions, followTags, tags, setUpstream, connection)
+		}
+
+		// push with several refspecs. Fails as the other does.
+		def push(remote string, refspecs string[], credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}) !PushResult {
+			let options = PushOptions{remote: withCredentials(connection, credentials), refspecs: refspecs, force: force, leases: leases, allOrNone: allOrNone, pushOptions: pushOptions, followTags: followTags, tags: tags, setUpstream: setUpstream}
+			return try pushRemote(self, remote, options)
+		}
+
+		// The commits `rev` reaches, newest first (`git log`): at most
+		// `limit` (-1: all), only those changing `paths` when given. Fails
+		// when the revision does not resolve.
+		def log(rev string = "HEAD", limit int = -1, paths string[] = []) !Commit[] {
+			let walk = new RevWalk(self)
+			walk.paths = paths
+			try walk.push(try peel(try resolve(rev), ObjectKind.Commit))
+			return try walk.all(limit)
+		}
+
+		// The submodules `.gitmodules` lists, with what the index records.
+		// Fails when `.gitmodules` cannot be read.
+		def submodules() !Submodule[] {
+			return try listSubmodules(self)
+		}
+
+		// Clones or fetches each submodule and checks it out at the commit
+		// the index records (`git submodule update`). Fails on the first
+		// that cannot be updated.
+		def updateSubmodules(options SubmoduleOptions = SubmoduleOptions{}) !none {
+			return try doUpdateSubmodules(self, options)
+		}
+
+		// Takes the connection settings (credentials, an SSH client) for the
+		// fetches the repository starts by itself: a partial clone fetching
+		// the objects it left out.
+		def useConnection(options RemoteOptions) {
+			installPromisorWith(self, options)
+		}
+
+		// Who last changed each line of a file at a revision (`git blame`),
+		// following the file through renames. Fails when the file is not in
+		// the revision.
+		def blame(path string, rev string = "HEAD", options BlameOptions = BlameOptions{}) !BlameLine[] {
+			return try blameFile(self, path, rev, options)
+		}
+
+		// ---- merging ---------------------------------------------------------------
+
+		// Merges a revision into the current branch (`git merge`): already up
+		// to date, a fast-forward, or a merge commit; with conflicts the
+		// index and working tree hold them and MERGE_HEAD is written, for
+		// `commit` (or `mergeAbort`) to conclude. Fails when local changes
+		// would be overwritten.
+		def merge(rev string, options MergeCommandOptions = MergeCommandOptions{}) !SequenceResult {
+			return try mergeRevision(self, rev, options)
+		}
+
+		// Abandons a merge, cherry-pick or revert that stopped with conflicts.
+		// Fails when nothing is in progress or the working tree cannot be reset.
+		def mergeAbort() !none {
+			try abortSequence(self)
+			return none
+		}
+
+		// Applies a commit's change on HEAD as a new commit (`git
+		// cherry-pick`); `mainline` picks the parent of a merge, `recordOrigin`
+		// adds `(cherry picked from commit ...)`. Stops with conflicts like
+		// merge.
+		// Fails when the revision does not resolve, is a merge without `mainline`, or the working tree is in the way.
+		def cherryPick(rev string, mainline int = 0, recordOrigin bool = false, commit bool = true, options MergeOptions = MergeOptions{}) !SequenceResult {
+			return try pickCommit(self, rev, false, mainline, recordOrigin, commit, options)
+		}
+
+		// Undoes a commit's change in a new commit (`git revert`). Stops with
+		// conflicts like merge.
+		// Fails when the revision does not resolve, is a merge without `mainline`, or the working tree is in the way.
+		def revert(rev string, mainline int = 0, commit bool = true, options MergeOptions = MergeOptions{}) !SequenceResult {
+			return try pickCommit(self, rev, true, mainline, false, commit, options)
+		}
+
+		// Replays the current branch's own commits onto `onto` (upstream by
+		// default), as `git rebase upstream`. Stops at a conflict with the
+		// state git uses (`rebaseContinue`, `rebaseAbort`, or git itself carry
+		// on). Fails when HEAD is detached or there are local changes.
+		def rebase(upstream string, onto string = "") !SequenceResult {
+			return try rebaseOnto(self, upstream, onto)
+		}
+
+		// Carries on a stopped rebase once its conflicts are resolved and
+		// staged.
+		// Fails when no rebase is in progress or conflicts are still unresolved.
+		def rebaseContinue() !SequenceResult {
+			return try continueRebase(self)
+		}
+
+		// Stops a rebase and restores the branch as it was before it.
+		// Fails when no rebase is in progress or the working tree cannot be reset.
+		def rebaseAbort() !none {
+			try abortRebase(self)
+			return none
+		}
+
+		// ---- diffs ---------------------------------------------------------------------
+
+		// The changes from one revision's tree to another's, renames found
+		// as options.changes says (`git diff from to`).
+		// Fails when a revision does not resolve or an object cannot be read.
+		def diff(from string, to string, options PatchOptions = PatchOptions{}) !Diff {
+			return try diffRevisions(self, from, to, options)
+		}
+
+		// The staged changes: from a revision (HEAD) to the index (`git diff
+		// --cached`).
+		// Fails when the revision does not resolve or the index cannot be read.
+		def diffIndex(base string = "HEAD", options PatchOptions = PatchOptions{}) !Diff {
+			return try diffStaged(self, base, options)
+		}
+
+		// The unstaged changes: from the index to the working tree (`git
+		// diff`).
+		// Fails when the index or a file cannot be read.
+		def diffWorktree(options PatchOptions = PatchOptions{}) !Diff {
+			return try diffUnstaged(self, options)
+		}
+
+		// Applies a patch (git's format or a plain unified diff) to the
+		// working tree, the index, or both, all files or none (`git apply`,
+		// `--cached`, `--index`); `strip` path components are dropped from
+		// the names. Fails when a file is missing or a hunk does not apply.
+		def apply(patch string, target ApplyTarget = ApplyTarget.Worktree, strip int = 1) !none {
+			try applyPatch(self, patch, target, strip)
+			return none
+		}
+
+		// ---- signatures -------------------------------------------------------------
+
+		// Checks the signature of a commit with the verifier. A commit
+		// without one is reported as not valid.
+		// Fails when the revision does not resolve to a commit.
+		def verifyCommit(rev string, verifier SignatureVerifier) !SignatureCheck {
+			let id = try peel(try resolve(rev), ObjectKind.Commit)
+			let (_, raw) = try objects.readRaw(id)
+			let (payload, sig) = splitCommitSignature(raw, format)
+			return SignatureCheck{valid: false, format: "", problem: "commit {id.short()} is not signed"} when sig == ""
+			let c = try parseCommit(id, raw)
+			return verifier.verify(payload, sig, c.committer.email)
+		}
+
+		// Checks the signature of an annotated tag with the verifier.
+		// Fails when the revision does not resolve to an annotated tag.
+		def verifyTag(rev string, verifier SignatureVerifier) !SignatureCheck {
+			let id = try resolve(rev)
+			let (kind, raw) = try objects.readRaw(id)
+			fail "git: {rev} is not an annotated tag" unless kind == ObjectKind.Tag
+			let (payload, sig) = splitTagSignature(raw)
+			return SignatureCheck{valid: false, format: "", problem: "tag {rev} is not signed"} when sig == ""
+			let t = try parseTag(id, raw)
+			let tagger = t.tagger
+			return verifier.verify(payload, sig, tagger is none ?? ("", tagger.email))
+		}
+
+		// ---- identity --------------------------------------------------------
+
+		// The signature for `author` or `committer` from the configuration
+		// (`user.name`, `user.email`, and `author.*` / `committer.*` over
+		// them), dated now. Fails when no name or address is configured.
+		def identity(role string = "author") !Signature {
+			let name = config.get("{role}.name")
+			let email = config.get("{role}.email")
+			let n = name is none ?? (config.get("user.name", ""), name)
+			let e = email is none ?? (config.get("user.email", ""), email)
+			fail "git: no {role} identity: set user.name and user.email" when n == "" || e == ""
+			return new Signature(n, e, time.now())
+		}
+	}
+
+	// The repository's commit-graph, none when it has none (or one that does
+	// not fit, which git also ignores).
+	internal def commitGraphOf(repo Repository) ?CommitGraph {
+		// Its parent lists would show what a shallow repository hides.
+		return none when shallowCommits(repo).len() > 0
+		if !repo.graphLoaded {
+			repo.graphLoaded = true
+			repo.graph = loadCommitGraph(repo.objects.dir, repo.format) onerror recover none
+		}
+		return repo.graph
+	}
+
+	// The commits whose parents a shallow repository lacks, from its
+	// `shallow` file; empty for a complete one.
+	internal def shallowCommits(repo Repository) map<string, bool> {
+		if !repo.shallowLoaded {
+			repo.shallowLoaded = true
+			let text = string(os.readFile(os.join(repo.commonDir, "shallow")) onerror recover byte[])
+			let ids map<string, bool> = {}
+			for let line in text.split("\n") {
+				ids[line.trim()] = true when line.trim() != ""
+			}
+			repo.shallowIds = ids
+		}
+		return repo.shallowIds
+	}
+
+	// Whether the commit is a shallow boundary: its parents are not in the
+	// repository and every walk stops at it.
+	def isShallowCommit(repo Repository, id ObjectId) bool {
+		let ids = shallowCommits(repo)
+		return ids.len() > 0 && ids.hasKey(id.str())
+	}
+
+	// Replaces the shallow boundary (sorted ids in `shallow`, removed when
+	// there are none). Fails when the file cannot be written.
+	internal def writeShallow(repo Repository, ids string[]) !none {
+		let path = os.join(repo.commonDir, "shallow")
+		let sorted = ids.clone()
+		sorted.sort((a, b) => a < b)
+		if sorted.len() == 0 {
+			os.remove(path) onerror recover none
+		} else {
+			try writeAtomically(path, (sorted.join("\n") + "\n").bytes())
+		}
+		let fresh map<string, bool> = {}
+		for let id in sorted {
+			fresh[id] = true
+		}
+		repo.shallowIds = fresh
+		repo.shallowLoaded = true
+		return none
+	}
+
+	// ---- opening and creating -------------------------------------------------
+
+	// Opens the repository at `path`: a working tree holding `.git`, a
+	// `.git` folder or file, or a bare repository. Fails when there is no
+	// repository there or it uses a format or extension this library does
+	// not support.
+	def open(path string) !Repository {
+		let abs = try os.resolve(path)
+		let found = try findGitDir(abs)
+		fail "git: {path} is not a git repository" when found is none
+		let (gitDir, workDir) = found
+		return try openGitDir(gitDir, workDir)
+	}
+
+	// Opens the repository that holds `path`, looking in its parent folders
+	// as git does. Fails when no folder up to the root holds one.
+	def discover(path string) !Repository {
+		let dir = try os.resolve(path)
+		for {
+			let found = try findGitDir(dir)
+			if !(found is none) {
+				let (gitDir, workDir) = found
+				return try openGitDir(gitDir, workDir)
+			}
+			let up = os.dir(dir)
+			fail "git: not a git repository (or any of the parent directories): {path}" when up == dir
+			dir = up
+		}
+		fail "unreachable"
+	}
+
+	// The git folder and working tree at a folder, none when it holds no
+	// repository.
+	internal def findGitDir(dir string) !?(string, string) {
+		let dotGit = os.join(dir, ".git")
+		let info = statOrNone(dotGit)
+		if !(info is none) {
+			if info.isDir {
+				return (dotGit, dir) when looksLikeGitDir(dotGit)
+			} else {
+				// A `.git` file: `gitdir: <path>` (submodules, linked worktrees).
+				let text = string(try os.readFile(dotGit)).trim()
+				fail "git: {dotGit} is not a gitdir file" unless text.startsWith("gitdir:")
+				let target = text.slice(7).trim()
+				let real = os.isAbs(target) ?? (target, os.clean(os.join(dir, target)))
+				fail "git: {dotGit} points to {real}, which is not a repository" unless looksLikeGitDir(real)
+				return (real, dir)
+			}
+		}
+		return (dir, "") when looksLikeGitDir(dir)
+		return none
+	}
+
+	// Whether a folder has what a git folder needs: HEAD, and objects and
+	// refs (here or in its common folder).
+	internal def looksLikeGitDir(dir string) bool {
+		return false unless os.exists(os.join(dir, "HEAD")) onerror recover false
+		let common = commonDirOf(dir)
+		let objects = os.exists(os.join(common, "objects")) onerror recover false
+		let refs = os.exists(os.join(common, "refs")) onerror recover false
+		let reftable = os.exists(os.join(common, "reftable")) onerror recover false
+		return objects && (refs || reftable)
+	}
+
+	internal def commonDirOf(gitDir string) string {
+		let path = os.join(gitDir, "commondir")
+		let text = os.readFile(path) onerror recover byte[]
+		return gitDir when text.len() == 0
+		let rel = string(text).trim()
+		return os.isAbs(rel) ?? (rel, os.clean(os.join(gitDir, rel)))
+	}
+
+	// The configuration files git reads for a repository, widest first.
+	internal def configSources(commonDir string, gitDir string, worktreeConfig bool) ConfigSource[] {
+		let out ConfigSource[] = [ConfigSource{path: "/etc/gitconfig", scope: ConfigScope.System}]
+		let home = os.homeDir() onerror recover ""
+		let xdg = os.join(home, ".config", "git", "config")
+		out.push(ConfigSource{path: xdg, scope: ConfigScope.Global})
+		out.push(ConfigSource{path: os.join(home, ".gitconfig"), scope: ConfigScope.Global}) unless home == ""
+		out.push(ConfigSource{path: os.join(commonDir, "config"), scope: ConfigScope.Local})
+		out.push(ConfigSource{path: os.join(gitDir, "config.worktree"), scope: ConfigScope.Worktree}) when worktreeConfig
+		return out
+	}
+
+	// The extensions this library understands in a version 1 repository.
+	internal const knownExtensions = string[
+		"noop", "noop-v1", "objectformat", "refstorage", "worktreeconfig", "preciousobjects",
+		"partialclone"
+	]
+
+	internal def openGitDir(gitDir string, workDir string) !Repository {
+		let commonDir = commonDirOf(gitDir)
+		// The repository's own file decides the format before anything else is
+		// read.
+		let local = new Config()
+		local.sources = [ConfigSource{path: os.join(commonDir, "config"), scope: ConfigScope.Local}]
+		try local.reload()
+		let version = try local.getInt("core.repositoryformatversion", 0)
+		fail "git: repository format version {version} is not supported" when version > 1
+		let format = try parseFormat(local.get("extensions.objectformat", "sha1").lower())
+		let refName = local.get("extensions.refstorage", "files").lower()
+		let refFormat = RefFormat.Files
+		switch refName {
+			case "files":
+				refFormat = RefFormat.Files
+			case "reftable":
+				refFormat = RefFormat.Reftable
+			default:
+				fail "git: reference storage '{refName}' is not supported"
+		}
+		if version == 1 {
+			for let e in local.entries {
+				fail "git: repository extension '{e.key}' is not supported" when e.section == "extensions" && !knownExtensions.includes(e.key)
+			}
+		}
+		let bare = try local.getBool("core.bare", workDir == "")
+		let tree = bare ?? ("", workDir)
+		let worktree = local.get("core.worktree")
+		if !bare && !(worktree is none) && gitDir == commonDir {
+			tree = os.isAbs(worktree) ?? (worktree, os.clean(os.join(gitDir, worktree)))
+		}
+		let config = new Config()
+		config.file = os.join(commonDir, "config")
+		config.sources = configSources(commonDir, gitDir, try local.getBool("extensions.worktreeconfig", false))
+		config.context = IncludeContext{gitDir: gitDir, worktree: tree, branch: headBranchFor(gitDir)}
+		try config.reload()
+		let objects = new ObjectDatabase(os.join(commonDir, "objects"), format)
+		objects.level = try config.getInt("core.loosecompression", try config.getInt("core.compression", 1))
+		objects.level = 1 when objects.level < 0
+		try objects.open()
+		let refs RefBackend = new FileRefs(gitDir, commonDir, format)
+		if refFormat == RefFormat.Reftable {
+			let table = try openReftable(gitDir, commonDir, format)
+			table.logRefs = config.get("core.logallrefupdates", bare ?? ("false", "true")).lower()
+			refs = table
+		} else {
+			let files = new FileRefs(gitDir, commonDir, format)
+			files.logRefs = config.get("core.logallrefupdates", bare ?? ("false", "true")).lower()
+			refs = files
+		}
+		let repo = new Repository(gitDir, commonDir, tree, format, refFormat, config, objects, refs)
+		installPromisor(repo)
+		return repo
+	}
+
+	// The system and user configuration, for work outside a repository.
+	internal def userConfig() Config {
+		let c = new Config()
+		c.sources = configSources("", "", false).filter(s => s.scope != ConfigScope.Local)
+		c.reload() onerror recover none
+		return c
+	}
+
+	// The branch HEAD names in a git folder, for `onbranch` includes; empty
+	// when detached or unreadable.
+	internal def headBranchFor(gitDir string) string {
+		let text = string(os.readFile(os.join(gitDir, "HEAD")) onerror recover byte[]).trim()
+		return text.startsWith("ref: refs/heads/") ?? (text.slice(16), "")
+	}
+
+	// Options for `init`.
+	struct InitOptions {
+		// No working tree: the folder is the repository.
+		bare          bool         = false
+		format        ObjectFormat = ObjectFormat.Sha1
+		refFormat     RefFormat    = RefFormat.Files
+		// The branch HEAD starts on; empty takes init.defaultBranch, else
+		// "master" as git does.
+		initialBranch string       = ""
+		// Keep the git folder here and leave a `.git` file pointing at it in
+		// the working tree.
+		separateGitDir string      = ""
+	}
+
+	// Creates a repository at `path` (its working tree, or the repository
+	// itself when bare), or opens it when one is already there. Fails when
+	// the folder cannot be written.
+	def init(path string, options InitOptions = InitOptions{}) !Repository {
+		try os.mkdir(path, true)
+		let abs = try os.resolve(path)
+		let gitDir = options.bare ?? (abs, os.join(abs, ".git"))
+		gitDir = try os.resolve(options.separateGitDir) when options.separateGitDir != ""
+		if looksLikeGitDir(gitDir) {
+			return try openGitDir(gitDir, options.bare ?? ("", abs))
+		}
+		for let sub in ["objects/info", "objects/pack", "refs/heads", "refs/tags", "info", "hooks"] {
+			try os.mkdir(os.join(gitDir, sub), true)
+		}
+		let globalConfig = new Config()
+		globalConfig.sources = configSources("", "", false).filter(s => s.scope != ConfigScope.Local)
+		globalConfig.reload() onerror recover none
+		let branch = options.initialBranch
+		branch = globalConfig.get("init.defaultbranch", "master") when branch == ""
+		fail "git: invalid branch name {branch}" unless validRefName("refs/heads/" + branch)
+		let sha256 = options.format == ObjectFormat.Sha256
+		let reftable = options.refFormat == RefFormat.Reftable
+		let version = sha256 || reftable ?? (1, 0)
+		let lines string[] = [
+			"[core]",
+			"\trepositoryformatversion = {version}",
+			"\tfilemode = true",
+			"\tbare = {options.bare}",
+		]
+		lines.push("\tlogallrefupdates = true") unless options.bare
+		if sha256 || reftable {
+			lines.push("[extensions]")
+			lines.push("\tobjectformat = sha256") when sha256
+			lines.push("\trefstorage = reftable") when reftable
+		}
+		try os.writeFile(os.join(gitDir, "config"), (lines.join("\n") + "\n").bytes())
+		try os.writeFile(os.join(gitDir, "description"), "Unnamed repository; edit this file 'description' to name the repository.\n".bytes())
+		try os.writeFile(os.join(gitDir, "info", "exclude"), "# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with '#' are comments.\n".bytes())
+		if reftable {
+			// HEAD stays a file that names an invalid branch, so older git
+			// tools still see a repository; the real HEAD is in the table.
+			try os.writeFile(os.join(gitDir, "HEAD"), "ref: refs/heads/.invalid\n".bytes())
+			try os.mkdir(os.join(gitDir, "reftable"), true)
+			// refs/heads is a file, so a git without reftable support refuses
+			// the repository instead of misreading it.
+			os.rmdir(os.join(gitDir, "refs", "heads")) onerror recover none
+			try os.writeFile(os.join(gitDir, "refs", "heads"), "this repository uses the reftable format\n".bytes())
+			try initReftable(gitDir, options.format, "refs/heads/" + branch)
+		} else {
+			try os.writeFile(os.join(gitDir, "HEAD"), "ref: refs/heads/{branch}\n".bytes())
+		}
+		if options.separateGitDir != "" && !options.bare {
+			try os.writeFile(os.join(abs, ".git"), "gitdir: {gitDir}\n".bytes())
+			return try openGitDir(gitDir, abs)
+		}
+		return try openGitDir(gitDir, options.bare ?? ("", abs))
+	}
+}

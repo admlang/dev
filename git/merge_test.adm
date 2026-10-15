@@ -1,0 +1,335 @@
+// Merging: file content merges checked against `git merge-file`
+// (testdata/merges.sh), and tree merges, cherry-picks, reverts and rebases
+// in repositories made here.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+		std.data.encoding::(JSON)
+	)
+
+	@embed("testdata/merges.tar.gz")
+	internal const mergesTar byte[]
+
+	@embed("testdata/treemerges.tar.gz")
+	internal const treeMergesTar byte[]
+
+	internal struct ExpectedMerge {
+		results ExpectedList[]
+	}
+
+	// A folder of tree-merge cases made by testdata/treemerges.sh (with
+	// another seed); without it the corpus test passes without running.
+	@env("ADM_TEST_GIT_MERGE_CORPUS")
+	internal const mergeCorpus string
+
+	// The cases of a tree-merge corpus whose result differs from git's.
+	internal def treeMergeDifferences(dir string) !string[] {
+		let failures string[] = []
+		for let c in try os.readDir(dir) {
+			continue unless c.info.isDir
+			// A case whose history could not be made has no answers.
+			continue unless os.exists(os.join(c.path, ".git", "expected.json")) onerror recover false
+			let repo = try open(c.path)
+			let want = ExpectedMerge{}
+			let codec = new JSON()
+			try codec.decode(try os.readFile(os.join(repo.gitDir, "expected.json")), want)
+			let ours = try repo.resolve("main")
+			let theirs = try repo.resolve("side")
+			for let item in want.results {
+				let options = MergeOptions{ours: "main", theirs: "side"}
+				options.text.style = item.key == "diff3" ?? (ConflictStyle.Diff3, ConflictStyle.Merge)
+				let r = mergeCommits(repo, ours, theirs, options) onerror (err error) {
+					failures.push("{c.info.name}/{item.key}: {err.message}")
+					recover MergeResult{tree: zeroId(), clean: false, stages: [], messages: []}
+				}
+				let got = mergeTreeText(r)
+				let code = r.clean ?? ("0", "1")
+				if got != item.values[1] || code != item.values[0] {
+					failures.push("{c.info.name}/{item.key}: differs")
+					if keepDir != "" {
+						try os.writeFile(os.join(keepDir, "{c.info.name}-{item.key}.got"), got.bytes())
+						try os.writeFile(os.join(keepDir, "{c.info.name}-{item.key}.want"), item.values[1].bytes())
+					}
+				}
+			}
+			repo.close()
+		}
+		return failures
+	}
+
+	// A commit of `repo` whose tree holds the submodule `lib` at `link`
+	// (and `.gitmodules` when `modules` is set), with the parents given.
+	internal def gitlinkCommit(repo Repository, link ?ObjectId, parents ObjectId[], modules bool) !ObjectId {
+		let entries TreeEntry[] = [TreeEntry{name: "r", mode: EntryMode.File, id: try repo.writeBlob("r\n".bytes())}]
+		if modules {
+			entries.push(TreeEntry{name: ".gitmodules", mode: EntryMode.File, id: try repo.writeBlob("[submodule \"lib\"]\n\tpath = lib\n\turl = ../lib\n".bytes())})
+		}
+		if !(link is none) {
+			entries.push(TreeEntry{name: "lib", mode: EntryMode.Submodule, id: link})
+		}
+		let sig = testSignature()
+		return try repo.write(ObjectKind.Commit, (new Commit(zeroId(repo.format), try repo.writeTree(entries), parents, sig, sig, "gitlink\n")).encode())
+	}
+
+	internal def messageTexts(r MergeResult) string[] {
+		return r.messages.mapElem(m => m.text)
+	}
+
+	check "Merge" {
+		@test()
+		def mergesSubmodulesLikeGit() !none {
+			// The library: c1 → c2 → c3, and `side` off c1.
+			let lib = try init(try scratch("submerge-lib"), InitOptions{bare: true})
+			let sig = testSignature()
+			let blob = try lib.writeBlob("x\n".bytes())
+			let tree = try lib.writeTree([TreeEntry{name: "f", mode: EntryMode.File, id: blob}])
+			let c1 = try lib.write(ObjectKind.Commit, (new Commit(zeroId(lib.format), tree, [], sig, sig, "c1\n")).encode())
+			let c2 = try lib.write(ObjectKind.Commit, (new Commit(zeroId(lib.format), tree, [c1], sig, sig, "c2\n")).encode())
+			let c3 = try lib.write(ObjectKind.Commit, (new Commit(zeroId(lib.format), tree, [c2], sig, sig, "c3\n")).encode())
+			let side = try lib.write(ObjectKind.Commit, (new Commit(zeroId(lib.format), tree, [c1], sig, sig, "side\n")).encode())
+			try lib.setRef("refs/heads/main", c3)
+			try lib.setRef("refs/heads/side", side)
+			// The superproject, with the library checked out at `lib`.
+			let sup = try newWorktree("submerge-super")
+			let checkedOut = try clone(lib.gitDir, os.join(sup.workDir, "lib"))
+			checkedOut.close()
+			// git merge-tree's answers for each case (base, ours, theirs).
+			let base2 = try gitlinkCommit(sup, c2, [], true)
+			let ours3 = try gitlinkCommit(sup, c3, [base2], true)
+			for let theirs in [side, c1] {
+				let t = try gitlinkCommit(sup, theirs, [base2], true)
+				let r = try mergeCommits(sup, ours3, t)
+				fail "{theirs.short()}: merged cleanly" when r.clean
+				fail "{theirs.short()}: messages {messageTexts(r)}" unless messageTexts(r).equals(["Failed to merge submodule lib (commits don't follow merge-base)", "CONFLICT (submodule): Merge conflict in lib"])
+			}
+			let base1 = try gitlinkCommit(sup, c1, [], true)
+			let ours2 = try gitlinkCommit(sup, c2, [base1], true)
+			let theirs3 = try gitlinkCommit(sup, c3, [base1], true)
+			let ff = try mergeCommits(sup, ours2, theirs3)
+			fail "fast-forward not clean" unless ff.clean
+			fail "fast-forward messages {messageTexts(ff)}" unless messageTexts(ff).equals(["Note: Fast-forwarding submodule lib to {c3.str()}"])
+			let root = try gitlinkCommit(sup, none, [], false)
+			let addOurs = try gitlinkCommit(sup, c2, [root], true)
+			let addTheirs = try gitlinkCommit(sup, c3, [root], true)
+			let added = try mergeCommits(sup, addOurs, addTheirs)
+			fail "add/add merged cleanly" when added.clean
+			fail "add/add messages {messageTexts(added)}" unless messageTexts(added).equals(["Failed to merge submodule lib (no merge base)", "CONFLICT (submodule): Merge conflict in lib"])
+			return none
+		}
+
+		@test()
+		def mergesTreesLikeGit() !none {
+			let failures = try treeMergeDifferences(try unpackFixture(treeMergesTar, "git-treemerges"))
+			for let f in failures {
+				println(f)
+			}
+			fail "{failures.len()} tree merges differ from git's" when failures.len() > 0
+			return none
+		}
+
+		@test()
+		def mergesTreeCorpusLikeGit() !none {
+			return none when mergeCorpus == ""
+			let failures = try treeMergeDifferences(mergeCorpus)
+			for let f in failures {
+				println(f)
+			}
+			fail "{failures.len()} tree merges differ from git's" when failures.len() > 0
+			return none
+		}
+
+		@test()
+		def mergesTextLikeGit() !none {
+			let dir = try unpackFixture(mergesTar, "git-merges")
+			let failures string[] = []
+			for let c in try os.readDir(dir) {
+				continue unless c.info.isDir
+				let base = try os.readFile(os.join(c.path, "base"))
+				let ours = try os.readFile(os.join(c.path, "ours"))
+				let theirs = try os.readFile(os.join(c.path, "theirs"))
+				for let v in ["merge", "diff3", "zdiff3", "ours", "theirs", "union"] {
+					let options = TextMergeOptions{}
+					switch v {
+						case "diff3":
+							options.style = ConflictStyle.Diff3
+						case "zdiff3":
+							options.style = ConflictStyle.ZealousDiff3
+						case "ours":
+							options.favor = MergeFavor.Ours
+						case "theirs":
+							options.favor = MergeFavor.Theirs
+						case "union":
+							options.favor = MergeFavor.Union
+					}
+					let got = mergeText(base, ours, theirs, options)
+					let want = try os.readFile(os.join(c.path, v + ".out"))
+					let code = string(try os.readFile(os.join(c.path, v + ".code"))).trim().toInt<int>()
+					if got.data.hex() != want.hex() {
+						failures.push("{c.info.name}/{v}: text differs")
+						try os.writeFile(os.join(keepDir == "" ?? (dir, keepDir), "{c.info.name}-{v}.got"), got.data) when keepDir != ""
+						continue
+					}
+					failures.push("{c.info.name}/{v}: {got.conflicts} conflicts, git says {code}") unless got.conflicts == code
+				}
+			}
+			for let f in failures {
+				println(f)
+			}
+			fail "{failures.len()} merges differ from git's" when failures.len() > 0
+			return none
+		}
+
+		@test()
+		def mergesBranches() !none {
+			let repo = try newWorktree("merge")
+			try writeFile(repo, "a.txt", "one\ntwo\nthree\n")
+			try repo.add(".")
+			let base = try repo.commit("Base")
+			try repo.createBranch("feature")
+			try repo.checkout("feature")
+			try writeFile(repo, "b.txt", "b\n")
+			try repo.add(".")
+			try repo.commit("Add b")
+			try repo.checkout("main")
+			let ff = try repo.merge("feature")
+			fail "expected fast-forward, got {ff.outcome}" unless ff.outcome == SequenceOutcome.FastForward
+			fail "up to date" unless (try repo.merge("feature")).outcome == SequenceOutcome.UpToDate
+			// Diverged: a merge commit.
+			try writeFile(repo, "c.txt", "c\n")
+			try repo.add(".")
+			try repo.commit("Add c")
+			try repo.checkout("feature")
+			try writeFile(repo, "a.txt", "one\ntwo changed\nthree\n")
+			try repo.add(".")
+			try repo.commit("Change two")
+			try repo.checkout("main")
+			let m = try repo.merge("feature")
+			fail "expected a merge commit, got {m.outcome}" unless m.outcome == SequenceOutcome.Committed
+			let c = try repo.commitAt("HEAD")
+			fail "message {c.message}" unless c.message == "Merge branch 'feature'\n" && c.parents.len() == 2
+			fail "merged content" unless string(try os.readFile(os.join(repo.workDir, "a.txt"))) == "one\ntwo changed\nthree\n"
+			let log = try repo.reflog("HEAD")
+			fail "reflog {log[log.len() - 1].message}" unless log[log.len() - 1].message == "merge feature: Merge made by the 'ort' strategy."
+			fail "status {try statusText(repo)}" unless (try statusText(repo)) == ""
+			fail "base lost" unless try isAncestor(repo, base, try repo.resolve("HEAD"))
+			repo.close()
+			return none
+		}
+
+		@test()
+		def stopsAtConflicts() !none {
+			let repo = try newWorktree("merge-conflict")
+			try writeFile(repo, "a.txt", "one\ntwo\nthree\n")
+			try repo.add(".")
+			try repo.commit("Base")
+			try repo.createBranch("feature")
+			try writeFile(repo, "a.txt", "one\nours\nthree\n")
+			try repo.add(".")
+			try repo.commit("Ours")
+			try repo.checkout("feature")
+			try writeFile(repo, "a.txt", "one\ntheirs\nthree\n")
+			try repo.add(".")
+			try repo.commit("Theirs")
+			try repo.checkout("main")
+			let r = try repo.merge("feature")
+			fail "expected conflicts, got {r.outcome}" unless r.outcome == SequenceOutcome.Conflicts && r.conflicts.join(",") == "a.txt"
+			let text = string(try os.readFile(os.join(repo.workDir, "a.txt")))
+			fail "markers: {text}" unless text == "one\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nthree\n"
+			fail "status {try statusText(repo)}" unless (try statusText(repo)) == "UU a.txt\n"
+			fail "MERGE_MSG" unless string(try os.readFile(os.join(repo.gitDir, "MERGE_MSG"))) == "Merge branch 'feature'\n\n# Conflicts:\n#\ta.txt\n"
+			try writeFile(repo, "a.txt", "one\nboth\nthree\n")
+			try repo.add("a.txt")
+			let id = try repo.commit("Merge branch 'feature'")
+			let c = try repo.commitAt(id)
+			fail "parents {c.parents.len()}" unless c.parents.len() == 2
+			fail "MERGE_HEAD left" when os.exists(os.join(repo.gitDir, "MERGE_HEAD")) onerror recover true
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def picksAndReverts() !none {
+			let repo = try newWorktree("pick")
+			try writeFile(repo, "a.txt", "1\n2\n3\n")
+			try repo.add(".")
+			try repo.commit("Base")
+			try repo.createBranch("feature")
+			try repo.checkout("feature")
+			try writeFile(repo, "a.txt", "1\n2 feature\n3\n")
+			try repo.add(".")
+			let other = new Signature("Bea Costa", "bea@example.com")
+			let picked = try repo.commit("Feature change", other)
+			try repo.checkout("main")
+			let r = try repo.cherryPick("feature", 0, true)
+			fail "pick {r.outcome}" unless r.outcome == SequenceOutcome.Committed
+			let c = try repo.commitAt("HEAD")
+			fail "author kept" unless c.author.email == "bea@example.com"
+			fail "origin line: {c.message}" unless c.message == "Feature change\n\n(cherry picked from commit {picked.str()})\n"
+			let rv = try repo.revert("HEAD")
+			fail "revert {rv.outcome}" unless rv.outcome == SequenceOutcome.Committed
+			let rc = try repo.commitAt("HEAD")
+			fail "revert message: {rc.message}" unless rc.message.startsWith("Revert \"Feature change\"\n\nThis reverts commit ")
+			fail "revert content" unless string(try os.readFile(os.join(repo.workDir, "a.txt"))) == "1\n2\n3\n"
+			try repo.revert("HEAD")
+			fail "reapply: {(try repo.commitAt("HEAD")).summary}" unless (try repo.commitAt("HEAD")).summary == "Reapply \"Feature change\""
+			try statusText(repo)
+			repo.close()
+			return none
+		}
+
+		@test()
+		def rebasesBranches() !none {
+			let repo = try newWorktree("rebase")
+			try writeFile(repo, "a.txt", "1\n2\n3\n4\n5\n")
+			try repo.add(".")
+			try repo.commit("Base")
+			try repo.createBranch("topic")
+			try writeFile(repo, "a.txt", "1 main\n2\n3\n4\n5\n")
+			try writeFile(repo, "dup.txt", "same\n")
+			try repo.add(".")
+			try repo.commit("Main change")
+			try repo.checkout("topic")
+			try writeFile(repo, "a.txt", "1\n2\n3\n4\n5 topic\n")
+			try repo.add(".")
+			try repo.commit("Topic change")
+			try writeFile(repo, "dup.txt", "same\n")
+			try repo.add(".")
+			try repo.commit("Same as upstream")
+			try writeFile(repo, "a.txt", "1 topic\n2\n3\n4\n5 topic\n")
+			try repo.add(".")
+			try repo.commit("Conflicting change")
+			let r = try repo.rebase("main")
+			fail "expected a stop, got {r.outcome}" unless r.outcome == SequenceOutcome.Conflicts
+			fail "state" unless os.exists(os.join(repo.gitDir, "rebase-merge", "git-rebase-todo")) onerror recover false
+			try writeFile(repo, "a.txt", "1 both\n2\n3\n4\n5 topic\n")
+			try repo.add("a.txt")
+			let done = try repo.rebaseContinue()
+			fail "continue {done.outcome}" unless done.outcome == SequenceOutcome.Committed
+			fail "branch {try repo.branch()}" unless (try repo.branch()) == "topic"
+			let walk = new RevWalk(repo)
+			try walk.pushRange("main..topic")
+			let subjects = (try walk.all()).mapElem(c => c.summary)
+			fail "rebased {subjects.join(", ")}" unless subjects.join(", ") == "Conflicting change, Topic change"
+			fail "status {try statusText(repo)}" unless (try statusText(repo)) == ""
+			repo.close()
+			// The same stop, left for git to carry on (checked by hand).
+			let stopped = try newWorktree("rebase-stopped")
+			try writeFile(stopped, "a.txt", "1\n")
+			try stopped.add(".")
+			try stopped.commit("Base")
+			try stopped.createBranch("topic")
+			try writeFile(stopped, "a.txt", "main\n")
+			try stopped.add(".")
+			try stopped.commit("Main")
+			try stopped.checkout("topic")
+			try writeFile(stopped, "a.txt", "topic\n")
+			try stopped.add(".")
+			try stopped.commit("Topic")
+			fail "no stop" unless (try stopped.rebase("main")).outcome == SequenceOutcome.Conflicts
+			stopped.close()
+			return none
+		}
+	}
+}

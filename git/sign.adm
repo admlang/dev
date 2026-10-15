@@ -1,0 +1,392 @@
+partial module adm.dev.git {
+	use (
+		std.time
+		std.crypto.hash
+		std.crypto.openpgp
+		std.net.ssh
+		std.data.encoding::(base64encode, base64decode)
+	)
+
+	// Signer signs commits and tags: it returns the armored signature git
+	// stores (OpenPGP `-----BEGIN PGP SIGNATURE-----` or SSH `-----BEGIN
+	// SSH SIGNATURE-----`).
+	interface Signer {
+		def sign(payload byte[]) !string
+	}
+
+	// Signs with an OpenPGP key (its signing subkey when it has one), as
+	// `gpg.format = openpgp`.
+	type OpenPGPSigner {
+		key openpgp.Key
+
+		def new(key openpgp.Key) {
+			self.key = key
+		}
+
+		// sign implements Signer. Fails when the key cannot sign (no secret
+		// part, or locked).
+		def sign(payload byte[]) !string {
+			let sig = try key.sign(payload)
+			return openpgp.armor(openpgp.ArmorKind.Signature, sig)
+		}
+	}
+
+	// Signs with an SSH key or a key in an SSH agent, as `gpg.format = ssh`:
+	// an SSHSIG signature in the `git` namespace over the SHA-512 of the
+	// payload.
+	type SSHSigner {
+		key ssh.Signer
+
+		def new(key ssh.Signer) {
+			self.key = key
+		}
+
+		// sign implements Signer. Fails when the key cannot sign.
+		def sign(payload byte[]) !string {
+			let pub = key.publicKey()
+			let digest = new hash.SHA512()
+			let signed = sshsigSignedData("git", "sha512", digest.hash(payload))
+			let sig = try key.sign(signed, sshSignatureAlgorithm(pub.algorithm()))
+			let blob byte[] = "SSHSIG".bytes()
+			putBe(blob, 1, 4)
+			sshString(blob, pub.blob())
+			sshString(blob, "git".bytes())
+			sshString(blob, byte[])
+			sshString(blob, "sha512".bytes())
+			sshString(blob, sig)
+			let text = base64encode(blob)
+			let lines string[] = ["-----BEGIN SSH SIGNATURE-----"]
+			for let i = 0; i < text.len(); i += 70 {
+				lines.push(text.slice(i, i + 70 < text.len() ?? (70, text.len() - i)))
+			}
+			lines.push("-----END SSH SIGNATURE-----")
+			return lines.join("\n") + "\n"
+		}
+	}
+
+	// The signature algorithm an SSH key signs SSHSIG with: RSA keys use
+	// rsa-sha2-512, the others their own name.
+	internal def sshSignatureAlgorithm(keyType string) string {
+		return keyType == "ssh-rsa" ?? ("rsa-sha2-512", keyType)
+	}
+
+	internal def sshString(out byte[], data byte[]) {
+		putBe(out, int64(data.len()), 4)
+		out.push(...data)
+	}
+
+	// What an SSHSIG signature covers.
+	internal def sshsigSignedData(namespace string, hashName string, digest byte[]) byte[] {
+		let out byte[] = "SSHSIG".bytes()
+		sshString(out, namespace.bytes())
+		sshString(out, byte[])
+		sshString(out, hashName.bytes())
+		sshString(out, digest)
+		return out
+	}
+
+	// What checking a commit or tag signature found.
+	struct SignatureCheck {
+		valid   bool
+		// "openpgp" or "ssh".
+		format  string
+		// Who signed: the OpenPGP fingerprint (or key id), or the SSH key's
+		// fingerprint and the principal that allows it.
+		signer  string = ""
+		// Why the signature does not hold, when it does not.
+		problem string = ""
+	}
+
+	// Checks signatures of one format.
+	interface SignatureVerifier {
+		// Checks `signature` (armored) over `payload`; `identity` is the
+		// email of the committer or tagger, for verifiers that tie keys to
+		// people.
+		def verify(payload byte[], signature string, identity string) SignatureCheck
+	}
+
+	// Verifies OpenPGP signatures against the keys of a keyring.
+	type OpenPGPVerifier {
+		keyring openpgp.Keyring
+
+		def new(keyring openpgp.Keyring) {
+			self.keyring = keyring
+		}
+
+		// verify implements SignatureVerifier.
+		def verify(payload byte[], signature string, identity string) SignatureCheck {
+			let checks = keyring.verify(payload, signature) onerror (err error) {
+				recover openpgp.Verification[]
+			}
+			if checks.len() == 0 {
+				return SignatureCheck{valid: false, format: "openpgp", problem: "not an OpenPGP signature"}
+			}
+			for let c in checks {
+				if c.valid {
+					return SignatureCheck{valid: true, format: "openpgp", signer: c.fingerprint == "" ?? (c.keyID, c.fingerprint)}
+				}
+			}
+			let first = checks[0]
+			return SignatureCheck{valid: false, format: "openpgp", signer: first.keyID, problem: first.problem}
+		}
+	}
+
+	// One line of an SSH allowed-signers file (gpg.ssh.allowedSignersFile):
+	// who may sign with which key.
+	struct AllowedSigner {
+		// Email patterns, as the file lists them.
+		principals string[]
+		key        ssh.PublicKey
+		// `namespaces="git,..."`; empty for any.
+		namespaces string[] = []
+		validAfter  ?time.Time = none
+		validBefore ?time.Time = none
+	}
+
+	// Reads an allowed-signers file: `principals [options] keytype key`
+	// lines. Fails on a line whose key does not parse.
+	def parseAllowedSigners(text string) !AllowedSigner[] {
+		let out AllowedSigner[] = []
+		for let raw in text.split("\n") {
+			let line = raw.trim()
+			continue when line == "" || line.startsWith("#")
+			let fields = splitSignerLine(line)
+			continue when fields.len() < 3
+			let principals = fields[0].replace("\"", "").split(",")
+			let at = 1
+			let namespaces string[] = []
+			let after ?time.Time = none
+			let before ?time.Time = none
+			// Options come before the key type when present.
+			if !fields[1].startsWith("ssh-") && !fields[1].startsWith("ecdsa-") && !fields[1].startsWith("sk-") {
+				for let opt in fields[1].split(",") {
+					let o = opt.trim()
+					if o.lower().startsWith("namespaces=") {
+						namespaces = o.slice(11).replace("\"", "").split(",")
+					} else if o.lower().startsWith("valid-after=") {
+						after = parseSignerTime(o.slice(12).replace("\"", ""))
+					} else if o.lower().startsWith("valid-before=") {
+						before = parseSignerTime(o.slice(13).replace("\"", ""))
+					}
+				}
+				at = 2
+			}
+			continue when fields.len() < at + 2
+			let key = try ssh.parsePublicKey("{fields[at]} {fields[at + 1]}")
+			out.push(AllowedSigner{principals: principals, key: key, namespaces: namespaces, validAfter: after, validBefore: before})
+		}
+		return out
+	}
+
+	// Splits on blanks outside double quotes.
+	internal def splitSignerLine(line string) string[] {
+		let out string[] = []
+		let cur byte[] = []
+		let quoted = false
+		for let c in line.bytes() {
+			if c == 0x22 {
+				quoted = !quoted
+				cur.push(c)
+				continue
+			}
+			if (c == 0x20 || c == 0x09) && !quoted {
+				out.push(string(cur)) when cur.len() > 0
+				cur = []
+				continue
+			}
+			cur.push(c)
+		}
+		out.push(string(cur)) when cur.len() > 0
+		return out
+	}
+
+	// `YYYYMMDD[HHMM[SS]]` (optionally with Z) as an instant, none when it
+	// is not one.
+	internal def parseSignerTime(text string) ?time.Time {
+		let t = text.endsWith("Z") ?? (text.slice(0, text.len() - 1), text)
+		return none unless t.isNumeric() && t.len() >= 8
+		let iso = "{t.slice(0, 4)}-{t.slice(4, 6)}-{t.slice(6, 8)}T" + (t.len() >= 12 ?? ("{t.slice(8, 10)}:{t.slice(10, 12)}", "00:00")) + (t.len() >= 14 ?? (":{t.slice(12, 14)}", ":00")) + "Z"
+		return timeOrNone(iso)
+	}
+
+	// Verifies SSH signatures against an allowed-signers list: the key must
+	// be listed for a principal matching the signer's email and for the
+	// `git` namespace.
+	type SSHVerifier {
+		allowed AllowedSigner[]
+
+		def new(allowed AllowedSigner[]) {
+			self.allowed = allowed
+		}
+
+		// verify implements SignatureVerifier.
+		def verify(payload byte[], signature string, identity string) SignatureCheck {
+			let parsed = sshsigBlob(signature) onerror (err error) {
+				recover byte[]
+			}
+			if parsed.len() == 0 {
+				return SignatureCheck{valid: false, format: "ssh", problem: "not an SSH signature"}
+			}
+			let r = new SshReader(parsed, 6)
+			let version = r.uint32()
+			let pubBlob = r.str()
+			let namespace = string(r.str())
+			r.str()
+			let hashName = string(r.str())
+			let sig = r.str()
+			if !r.ok || version != 1 {
+				return SignatureCheck{valid: false, format: "ssh", problem: "malformed SSH signature"}
+			}
+			if namespace != "git" {
+				return SignatureCheck{valid: false, format: "ssh", problem: "signature namespace is {namespace}, not git"}
+			}
+			let pub = keyOrNone(pubBlob)
+			if pub is none {
+				return SignatureCheck{valid: false, format: "ssh", problem: "unsupported signing key"}
+			}
+			if !(hashName := "sha256" || "sha512") {
+				return SignatureCheck{valid: false, format: "ssh", problem: "unsupported hash {hashName}"}
+			}
+			let h256 = new hash.SHA256()
+			let h512 = new hash.SHA512()
+			let digest = hashName == "sha256" ?? (h256.hash(payload), h512.hash(payload))
+			if !pub.verify(sshsigSignedData(namespace, hashName, digest), sig) {
+				return SignatureCheck{valid: false, format: "ssh", signer: pub.fingerprint(), problem: "bad signature"}
+			}
+			let now = time.now()
+			for let a in allowed {
+				continue unless a.key.equals(pub)
+				continue unless a.namespaces.len() == 0 || a.namespaces.includes("git")
+				let after = a.validAfter
+				continue when !(after is none) && now.before(after)
+				let before = a.validBefore
+				continue when !(before is none) && now.after(before)
+				for let p in a.principals {
+					if wildmatch(p, identity, false, false) {
+						return SignatureCheck{valid: true, format: "ssh", signer: "{pub.fingerprint()} {identity}"}
+					}
+				}
+			}
+			return SignatureCheck{valid: false, format: "ssh", signer: pub.fingerprint(), problem: "no allowed signer for {identity} uses this key"}
+		}
+	}
+
+	internal def keyOrNone(blob byte[]) ?ssh.PublicKey {
+		return tryPublicKey(blob) onerror recover none
+	}
+
+	internal def tryPublicKey(blob byte[]) !?ssh.PublicKey {
+		return try ssh.parsePublicKey(blob)
+	}
+
+	// The binary blob of an armored SSH signature, its magic checked.
+	internal def sshsigBlob(text string) !byte[] {
+		let beginMarker = "-----BEGIN SSH SIGNATURE-----"
+		let endMarker = "-----END SSH SIGNATURE-----"
+		let a = text.indexOf(beginMarker)
+		let b = text.indexOf(endMarker)
+		fail "git: not an SSH signature" when a < 0 || b < a
+		let body = text.slice(a + beginMarker.len(), b).replace("\n", "").replace("\r", "").trim()
+		let blob = try base64decode(body)
+		fail "git: not an SSH signature" when blob.len() < 6 || string(blob[0:6]) != "SSHSIG"
+		return blob
+	}
+
+	// Reads the SSH wire encoding's uint32s and strings.
+	internal type SshReader {
+		data byte[]
+		pos  int
+		ok   bool = true
+
+		def new(data byte[], pos int) {
+			self.data = data
+			self.pos = pos
+		}
+
+		def uint32() int {
+			if pos + 4 > data.len() {
+				ok = false
+				return 0
+			}
+			let v = be32(data, pos)
+			pos += 4
+			return v
+		}
+
+		def str() byte[] {
+			let n = uint32()
+			if !ok || pos + n > data.len() {
+				ok = false
+				return []
+			}
+			let out = data[pos:pos + n].clone()
+			pos += n
+			return out
+		}
+	}
+
+	// ---- signed objects -----------------------------------------------------------
+
+	// The header a signature of the repository's format goes in.
+	internal def signatureHeader(format ObjectFormat) string {
+		return format == ObjectFormat.Sha256 ?? ("gpgsig-sha256", "gpgsig")
+	}
+
+	// Adds a signature over the commit's bytes (without signature headers)
+	// to the commit. Fails when the signer fails.
+	internal def signCommit(c Commit, signer Signer) !none {
+		c.headers = c.headers.filter(h => h.key != "gpgsig" && h.key != "gpgsig-sha256")
+		let sig = try signer.sign(c.encode())
+		let text = sig.endsWith("\n") ?? (sig.slice(0, sig.len() - 1), sig)
+		c.headers.push(Header{key: signatureHeader(c.tree.format()), value: text})
+		return none
+	}
+
+	// A commit's stored bytes split into what was signed and the signature:
+	// every gpgsig and gpgsig-sha256 header removed from the payload. The
+	// signature is empty for an unsigned commit.
+	def splitCommitSignature(raw byte[], format ObjectFormat = ObjectFormat.Sha1) (byte[], string) {
+		let payload byte[] = []
+		let sig = ""
+		let want = signatureHeader(format)
+		let n = raw.len()
+		let i = 0
+		for i < n && raw[i] != 0x0A {
+			let eol = indexByte(raw, 0x0A, i, n)
+			eol = n - 1 when eol < 0
+			let sp = indexByte(raw, 0x20, i, eol)
+			let key = sp < 0 ?? ("", string(raw[i:sp]))
+			// The header runs on over continuation lines.
+			let end = eol + 1
+			for end < n && raw[end] == 0x20 {
+				let e = indexByte(raw, 0x0A, end, n)
+				end = e < 0 ?? (n, e + 1)
+			}
+			if key := "gpgsig" || "gpgsig-sha256" {
+				if key == want && sig == "" {
+					let (value, _) = readHeaderValue(raw, sp + 1, eol, n)
+					sig = value + "\n"
+				}
+			} else {
+				payload.push(...raw[i:end])
+			}
+			i = end
+		}
+		payload.push(...raw[i:n])
+		return (payload, sig)
+	}
+
+	// A tag's stored bytes split into the signed part and the signature that
+	// ends its message (OpenPGP, SSH or X.509).
+	def splitTagSignature(raw byte[]) (byte[], string) {
+		let text = string(raw)
+		for let marker in ["-----BEGIN PGP SIGNATURE-----", "-----BEGIN SSH SIGNATURE-----", "-----BEGIN SIGNED MESSAGE-----"] {
+			let at = text.lastIndexOf("\n" + marker)
+			if at >= 0 {
+				let cut = text.slice(0, at + 1).bytes().len()
+				return (raw[0:cut].clone(), string(raw[cut:]))
+			}
+		}
+		return (raw, "")
+	}
+}

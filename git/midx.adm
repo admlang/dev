@@ -1,0 +1,207 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.services.storage::(MapAccess)
+	)
+
+	// One multi-pack-index file: one sorted id table over several packs.
+	internal type MidxLayer {
+		path      string
+		data      byte[]
+		hashLen   int
+		count     int
+		packNames string[]      = []
+		packs     ?Pack[]       = none
+		fanoutAt  int           = 0
+		idsAt     int           = 0
+		offsetsAt int           = 0
+		largeAt   int           = -1
+		// The index of this layer's first object among every layer's, for
+		// a chain of incremental layers.
+		base      int           = 0
+		mapping   ?os.Mapping   = none
+
+		def new(path string, hashLen int) {
+			self.path = path
+			self.hashLen = hashLen
+		}
+
+		// Unmaps the file when the layer is released.
+		def dispose() {
+			close()
+		}
+
+		def close() {
+			let m = mapping
+			m.close() unless m is none
+			mapping = none
+		}
+
+		// Maps the file and reads its chunk table. Fails when it is not a
+		// multi-pack index of the repository's format.
+		def load() !none {
+			let m = try os.mapFile(path, MapAccess.Copy)
+			mapping = m
+			data = try m.pages(0, m.length())
+			fail "git: {path} is not a multi-pack index" when data.len() < 12 || string(data[0:4]) != "MIDX"
+			let version = int(data[4])
+			fail "git: {path} has unsupported version {version}" unless version == 1 || version == 2
+			let oidVersion = int(data[5])
+			fail "git: {path} has the wrong object format" when (oidVersion == 1 ?? (20, 32)) != hashLen
+			let chunks = int(data[6])
+			let packCount = be32(data, 8)
+			let pnam = -1
+			let pnamEnd = -1
+			for let i = 0; i < chunks; i++ {
+				let at = 12 + i * 12
+				let id = string(data[at:at + 4])
+				let offset = int(be64(data, at + 4))
+				let next = int(be64(data, at + 16))
+				switch id {
+					case "PNAM":
+						pnam = offset
+						pnamEnd = next
+					case "OIDF":
+						fanoutAt = offset
+					case "OIDL":
+						idsAt = offset
+					case "OOFF":
+						offsetsAt = offset
+					case "LOFF":
+						largeAt = offset
+				}
+			}
+			fail "git: {path} lacks a required chunk" when pnam < 0 || fanoutAt == 0 || idsAt == 0 || offsetsAt == 0
+			count = be32(data, fanoutAt + 255 * 4)
+			let p = pnam
+			for let k = 0; k < packCount; k++ {
+				let end = indexByte(data, 0, p, pnamEnd)
+				fail "git: {path} has a malformed pack name list" when end < 0
+				packNames.push(string(data[p:end]))
+				p = end + 1
+			}
+			return none
+		}
+
+		// The position of the id in this layer, or -1.
+		def position(id byte[]) int {
+			let first = int(id[0])
+			let lo = first == 0 ?? (0, be32(data, fanoutAt + (first - 1) * 4))
+			let hi = be32(data, fanoutAt + first * 4)
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let c = compareIdBytes(data, idsAt + mid * hashLen, id, 0, hashLen)
+				return mid when c == 0
+				if c < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return -1
+		}
+
+		// The id at a position.
+		def idAt(n int) ObjectId {
+			let at = idsAt + n * hashLen
+			return new ObjectId(data[at:at + hashLen].clone())
+		}
+
+		// The pack number and offset of the object at a position.
+		def location(n int) (int, int) {
+			let packId = be32(data, offsetsAt + n * 8)
+			let v = be32(data, offsetsAt + n * 8 + 4)
+			return (packId, v) when (v & 0x80000000) == 0
+			return (packId, int(be64(data, largeAt + (v & 0x7FFFFFFF) * 8)))
+		}
+	}
+
+	// MultiPackIndex is `objects/pack/multi-pack-index`, or the chain of
+	// incremental layers under `multi-pack-index.d`, over the packs of one
+	// object database.
+	internal type MultiPackIndex {
+		layers  MidxLayer[]
+		covered map<string, bool> = {}
+
+		def new(layers MidxLayer[]) {
+			self.layers = layers
+		}
+
+		// Unmaps the layers when the index is released.
+		def dispose() {
+			close()
+		}
+
+		def close() {
+			for let l in layers {
+				l.close()
+			}
+		}
+
+		// Whether the pack is one the index covers.
+		def covers(p Pack) bool {
+			return covered.hasKey(os.base(p.path))
+		}
+
+		// The pack and offset of the object, none when no layer holds it.
+		def find(id byte[]) ?(Pack, int) {
+			for let i = layers.len() - 1; i >= 0; i-- {
+				let l = layers[i]
+				let n = l.position(id)
+				continue when n < 0
+				let (packId, offset) = l.location(n)
+				let ps = l.packs
+				return none when ps is none || packId >= ps.len()
+				return (ps[packId], offset)
+			}
+			return none
+		}
+	}
+
+	// The multi-pack index of the database, none when it has none or names a
+	// pack that is gone (git ignores such an index too). Fails when the file
+	// is malformed.
+	internal def loadMultiPackIndex(odb ObjectDatabase) !?MultiPackIndex {
+		let packDir = os.join(odb.dir, "pack")
+		let hashLen = idLength(odb.format)
+		let layers MidxLayer[] = []
+		let single = os.join(packDir, "multi-pack-index")
+		let chain = os.join(packDir, "multi-pack-index.d", "multi-pack-index-chain")
+		if os.exists(chain) onerror recover false {
+			let base = 0
+			for let line in string(try os.readFile(chain)).split("\n") {
+				let h = line.trim()
+				continue when h == ""
+				let l = new MidxLayer(os.join(packDir, "multi-pack-index.d", "multi-pack-index-{h}.midx"), hashLen)
+				try l.load()
+				l.base = base
+				base += l.count
+				layers.push(l)
+			}
+		} else if os.exists(single) onerror recover false {
+			let l = new MidxLayer(single, hashLen)
+			try l.load()
+			layers.push(l)
+		}
+		return none when layers.len() == 0
+		let midx = new MultiPackIndex(layers)
+		let byName map<string, Pack> = {}
+		for let p in odb.packs {
+			byName[os.base(p.path).replace(".pack", ".idx")] = p
+		}
+		for let l in layers {
+			let ps Pack[] = []
+			for let name in l.packNames {
+				let p = byName.get(name)
+				if p is none {
+					midx.close()
+					return none
+				}
+				ps.push(p)
+				midx.covered[name.replace(".idx", ".pack")] = true
+			}
+			l.packs = ps
+		}
+		return midx
+	}
+}

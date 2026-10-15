@@ -1,0 +1,655 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// Reference is a name for an object: `refs/heads/main`, `refs/tags/v1`,
+	// `HEAD`. A symbolic reference names another reference instead.
+	struct Reference {
+		name   string
+		// The object it names; none for a symbolic reference.
+		id     ?ObjectId = none
+		// The reference a symbolic reference names; empty otherwise.
+		target string    = ""
+		// For an annotated tag, the object the tag (and any tag it names)
+		// leads to, when the store records it.
+		peeled ?ObjectId = none
+	}
+
+	// Whether the reference is symbolic.
+	def isSymbolic(ref Reference) bool {
+		return ref.target != ""
+	}
+
+	// One line of a reference's log: what it held before and after, who
+	// changed it, when and why.
+	struct ReflogEntry {
+		oldId   ObjectId
+		newId   ObjectId
+		who     Signature
+		message string
+	}
+
+	// Whether `name` is a valid reference name (git check-ref-format):
+	// no `..`, `@{`, control characters, space, `~ ^ : ? * [ \`, no
+	// component starting with `.` or ending with `.lock`, no empty
+	// component, no trailing `.` and not `@`. `onelevel` allows a name
+	// without a `/` (as `HEAD`); `pattern` allows one `*`.
+	def validRefName(name string, onelevel bool = false, pattern bool = false) bool {
+		let b = name.bytes()
+		return false when b.len() == 0 || name == "@"
+		return false when b[0] == 0x2F || b[b.len() - 1] == 0x2F || b[b.len() - 1] == 0x2E
+		let stars = 0
+		let slashes = 0
+		let componentStart = 0
+		for let i = 0; i < b.len(); i++ {
+			let c = b[i]
+			return false when c < 0x20 || c == 0x7F
+			switch int(c) {
+				case 0x20, 0x7E, 0x5E, 0x3A, 0x3F, 0x5B, 0x5C:
+					return false
+				case 0x2A:
+					stars++
+					return false unless pattern && stars == 1
+				case 0x2E:
+					return false when i + 1 < b.len() && b[i + 1] == 0x2E
+					return false when i == componentStart
+				case 0x40:
+					return false when i + 1 < b.len() && b[i + 1] == 0x7B
+				case 0x2F:
+					return false when i == componentStart
+					return false when name.slice(componentStart, i).endsWith(".lock")
+					slashes++
+					componentStart = i + 1
+			}
+		}
+		return false when name.slice(componentStart).endsWith(".lock")
+		return false when slashes == 0 && !onelevel
+		return true
+	}
+
+	// Whether the reference lives with each worktree rather than with the
+	// repository: HEAD and the other root names, refs/bisect,
+	// refs/worktree and refs/rewritten.
+	internal def perWorktreeRef(name string) bool {
+		return true unless name.startsWith("refs/")
+		return name.startsWith("refs/bisect/") || name.startsWith("refs/worktree/") || name.startsWith("refs/rewritten/")
+	}
+
+	// One change a RefTransaction makes.
+	internal struct RefUpdate {
+		name     string
+		// The new value: an id, a symbolic target, or neither to delete.
+		newId    ?ObjectId = none
+		newTarget string   = ""
+		delete   bool      = false
+		// The value the reference must hold first; none checks nothing, the
+		// zero id requires it not to exist.
+		expected ?ObjectId = none
+		message  string    = ""
+		// Write the update through a symbolic reference to what it names.
+		deref    bool      = true
+	}
+
+	// A store of references: the files under `.git` or a reftable stack.
+	internal interface RefBackend {
+		// The reference as stored (symbolic references are not followed),
+		// none when there is none. Fails when the store is unreadable.
+		def read(name string) !?Reference
+
+		// Every reference under the prefix ("" for all), sorted by name,
+		// HEAD and the other root references excluded.
+		def list(prefix string) !Reference[]
+
+		// Applies the updates all or none. Fails when a reference does not
+		// hold its expected value or the store cannot be written.
+		def commit(updates RefUpdate[], who Signature) !none
+
+		// The reference's log, oldest first; empty when it has none.
+		def reflog(name string) !ReflogEntry[]
+
+		// Whether the reference has a log.
+		def hasReflog(name string) bool
+
+		// Removes a reference's log, or replaces it with the entries kept.
+		def rewriteReflog(name string, entries ReflogEntry[]) !none
+	}
+
+	// The reference store of the `files` format: loose files under `refs/`,
+	// `packed-refs`, the root references (`HEAD`, `FETCH_HEAD`, ...) and
+	// logs under `logs/`.
+	internal type FileRefs {
+		// The worktree's git folder, which holds HEAD and per-worktree refs.
+		gitDir    string
+		// The common folder, which holds the shared refs.
+		commonDir string
+		format    ObjectFormat
+		// When to write logs: "true" (branches, remotes, notes, HEAD),
+		// "always" (every ref) or "false".
+		logRefs   string       = "true"
+		packed    ?PackedRefs  = none
+
+		def new(gitDir string, commonDir string, format ObjectFormat) {
+			self.gitDir = gitDir
+			self.commonDir = commonDir
+			self.format = format
+		}
+
+		def folderOf(name string) string {
+			return perWorktreeRef(name) ?? (gitDir, commonDir)
+		}
+
+		def pathOf(name string) string {
+			return os.join(folderOf(name), name)
+		}
+
+		def logPath(name string) string {
+			return os.join(folderOf(name), "logs", name)
+		}
+
+		// The packed references, read again when the file changed.
+		def packedRefs() !PackedRefs {
+			let path = os.join(commonDir, "packed-refs")
+			let info = statOrNone(path)
+			let current = packed
+			if info is none {
+				let none0 = new PackedRefs(path, [], time.fromUnixNs(0), 0)
+				packed = none0
+				return none0
+			}
+			if !(current is none) && current.modTime.equals(info.modTime) && current.size == info.size {
+				return current
+			}
+			let p = try readPackedRefs(path, info.modTime, info.size)
+			packed = p
+			return p
+		}
+
+		def read(name string) !?Reference {
+			let loose = try readLooseRef(pathOf(name), name, format)
+			return loose unless loose is none
+			return none when perWorktreeRef(name) && !name.startsWith("refs/")
+			let p = try packedRefs()
+			return p.get(name)
+		}
+
+		def list(prefix string) !Reference[] {
+			let byName map<string, Reference> = {}
+			let p = try packedRefs()
+			for let r in p.refs {
+				byName[r.name] = r when r.name.startsWith(prefix)
+			}
+			try collectLoose(os.join(commonDir, "refs"), "refs/", prefix, byName)
+			if gitDir != commonDir {
+				// A linked worktree's own refs/bisect, refs/worktree, refs/rewritten.
+				for let sub in ["refs/bisect", "refs/worktree", "refs/rewritten"] {
+					try collectLoose(os.join(gitDir, sub), sub + "/", prefix, byName)
+				}
+			}
+			let names = byName.keys()
+			names.sort((a, b) => compareBytes(a, b))
+			let out Reference[] = []
+			for let n in names {
+				out.push(byName[n])
+			}
+			return out
+		}
+
+		def collectLoose(dir string, base string, prefix string, into map<string, Reference>) !none {
+			return none unless os.exists(dir) onerror recover false
+			// Skip folders the prefix rules out.
+			let shared = base.len() < prefix.len() ?? (prefix.startsWith(base), base.startsWith(prefix))
+			return none unless shared
+			for let e in try os.readDir(dir) {
+				let name = base + e.info.name
+				if e.info.isDir {
+					try collectLoose(e.path, name + "/", prefix, into)
+					continue
+				}
+				continue when e.info.name.endsWith(".lock") || !name.startsWith(prefix)
+				let r = readLooseRef(e.path, name, format) onerror recover none
+				into[name] = r unless r is none
+			}
+			return none
+		}
+
+		def commit(updates RefUpdate[], who Signature) !none {
+			let locks RefLock[] = []
+			let failure ?error = none
+			let resolved RefUpdate[] = []
+			let needPacked = false
+			// Lock every reference, then check what each holds.
+			for let u0 in updates {
+				let u = try derefUpdate(u0)
+				resolved.push(u)
+				fail "git: invalid reference name {u.name}" unless validRefName(u.name, true) || u.name.startsWith("refs/")
+				let lock = lockOrNone(pathOf(u.name)) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+				break when lock is none
+				locks.push(lock)
+				let current = try read(u.name)
+				let mismatch = checkExpected(u, current)
+				if mismatch != "" {
+					failure = error{message: mismatch}
+					break
+				}
+				needPacked = true when u.delete
+			}
+			if !(failure is none) {
+				for let l in locks {
+					l.release()
+				}
+				fail failure
+			}
+			// Deleting a packed reference rewrites packed-refs under its lock.
+			if needPacked {
+				let p = try packedRefs()
+				let gone = resolved.filter(u => u.delete).mapElem(u => u.name)
+				if p.refs.filter(r => gone.includes(r.name)).len() > 0 {
+					let held = lockOrNone(os.join(commonDir, "packed-refs")) onerror (err error) {
+						failure = err
+						recover none
+					}
+					if failure is none && !(held is none) {
+						let lock RefLock = held
+						// packed-refs goes first: the loose files still hide the
+						// old packed values until they are removed below.
+						let kept = p.refs.filter(r => !gone.includes(r.name))
+						lock.write(encodePackedRefs(kept)) onerror (err error) {
+							failure = err
+							recover none
+						}
+						if failure is none {
+							lock.commit() onerror (err error) {
+								failure = err
+								recover none
+							}
+						} else {
+							lock.release()
+						}
+					}
+				}
+			}
+			if !(failure is none) {
+				for let l in locks {
+					l.release()
+				}
+				fail failure
+			}
+			let head = read("HEAD") onerror recover none
+			let headTarget = head is none ?? ("", head.target)
+			for let (i, u) in resolved {
+				let lock = locks[i]
+				let old = try read(u.name)
+				let oldId = old is none ?? (zeroId(format), refIdOrZero(old, format))
+				// What a symbolic reference led to before it moves.
+				let before = resolveSymbolic(self, u.name, zeroId(format))
+				if u.delete {
+					lock.release()
+					os.remove(pathOf(u.name)) onerror recover none
+					removeEmptyParents(os.dir(pathOf(u.name)), folderOf(u.name))
+					os.remove(logPath(u.name)) onerror recover none
+					continue
+				}
+				let content = u.newTarget != "" ?? ("ref: {u.newTarget}\n", "{refIdOrZero(Reference{name: u.name, id: u.newId}, format).str()}\n")
+				try lock.write(content.bytes())
+				try lock.commit()
+				let newId = u.newId
+				if u.newTarget != "" && u.message != "" && shouldLog(u.name) {
+					// A symbolic reference moved to another branch logs the
+					// commit it leads to now.
+					let target = resolveSymbolic(self, u.newTarget, zeroId(format))
+					try appendReflog(u.name, ReflogEntry{oldId: before, newId: target, who: who, message: u.message})
+				}
+				if !(newId is none) && shouldLog(u.name) {
+					let entry = ReflogEntry{oldId: oldId, newId: newId, who: who, message: u.message}
+					try appendReflog(u.name, entry)
+					// The branch HEAD is on moves HEAD too, and its log says so.
+					try appendReflog("HEAD", entry) when u.name == headTarget && u.name != "HEAD"
+				}
+			}
+			for let l in locks {
+				l.commit() onerror recover none
+			}
+			packed = none
+			return none
+		}
+
+		// An update aimed through a symbolic reference at the reference it
+		// names, as git updates the branch HEAD is on.
+		def derefUpdate(u RefUpdate) !RefUpdate {
+			return u unless u.deref && u.newTarget == ""
+			let name = u.name
+			for let depth = 0; depth < 5; depth++ {
+				let r = try read(name)
+				break when r is none || r.target == ""
+				name = r.target
+			}
+			return RefUpdate{...u, name: name}
+		}
+
+		def shouldLog(name string) bool {
+			return false when logRefs == "false"
+			return true when logRefs == "always"
+			return name == "HEAD" || name.startsWith("refs/heads/") || name.startsWith("refs/remotes/") || name.startsWith("refs/notes/") || os.exists(logPath(name)) onerror recover false
+		}
+
+		def appendReflog(name string, entry ReflogEntry) !none {
+			let path = logPath(name)
+			try os.mkdir(os.dir(path), true)
+			let f = try os.open(path, "a")
+			let message = entry.message.replace("\n", " ")
+			try f.write("{entry.oldId.str()} {entry.newId.str()} {entry.who.str()}\t{message}\n".bytes())
+			try f.close()
+			return none
+		}
+
+		def reflog(name string) !ReflogEntry[] {
+			let path = logPath(name)
+			let data = os.readFile(path) onerror recover byte[]
+			return try parseReflog(data, format)
+		}
+
+		def hasReflog(name string) bool {
+			return os.exists(logPath(name)) onerror recover false
+		}
+
+		def rewriteReflog(name string, entries ReflogEntry[]) !none {
+			let path = logPath(name)
+			if entries.len() == 0 {
+				os.remove(path) onerror recover none
+				return none
+			}
+			let out byte[] = []
+			for let e in entries {
+				out.push(..."{e.oldId.str()} {e.newId.str()} {e.who.str()}\t{e.message}\n".bytes())
+			}
+			try os.mkdir(os.dir(path), true)
+			try writeAtomically(path, out)
+			return none
+		}
+
+		// Writes every loose reference under refs/ into packed-refs and
+		// removes the loose files (`git pack-refs --all`), keeping peeled
+		// values for tags. Fails when a lock is held or a file cannot be
+		// written.
+		def pack(peel def (ObjectId) ?ObjectId) !none {
+			let all = try list("refs/")
+			let lock = try acquireLock(os.join(commonDir, "packed-refs"))
+			let refs Reference[] = []
+			for let r in all {
+				continue when r.target != ""
+				let id = r.id
+				continue when id is none
+				let peeled = r.name.startsWith("refs/tags/") ?? (peel(id), none)
+				refs.push(Reference{name: r.name, id: id, peeled: peeled})
+			}
+			lock.write(encodePackedRefs(refs)) onerror (err error) {
+				lock.release()
+				fail err
+			}
+			try lock.commit()
+			for let r in refs {
+				let path = pathOf(r.name)
+				os.remove(path) onerror recover none
+				removeEmptyParents(os.dir(path), commonDir)
+			}
+			packed = none
+			return none
+		}
+	}
+
+	// The id a reference leads to through symbolic references in a store,
+	// `fallback` (the zero id by default) when it leads nowhere.
+	internal def resolveSymbolic(store RefBackend, name string, fallback ?ObjectId = none) ObjectId {
+		let current = name
+		for let depth = 0; depth < 6; depth++ {
+			let r = store.read(current) onerror recover none
+			break when r is none
+			let id = r.id
+			return id unless id is none
+			current = r.target
+		}
+		return fallback is none ?? (zeroId(ObjectFormat.Sha1), fallback)
+	}
+
+	internal def refIdOrZero(r Reference, format ObjectFormat) ObjectId {
+		let id = r.id
+		return id is none ?? (zeroId(format), id)
+	}
+
+	// "" when the reference holds what the update expects, else why not.
+	internal def checkExpected(u RefUpdate, current ?Reference) string {
+		let want = u.expected
+		return "" when want is none
+		if want.isZero() {
+			return "" when current is none
+			return "git: reference {u.name} already exists"
+		}
+		return "git: reference {u.name} does not exist" when current is none
+		let id = current.id
+		return "git: reference {u.name} is symbolic" when id is none
+		return "" when id.equals(want)
+		return "git: reference {u.name} is at {id.short()}, not {want.short()}"
+	}
+
+	// Removes the folders from `dir` up while they are empty, keeping `refs/`
+	// and the folders directly in it (`refs/heads`, `refs/tags`), which git
+	// expects to find, and never going above `root`.
+	internal def removeEmptyParents(dir string, root string) {
+		let d = dir
+		for d.len() > root.len() && d.startsWith(root + "/") {
+			let rel = d.slice(root.len() + 1)
+			let parts = rel.split("/")
+			break when parts.len() <= 2 && parts[0] == "refs"
+			let entries = os.readDir(d) onerror recover os.DirEntry[]
+			break when entries.len() > 0
+			os.rmdir(d) onerror recover none
+			d = os.dir(d)
+		}
+	}
+
+	// Orders strings by their bytes, as git sorts reference names.
+	internal def compareBytes(a string, b string) int {
+		let x = a.bytes()
+		let y = b.bytes()
+		let n = x.len() < y.len() ?? (x.len(), y.len())
+		let c = compareIdBytes(x, 0, y, 0, n)
+		return c when c != 0
+		return 0 when x.len() == y.len()
+		return x.len() < y.len() ?? (-1, 1)
+	}
+
+	// A loose reference file, none when there is none. Fails when it holds
+	// neither an id nor `ref: <name>`.
+	internal def readLooseRef(path string, name string, format ObjectFormat) !?Reference {
+		let data = os.readFile(path) onerror recover byte[]
+		if data.len() == 0 {
+			return none unless os.exists(path) onerror recover false
+			let info = statOrNone(path)
+			return none when !(info is none) && info.isDir
+			fail "git: reference {name} is empty"
+		}
+		let text = string(data).trim()
+		if text.startsWith("ref:") {
+			return Reference{name: name, target: text.slice(4).trim()}
+		}
+		let hex = text.len() > idLength(format) * 2 ?? (text.slice(0, idLength(format) * 2), text)
+		let id = parseId(hex) onerror (err error) {
+			fail "git: reference {name} is malformed"
+		}
+		return Reference{name: name, id: id}
+	}
+
+	// packed-refs as read: the references sorted by name, and the file's
+	// time and size to tell when it changes.
+	internal type PackedRefs {
+		path    string
+		refs    Reference[]
+		modTime time.Time
+		size    int64
+
+		def new(path string, refs Reference[], modTime time.Time, size int64) {
+			self.path = path
+			self.refs = refs
+			self.modTime = modTime
+			self.size = size
+		}
+
+		def get(name string) ?Reference {
+			let lo = 0
+			let hi = refs.len()
+			for lo < hi {
+				let mid = (lo + hi) / 2
+				let c = compareBytes(refs[mid].name, name)
+				return refs[mid] when c == 0
+				if c < 0 {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			return none
+		}
+	}
+
+	// Reads packed-refs: `<id> <name>` lines, each optionally followed by
+	// `^<id>`, the tag peeled. Fails on a malformed line.
+	internal def readPackedRefs(path string, modTime time.Time, size int64) !PackedRefs {
+		let data = try os.readFile(path)
+		let refs Reference[] = []
+		let sorted = false
+		for let line in string(data).split("\n") {
+			let l = line.trim()
+			continue when l == ""
+			if l.startsWith("#") {
+				sorted = true when l.contains(" sorted")
+				continue
+			}
+			if l.startsWith("^") {
+				fail "git: {path} has a peeled line with no reference" when refs.len() == 0
+				let last = refs.len() - 1
+				refs[last] = Reference{...refs[last], peeled: try parseId(l.slice(1))}
+				continue
+			}
+			let sp = l.indexOf(" ")
+			fail "git: {path} has a malformed line" when sp < 0
+			refs.push(Reference{name: l.slice(sp + 1), id: try parseId(l.slice(0, sp))})
+		}
+		refs.sort((a, b) => compareBytes(a.name, b.name)) unless sorted
+		return new PackedRefs(path, refs, modTime, size)
+	}
+
+	// packed-refs text for sorted references.
+	internal def encodePackedRefs(refs Reference[]) byte[] {
+		let lines string[] = ["# pack-refs with: peeled fully-peeled sorted "]
+		for let r in refs {
+			lines.push("{refIdOrZero(r, ObjectFormat.Sha1).str()} {r.name}")
+			let p = r.peeled
+			lines.push("^{p.str()}") unless p is none
+		}
+		return (lines.join("\n") + "\n").bytes()
+	}
+
+	// A reflog file's entries, oldest first. Malformed lines are skipped,
+	// as git skips them.
+	internal def parseReflog(data byte[], format ObjectFormat) !ReflogEntry[] {
+		let out ReflogEntry[] = []
+		let hexLen = idLength(format) * 2
+		for let line in string(data).split("\n") {
+			continue when line.len() < hexLen * 2 + 2
+			let b = line.bytes()
+			let before = idOrNone(string(b[0:hexLen]))
+			let after = idOrNone(string(b[hexLen + 1:hexLen * 2 + 1]))
+			continue when before is none
+			continue when after is none
+			let rest = b[hexLen * 2 + 2:]
+			let tab = indexByte(rest, 0x09, 0, rest.len())
+			let identEnd = tab < 0 ?? (rest.len(), tab)
+			let who = signatureOrNone(rest, 0, identEnd)
+			continue when who is none
+			let message = tab < 0 ?? ("", string(rest[tab + 1:]))
+			out.push(ReflogEntry{oldId: before, newId: after, who: who, message: message})
+		}
+		return out
+	}
+
+	// A `<path>.lock` file held while a file is rewritten: created
+	// exclusively, written, then renamed over the file (commit) or removed
+	// (release).
+	internal type RefLock {
+		path string
+		lockPath string
+		done bool = false
+
+		def new(path string) {
+			self.path = path
+			lockPath = path + ".lock"
+		}
+
+		def write(data byte[]) !none {
+			try os.writeFile(lockPath, data)
+			return none
+		}
+
+		def commit() !none {
+			return none when done
+			done = true
+			try os.rename(lockPath, path)
+			return none
+		}
+
+		def release() {
+			return when done
+			done = true
+			os.remove(lockPath) onerror recover none
+		}
+	}
+
+	// acquireLock with an optional result, for callers that collect errors.
+	internal def lockOrNone(path string) !?RefLock {
+		return try acquireLock(path)
+	}
+
+	// The file's information, none when it cannot be read.
+	internal def statOrNone(path string, followLinks bool = true) ?os.FileInfo {
+		return tryStat(path, followLinks) onerror recover none
+	}
+
+	internal def tryStat(path string, followLinks bool) !?os.FileInfo {
+		return try os.stat(path, followLinks)
+	}
+
+	// The id written in hex, none when it is not one.
+	internal def idOrNone(text string) ?ObjectId {
+		return tryParseId(text) onerror recover none
+	}
+
+	internal def tryParseId(text string) !?ObjectId {
+		return try parseId(text)
+	}
+
+	internal def signatureOrNone(data byte[], start int, end int) ?Signature {
+		return trySignature(data, start, end) onerror recover none
+	}
+
+	internal def trySignature(data byte[], start int, end int) !?Signature {
+		return try parseSignatureBytes(data, start, end)
+	}
+
+	// Takes the lock on a file. Fails when another process holds it (the
+	// lock file exists) or it cannot be created.
+	internal def acquireLock(path string) !RefLock {
+		try os.mkdir(os.dir(path), true)
+		let lock = new RefLock(path)
+		let f = os.open(lock.lockPath, "wx") onerror (err error) {
+			fail "git: unable to create {lock.lockPath}: another git process may be running ({err.message})"
+		}
+		try f.close()
+		return lock
+	}
+}

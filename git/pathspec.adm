@@ -1,0 +1,324 @@
+partial module adm.dev.git {
+	// One pathspec item: a path or pattern with its magic.
+	internal struct PathspecItem {
+		// The text after the magic, relative to the top of the tree.
+		text     string
+		// Whether the text has wildcards that are interpreted.
+		wild     bool
+		// `:(glob)`: `*` stops at `/`, `**` crosses folders.
+		glob     bool
+		icase    bool
+		exclude  bool
+		// Attribute requirements of `:(attr:...)`: name and wanted state
+		// ("set", "unset", "unspecified" or a value).
+		attrs    (string, string)[] = []
+		// Bytes before the first wildcard: what a folder must start with.
+		literalLen int
+	}
+
+	// Pathspec selects paths as `git log -- <paths>` and `git add <paths>`
+	// read them: a path matches itself and everything below it; `*`, `?` and
+	// `[...]` are wildcards that also match `/` (unless `:(glob)`); magic in
+	// `:(...)` or the short forms `:!` / `:^` (exclude) and `:/` (top).
+	type Pathspec {
+		items PathspecItem[] = []
+
+		def new() {}
+
+		// Whether nothing is selected by item, which selects everything.
+		def isEmpty() bool {
+			return items.filter(i => !i.exclude).len() == 0
+		}
+
+		// Whether the path (a file, relative to the top) is selected.
+		def matches(path string, attrs ?def (string, string) string = none) bool {
+			let included = false
+			let anyInclude = false
+			for let it in items {
+				continue when it.exclude
+				anyInclude = true
+				if itemMatches(it, path, attrs) {
+					included = true
+					break
+				}
+			}
+			included = true unless anyInclude
+			return false unless included
+			for let it in items {
+				return false when it.exclude && itemMatches(it, path, attrs)
+			}
+			return true
+		}
+
+		// Whether something below the folder may be selected, so that a
+		// tree walk must go into it.
+		def mayMatchDir(dir string) bool {
+			let anyInclude = false
+			for let it in items {
+				continue when it.exclude
+				anyInclude = true
+				return true when dirMayMatch(it, dir)
+			}
+			return !anyInclude
+		}
+	}
+
+	// A pathspec from the strings as given on a command line, relative to
+	// the top of the tree. Fails on unknown magic.
+	def newPathspec(specs string[], prefix string = "") !Pathspec {
+		let ps = new Pathspec()
+		for let raw in specs {
+			ps.items.push(try parsePathspecItem(raw, prefix))
+		}
+		return ps
+	}
+
+	internal def parsePathspecItem(raw string, prefix string) !PathspecItem {
+		let text = raw
+		let glob = false
+		let literal = false
+		let icase = false
+		let exclude = false
+		let top = false
+		let attrs (string, string)[] = []
+		if text.startsWith(":(") {
+			let close = text.indexOf(")")
+			fail "git: unterminated pathspec magic in '{raw}'" when close < 0
+			for let word in text.slice(2, close).split(",") {
+				let w = word.trim()
+				switch w {
+					case "glob":
+						glob = true
+					case "literal":
+						literal = true
+					case "icase":
+						icase = true
+					case "exclude":
+						exclude = true
+					case "top":
+						top = true
+					case "":
+					default:
+						if w.startsWith("attr:") {
+							for let a in w.slice(5).split(" ").filter(x => x != "") {
+								attrs.push(parseAttrRequirement(a))
+							}
+						} else if w.startsWith("prefix:") {
+							// Magic git passes to submodules: the prefix length.
+						} else {
+							fail "git: unknown pathspec magic '{w}' in '{raw}'"
+						}
+				}
+			}
+			text = text.slice(close + 1)
+		} else if text.startsWith(":") && text.len() > 1 {
+			// Short magic: `:!x`, `:^x`, `:/x`, ending at an optional second `:`.
+			let i = 1
+			let b = text.bytes()
+			for i < b.len() {
+				let c = b[i]
+				if c == 0x21 || c == 0x5E {
+					exclude = true
+				} else if c == 0x2F {
+					top = true
+				} else {
+					break
+				}
+				i++
+			}
+			i++ when i < b.len() && b[i] == 0x3A
+			text = text.slice(i)
+		}
+		fail "git: :(glob) and :(literal) cannot be combined in '{raw}'" when glob && literal
+		if !top && prefix != "" {
+			text = prefix + text
+		}
+		text = normalizePathspecText(text)
+		let wild = !literal && hasWildcard(text)
+		let literalLen = wild ?? (firstWildcard(text), text.bytes().len())
+		return PathspecItem{text: text, wild: wild, glob: glob, icase: icase, exclude: exclude, attrs: attrs, literalLen: literalLen}
+	}
+
+	// `name`, `-name`, `!name` or `name=value` as an attribute requirement.
+	internal def parseAttrRequirement(a string) (string, string) {
+		return (a.slice(1), "unset") when a.startsWith("-")
+		return (a.slice(1), "unspecified") when a.startsWith("!")
+		let eq = a.indexOf("=")
+		return eq < 0 ?? ((a, "set"), (a.slice(0, eq), a.slice(eq + 1)))
+	}
+
+	// Drops `./`, a trailing `/` and doubled slashes; `.` alone is the top.
+	internal def normalizePathspecText(text string) string {
+		let parts string[] = []
+		for let p in text.split("/") {
+			continue when p == "" || p == "."
+			if p == ".." && parts.len() > 0 {
+				parts.pop()
+				continue
+			}
+			parts.push(p)
+		}
+		return parts.join("/")
+	}
+
+	internal def hasWildcard(text string) bool {
+		return firstWildcard(text) < text.bytes().len()
+	}
+
+	internal def firstWildcard(text string) int {
+		let b = text.bytes()
+		for let i = 0; i < b.len(); i++ {
+			return i when b[i] == 0x2A || b[i] == 0x3F || b[i] == 0x5B || b[i] == 0x5C
+		}
+		return b.len()
+	}
+
+	internal def itemMatches(it PathspecItem, path string, attrs ?def (string, string) string) bool {
+		if it.attrs.len() > 0 {
+			return false when attrs is none
+			for let a in it.attrs {
+				let (name, want) = a
+				return false unless attrs(path, name) == want
+			}
+		}
+		return true when it.text == ""
+		let p = it.icase ?? (path.lower(), path)
+		let t = it.icase ?? (it.text.lower(), it.text)
+		if !it.wild {
+			return p == t || p.startsWith(t + "/")
+		}
+		// A wildcard pattern matches the path, or a folder above it (so
+		// `dir*` selects what is in `dirA/`).
+		return true when wildmatch(t, p, it.glob, false)
+		let b = p.bytes()
+		for let i = 0; i < b.len(); i++ {
+			if b[i] == 0x2F && wildmatch(t, string(b[0:i]), it.glob, false) {
+				return true
+			}
+		}
+		return false
+	}
+
+	internal def dirMayMatch(it PathspecItem, dir string) bool {
+		return true when it.text == ""
+		let d = it.icase ?? (dir.lower(), dir)
+		let t = it.icase ?? (it.text.lower(), it.text)
+		if !it.wild {
+			return t == d || t.startsWith(d + "/") || d.startsWith(t + "/")
+		}
+		// Up to the first wildcard the folder and the pattern must agree.
+		let lit = string(t.bytes()[0:it.literalLen])
+		let dd = d + "/"
+		return lit.startsWith(dd) || dd.startsWith(lit)
+	}
+
+	// Whether the tree holds anything the pathspec selects.
+	internal def treeHasPaths(repo Repository, tree ObjectId, spec Pathspec) !bool {
+		return try treeSelects(repo, tree, spec, "")
+	}
+
+	internal def treeSelects(repo Repository, tree ObjectId, spec Pathspec, prefix string) !bool {
+		let t = try repo.tree(tree)
+		for let e in t.entries {
+			let path = prefix + e.name
+			if isTree(e.mode) {
+				if spec.mayMatchDir(path) && (try treeSelects(repo, e.id, spec, path + "/")) {
+					return true
+				}
+				continue
+			}
+			return true when spec.matches(path)
+		}
+		return false
+	}
+
+	// Whether a path the pathspec selects differs between the parent's tree
+	// and the commit's. A Bloom filter in the commit-graph answers "no
+	// change" without reading trees when it can.
+	internal def pathsDiffer(repo Repository, parent WalkNode, n WalkNode, spec Pathspec) !bool {
+		let g = commitGraphOf(repo)
+		let gc = n.graph
+		if !(g is none) && !(gc is none) && n.parents.len() > 0 && n.parents[0].equals(parent.id) {
+			let literal = spec.items.filter(i => !i.exclude && !i.wild && !i.icase && i.text != "" && i.attrs.len() == 0)
+			if literal.len() == spec.items.len() && literal.len() > 0 {
+				let any = false
+				for let it in literal {
+					any = true when graphMayChange(g, gc, it.text)
+				}
+				return false unless any
+			}
+		}
+		return try treesDiffer(repo, parent.tree, n.tree, spec, "")
+	}
+
+	// Whether two trees differ in a path the pathspec selects.
+	internal def treesDiffer(repo Repository, a ObjectId, b ObjectId, spec Pathspec, prefix string) !bool {
+		return false when a.equals(b)
+		let ta = try repo.tree(a)
+		let tb = try repo.tree(b)
+		let i = 0
+		let j = 0
+		let ea = ta.entries
+		let eb = tb.entries
+		for i < ea.len() || j < eb.len() {
+			let c = 0
+			if i >= ea.len() {
+				c = 1
+			} else if j >= eb.len() {
+				c = -1
+			} else {
+				c = compareTreeNames(ea[i].name, isTree(ea[i].mode), eb[j].name, isTree(eb[j].mode))
+				// A file replaced by a folder of the same name sorts apart:
+				// compare by name alone so the two meet.
+				if c != 0 && ea[i].name == eb[j].name {
+					c = 0
+				}
+			}
+			if c < 0 {
+				if try entrySelected(repo, ea[i], spec, prefix) {
+					return true
+				}
+				i++
+				continue
+			}
+			if c > 0 {
+				if try entrySelected(repo, eb[j], spec, prefix) {
+					return true
+				}
+				j++
+				continue
+			}
+			let x = ea[i]
+			let y = eb[j]
+			i++
+			j++
+			continue when x.id.equals(y.id) && x.mode == y.mode
+			let path = prefix + x.name
+			if isTree(x.mode) && isTree(y.mode) {
+				if spec.mayMatchDir(path) && (try treesDiffer(repo, x.id, y.id, spec, path + "/")) {
+					return true
+				}
+				continue
+			}
+			if isTree(x.mode) != isTree(y.mode) {
+				let side = isTree(x.mode) ?? (x, y)
+				return true when spec.matches(path)
+				return true when spec.mayMatchDir(path) && (try treeSelects(repo, side.id, spec, path + "/"))
+				continue
+			}
+			return true when spec.matches(path)
+		}
+		return false
+	}
+
+	// Whether an entry present on one side only is selected (a file) or
+	// holds something selected (a folder).
+	internal def entrySelected(repo Repository, e TreeEntry, spec Pathspec, prefix string) !bool {
+		let path = prefix + e.name
+		if isTree(e.mode) {
+			return false unless spec.mayMatchDir(path)
+			return try treeSelects(repo, e.id, spec, path + "/")
+		}
+		return spec.matches(path)
+	}
+}

@@ -1,0 +1,710 @@
+partial module adm.dev.git {
+	use std.os
+
+	// ---- directory renames --------------------------------------------------------
+
+	// The folder renames each side made: for each removed folder with
+	// counts, the destination with a strict majority; a tie is a conflict.
+	internal def provisionalDirRenames(m TreeMerge, side int) {
+		for let (source, counts) in m.renameCount[side] {
+			let max = 0
+			let badMax = 0
+			let best = ""
+			// git's iteration order is a hash order; the outcome does not
+			// depend on it except for which of tied destinations is named.
+			let keys = counts.keys()
+			keys.sort((a, b) => compareBytes(a, b))
+			for let target in keys {
+				let n = counts[target]
+				if n == max {
+					badMax = max
+				} else if n > max {
+					max = n
+					best = target
+				}
+			}
+			continue when max == 0
+			if badMax == max {
+				m.message([source], true, "CONFLICT (directory rename split): Unclear where to rename {source} to; it was renamed to multiple other directories, with no destination getting a majority of the files.")
+				m.cleanFlag = false
+			} else {
+				m.dirRenames[side][source] = best
+			}
+		}
+	}
+
+	// A folder renamed on both sides is left alone on both.
+	internal def directoryLevelConflicts(m TreeMerge) {
+		let both string[] = []
+		for let (dir, _) in m.dirRenames[1] {
+			both.push(dir) when m.dirRenames[2].hasKey(dir)
+		}
+		for let dir in both {
+			m.dirRenames[1].delete(dir)
+			m.dirRenames[2].delete(dir)
+		}
+	}
+
+	// The renamed folder a path is in (the deepest), none when none.
+	internal def dirRenamedFor(path string, renames map<string, string>) ?(string, string) {
+		let dir = dirOf(path)
+		for {
+			let to = renames.get(dir)
+			return (dir, to) unless to is none
+			break when dir == ""
+			dir = dirOf(dir)
+		}
+		return none
+	}
+
+	// The path in the renamed folder.
+	internal def applyDirRename(oldDir string, newDir string, path string) string {
+		let rest = oldDir == "" ?? (path, path.slice(oldDir.len() + 1))
+		return newDir == "" ?? (rest, newDir + "/" + rest)
+	}
+
+	// For each path an implicit folder rename would create: the paths that
+	// would go there.
+	internal def computeCollisions(pairs SidePair[], renames map<string, string>) map<string, string[]> {
+		let out map<string, string[]> = {}
+		return out when renames.len() == 0
+		for let p in pairs {
+			continue unless p.status == 0x41 || p.status == 0x52
+			let r = dirRenamedFor(p.twoPath, renames)
+			continue when r is none
+			let (from, to) = r
+			let target = applyDirRename(from, to, p.twoPath)
+			let known = out.get(target)
+			if known is none {
+				out[target] = [p.twoPath]
+				continue
+			}
+			known.push(p.twoPath) unless known.includes(p.twoPath)
+			known.sort((a, b) => compareBytes(a, b))
+		}
+		return out
+	}
+
+	// Whether something already at `path` blocks a folder rename putting a
+	// file there.
+	internal def pathInWay(m TreeMerge, path string, sideMask int, p SidePair) bool {
+		let e = m.paths.get(path)
+		return false when e is none
+		return e.clean || (sideMask & (e.filemask | e.dirmask)) != 0 || ((e.filemask & 1) != 0 && p.onePath != path)
+	}
+
+	// The new path for a pair added or renamed into a folder the other side
+	// renamed, none when there is none or it cannot go there (a conflict
+	// says why).
+	internal def checkDirRename(m TreeMerge, path string, side int, p SidePair, renames map<string, string>, exclusions map<string, string>, collisions map<string, string[]>[], reported map<string, bool>) ?string {
+		return none when renames.len() == 0
+		let other = 3 - side
+		return none when collisions[other].hasKey(path)
+		let r = dirRenamedFor(path, renames)
+		return none when r is none
+		let (from, to) = r
+		if exclusions.hasKey(to) {
+			m.message([from, path, to], false, "WARNING: Avoiding applying {from} -> {to} rename to {path}, because {to} itself was renamed.")
+			return none
+		}
+		let target = applyDirRename(from, to, path)
+		let sources = collisions[side].get(target)
+		let list string[] = sources is none ?? ([], sources)
+		if reported.hasKey(target) {
+			m.cleanFlag = false
+			return none
+		}
+		if pathInWay(m, target, 1 << side, p) {
+			reported[target] = true
+			m.message([target] + list, true, "CONFLICT (implicit dir rename): Existing file/dir at {target} in the way of implicit directory rename(s) putting the following path(s) there: {list.join(", ")}.")
+			m.cleanFlag = false
+			return none
+		}
+		if list.len() > 1 {
+			reported[target] = true
+			m.message([target] + list, true, "CONFLICT (implicit dir rename): Cannot map more than one path to {target}; implicit directory renames tried to put these paths there: {list.join(", ")}")
+			m.cleanFlag = false
+			return none
+		}
+		return target
+	}
+
+	// Moves a pair's added or renamed path to its place in the renamed
+	// folder, and reports it.
+	internal def moveByDirRename(m TreeMerge, p SidePair, newPath string) {
+		let oldPath = p.twoPath
+		let e = m.paths[oldPath]
+		// Parent folders of the new path exist as folder entries.
+		let dir = dirOf(newPath)
+		let missing string[] = []
+		for dir != "" && !m.paths.hasKey(dir) {
+			missing.push(dir)
+			dir = dirOf(dir)
+		}
+		for let i = missing.len() - 1; i >= 0; i-- {
+			let d = m.entry(missing[i])
+			d.dirmask = e.filemask
+		}
+		let moving MergePath = e
+		if e.dirmask == 0 {
+			m.paths.delete(oldPath)
+		} else {
+			// A folder stays at the old path; the file moves.
+			let copy = new MergePath(newPath, m.zero)
+			copy.stages = e.stages.clone()
+			copy.pathnames = e.pathnames.clone()
+			copy.filemask = e.filemask
+			copy.stages[1] = Version{mode: 0, id: m.zero}
+			e.filemask = 0
+			e.clean = true
+			for let k = 0; k < 3; k++ {
+				e.stages[k] = Version{mode: 0, id: m.zero} when (e.dirmask & (1 << k)) == 0
+			}
+			moving = copy
+		}
+		let withNew = moving.filemask == 2 ?? (m.branch1, m.branch2)
+		let withRename = moving.filemask == 2 ?? (m.branch2, m.branch1)
+		let existing = m.paths.get(newPath)
+		if existing is none {
+			moving.path = newPath
+			m.paths[newPath] = moving
+			m.order.push(newPath)
+		} else {
+			existing.filemask = existing.filemask | moving.filemask
+			existing.dfConflict = true when existing.dirmask != 0
+			let index = moving.filemask >> 1
+			existing.pathnames[index] = moving.pathnames[index]
+			existing.stages[index] = moving.stages[index]
+			moving = existing
+		}
+		if m.options.directoryRenames == DirectoryRenames.On {
+			if p.status == 0x41 {
+				m.message([newPath, oldPath], false, "Path updated: {oldPath} added in {withNew} inside a directory that was renamed in {withRename}; moving it to {newPath}.")
+			} else {
+				m.message([newPath, oldPath], false, "Path updated: {p.onePath} renamed to {oldPath} in {withNew}, inside a directory that was renamed in {withRename}; moving it to {newPath}.")
+			}
+		} else {
+			moving.pathConflict = true
+			if p.status == 0x41 {
+				m.message([newPath, oldPath], true, "CONFLICT (file location): {oldPath} added in {withNew} inside a directory that was renamed in {withRename}, suggesting it should perhaps be moved to {newPath}.")
+			} else {
+				m.message([newPath, oldPath], true, "CONFLICT (file location): {p.onePath} renamed to {oldPath} in {withNew}, inside a directory that was renamed in {withRename}, suggesting it should perhaps be moved to {newPath}.")
+			}
+		}
+		p.twoPath = newPath
+	}
+
+	// ---- renames ---------------------------------------------------------------
+
+	internal def detectAndProcessRenames(m TreeMerge) !none {
+		return none unless m.options.renames
+		// No deletion on either side matters: nothing to do with renames.
+		let possible1 = m.pairs[1].len() > 0 && m.relevant[1].len() > 0
+		let possible2 = m.pairs[2].len() > 0 && m.relevant[2].len() > 0
+		return none unless possible1 || possible2
+		try detectSideRenames(m, 1)
+		try detectSideRenames(m, 2)
+		let dirRenames = m.callDepth == 0 && m.options.directoryRenames != DirectoryRenames.Off
+		if dirRenames {
+			provisionalDirRenames(m, 1)
+			provisionalDirRenames(m, 2)
+			directoryLevelConflicts(m)
+		}
+		let none0 map<string, string[]> = {}
+		let collisions map<string, string[]>[] = [none0, computeCollisions(m.pairs[1], m.dirRenames[2]), computeCollisions(m.pairs[2], m.dirRenames[1])]
+		let combined SidePair[] = []
+		for let side = 1; side <= 2; side++ {
+			let other = 3 - side
+			let reported map<string, bool> = {}
+			for let p in m.pairs[side] {
+				continue unless p.status == 0x41 || p.status == 0x52
+				let newPath ?string = none
+				if dirRenames {
+					newPath = checkDirRename(m, p.twoPath, side, p, m.dirRenames[other], m.dirRenames[side], collisions, reported)
+				}
+				continue when p.status != 0x52 && newPath is none
+				if !(newPath is none) {
+					moveByDirRename(m, p, newPath)
+				}
+				p.side = side
+				combined.push(p)
+			}
+		}
+		// Stable by source path.
+		combined = stableSortPairs(combined)
+		try processRenames(m, combined)
+		return none
+	}
+
+	internal def stableSortPairs(items SidePair[]) SidePair[] {
+		return items when items.len() < 2
+		let mid = items.len() / 2
+		let left = stableSortPairs(items.slice(0, mid).clone())
+		let right = stableSortPairs(items.slice(mid, items.len() - mid).clone())
+		let out SidePair[] = []
+		let i = 0
+		let j = 0
+		for i < left.len() || j < right.len() {
+			if j >= right.len() || (i < left.len() && compareBytes(left[i].onePath, right[j].onePath) <= 0) {
+				out.push(left[i])
+				i++
+			} else {
+				out.push(right[j])
+				j++
+			}
+		}
+		return out
+	}
+
+	// The labels of a content merge: the branch names, with the paths when
+	// they are not all the same.
+	internal def mergeLabels(m TreeMerge, pathnames string[]) (string, string, string) {
+		if pathnames[0] == pathnames[1] && pathnames[1] == pathnames[2] {
+			return (m.ancestor, m.branch1, m.branch2)
+		}
+		return ("{m.ancestor}:{pathnames[0]}", "{m.branch1}:{pathnames[1]}", "{m.branch2}:{pathnames[2]}")
+	}
+
+	internal def processRenames(m TreeMerge, renames SidePair[]) !none {
+		let i = 0
+		for i < renames.len() {
+			let pair = renames[i]
+			let oldPath = pair.onePath
+			let newPath = pair.twoPath
+			let oldInfo = m.paths.get(oldPath)
+			let newInfo = m.paths.get(newPath)
+			if oldPath == newPath || oldInfo is none || oldInfo.clean {
+				i++
+				continue
+			}
+			if i + 1 < renames.len() && renames[i + 1].onePath == oldPath {
+				// Renamed on both sides.
+				let names = [oldPath, newPath, renames[i + 1].twoPath]
+				let base = m.paths[names[0]]
+				let side1 = m.paths[names[1]]
+				let side2 = m.paths[names[2]]
+				if names[1] == names[2] {
+					side1.stages[0] = base.stages[0]
+					side1.filemask = side1.filemask | 1
+					base.isNull = true
+					base.clean = true
+					i += 2
+					continue
+				}
+				let (clean, merged) = try contentMerge(m, oldPath, base.stages[0], side1.stages[1], side2.stages[2], names, 1 + 2 * m.callDepth)
+				let wasBinary = !clean && merged.mode == side1.stages[1].mode && merged.id.equals(side1.stages[1].id)
+				side1.stages[1] = merged
+				side2.stages[2] = wasBinary ?? (side2.stages[2], merged)
+				side1.pathConflict = true
+				side2.pathConflict = true
+				base.pathConflict = true
+				m.message(names, true, "CONFLICT (rename/rename): {names[0]} renamed to {names[1]} in {m.branch1} and to {names[2]} in {m.branch2}.")
+				i += 2
+				continue
+			}
+			fail "git: merge lost track of {newPath}" when newInfo is none
+			let target = pair.side
+			let otherSource = 3 - target
+			let oldSideMask = 1 << otherSource
+			let sourceDeleted = oldInfo.filemask == 1
+			let collision = (newInfo.filemask & oldSideMask) != 0
+			let typeChanged = !sourceDeleted && (modeType(oldInfo.stages[otherSource].mode) == 0o100000) != (modeType(newInfo.stages[target].mode) == 0o100000)
+			collision = false when typeChanged && collision
+			let renameBranch = target == 1 ?? (m.branch1, m.branch2)
+			let deleteBranch = target == 1 ?? (m.branch2, m.branch1)
+			if collision && !sourceDeleted {
+				let names = [oldPath, oldPath, oldPath]
+				names[target] = newPath
+				let base = m.paths[names[0]]
+				let side1 = m.paths[names[1]]
+				let side2 = m.paths[names[2]]
+				let (clean, merged) = try contentMerge(m, oldPath, base.stages[0], side1.stages[1], side2.stages[2], names, 1 + 2 * m.callDepth)
+				newInfo.stages[target] = merged
+				if !clean {
+					m.message([newPath, oldPath], true, "CONFLICT (rename involved in collision): rename of {oldPath} -> {newPath} has content conflicts AND collides with another path; this may result in nested conflict markers.")
+				}
+			} else if collision && sourceDeleted {
+				newInfo.pathConflict = true
+				m.message([newPath, oldPath], true, "CONFLICT (rename/delete): {oldPath} renamed to {newPath} in {renameBranch}, but deleted in {deleteBranch}.")
+			} else {
+				newInfo.stages[0] = oldInfo.stages[0]
+				newInfo.filemask = newInfo.filemask | 1
+				newInfo.pathnames[0] = oldPath
+				if typeChanged {
+					oldInfo.stages[0] = Version{mode: 0, id: m.zero}
+					oldInfo.filemask = oldInfo.filemask & 6
+				} else if sourceDeleted {
+					newInfo.pathConflict = true
+					m.message([newPath, oldPath], true, "CONFLICT (rename/delete): {oldPath} renamed to {newPath} in {renameBranch}, but deleted in {deleteBranch}.")
+				} else {
+					newInfo.stages[otherSource] = oldInfo.stages[otherSource]
+					newInfo.filemask = newInfo.filemask | (1 << otherSource)
+					newInfo.pathnames[otherSource] = oldPath
+				}
+			}
+			if !typeChanged {
+				oldInfo.isNull = true
+				oldInfo.clean = true
+			}
+			i++
+		}
+		return none
+	}
+
+	// ---- content merges ---------------------------------------------------------
+
+	// Merges three versions of one path as merge-ort's handle_content_merge:
+	// modes (a 644/755 change on one side wins), trivial cases, text
+	// through the file merge (a binary file keeps ours and conflicts),
+	// submodules and links (a conflict keeping ours). Returns whether it
+	// is clean and the result, written.
+	internal def contentMerge(m TreeMerge, path string, o Version, a Version, b Version, pathnames string[], extraMarker int) !(bool, Version) {
+		let clean = true
+		let mode = 0
+		if a.mode == b.mode || a.mode == o.mode {
+			mode = b.mode
+		} else {
+			mode = a.mode
+			clean = b.mode == o.mode
+		}
+		if a.id.equals(b.id) || a.id.equals(o.id) {
+			return (clean, Version{mode: mode, id: b.id})
+		}
+		if b.id.equals(o.id) {
+			return (clean, Version{mode: mode, id: a.id})
+		}
+		if modeType(a.mode) == 0o100000 {
+			let twoWay = modeType(o.mode) != modeType(a.mode)
+			let base = twoWay ?? (byte[], try blobBytes(m.repo, o.id))
+			let ours = try blobBytes(m.repo, a.id)
+			let theirs = try blobBytes(m.repo, b.id)
+			let (baseLabel, oursLabel, theirsLabel) = mergeLabels(m, pathnames)
+			let binary = isBinaryContent(base) || isBinaryContent(ours) || isBinaryContent(theirs)
+			let result byte[] = []
+			let conflicts = 0
+			if binary {
+				if m.callDepth > 0 {
+					result = base
+				} else {
+					switch m.options.text.favor {
+						case MergeFavor.Ours:
+							result = ours
+						case MergeFavor.Theirs:
+							result = theirs
+						default:
+							result = ours
+							conflicts = 1
+							m.message([path], true, "warning: Cannot merge binary files: {path} ({oursLabel} vs. {theirsLabel})")
+					}
+				}
+			} else {
+				let text = m.options.text
+				let opts = TextMergeOptions{...text, ours: oursLabel, theirs: theirsLabel, base: baseLabel, markerSize: text.markerSize + extraMarker}
+				if m.callDepth > 0 {
+					opts.favor = MergeFavor.None
+				}
+				let merged = mergeText(base, ours, theirs, opts)
+				result = merged.data
+				conflicts = merged.conflicts
+			}
+			let id = try m.repo.write(ObjectKind.Blob, result)
+			clean = false when conflicts > 0
+			m.message([path], false, "Auto-merging {path}")
+			return (clean, Version{mode: mode, id: id})
+		}
+		if modeType(a.mode) == 0o160000 {
+			// Submodules: a fast-forward of one side over the other merges
+			// cleanly; anything else is a conflict keeping ours.
+			let twoWay = modeType(o.mode) != modeType(a.mode)
+			let resolved = try mergeSubmodule(m, path, twoWay ?? (m.zero, o.id), a.id, b.id)
+			if resolved is none {
+				if m.callDepth > 0 && twoWay {
+					return (false, o)
+				}
+				return (false, Version{mode: mode, id: a.id})
+			}
+			return (true, Version{mode: mode, id: resolved})
+		}
+		// Symbolic links.
+		if m.callDepth > 0 {
+			return (false, o)
+		}
+		switch m.options.text.favor {
+			case MergeFavor.Ours:
+				return (clean, Version{mode: mode, id: a.id})
+			case MergeFavor.Theirs:
+				return (clean, Version{mode: mode, id: b.id})
+		}
+		return (false, Version{mode: mode, id: a.id})
+	}
+
+	internal def blobBytes(repo Repository, id ObjectId) !byte[] {
+		return byte[] when id.isZero()
+		let (_, data) = try repo.raw(id)
+		return data
+	}
+
+	// A submodule merge, as merge-ort decides it: both sides must descend
+	// from the base, and one must contain the other, which is the result
+	// (a fast-forward, noted); none, with the reason, when it cannot be
+	// decided.
+	internal def mergeSubmodule(m TreeMerge, path string, o ObjectId, a ObjectId, b ObjectId) !?ObjectId {
+		if o.isZero() {
+			m.message([path], true, "Failed to merge submodule {path} (no merge base)")
+			return none
+		}
+		let sub = openOrNone(os.join(m.repo.workDir, path))
+		if sub is none {
+			m.message([path], true, "Failed to merge submodule {path} (not checked out)")
+			return none
+		}
+		let result ?ObjectId = none
+		let why = ""
+		if !sub.has(o) || !sub.has(a) || !sub.has(b) {
+			why = " (commits not present)"
+		} else if !(isAncestor(sub, o, a) onerror recover false) || !(isAncestor(sub, o, b) onerror recover false) {
+			why = " (commits don't follow merge-base)"
+		} else if isAncestor(sub, a, b) onerror recover false {
+			result = b
+		} else if isAncestor(sub, b, a) onerror recover false {
+			result = a
+		}
+		sub.close()
+		if result is none {
+			m.message([path], true, "Failed to merge submodule {path}{why}")
+		} else {
+			m.message([path], false, "Note: Fast-forwarding submodule {path} to {result.str()}")
+		}
+		return result
+	}
+
+	// ---- per path ----------------------------------------------------------------------
+
+	// A path the merge can put a file at that nothing uses: `path~branch`,
+	// then with `_0`, `_1`, ... after it.
+	internal def uniquePath(m TreeMerge, path string, branch string) string {
+		let base = "{path}~{branch.replace("/", "_")}"
+		let candidate = base
+		let n = 0
+		for m.paths.hasKey(candidate) {
+			candidate = "{base}_{n}"
+			n++
+		}
+		return candidate
+	}
+
+	// The order git processes paths in: sorted with `/` before any other
+	// byte, so a folder's contents sit right after it; processed from the
+	// end, every folder after its contents.
+	internal def compareDirsFirst(a string, b string) int {
+		let x = a.bytes()
+		let y = b.bytes()
+		let n = x.len() < y.len() ?? (x.len(), y.len())
+		for let i = 0; i < n; i++ {
+			if x[i] != y[i] {
+				let cx = x[i] == 0x2F ?? (0, int(x[i]) + 1)
+				let cy = y[i] == 0x2F ?? (0, int(y[i]) + 1)
+				return cx < cy ?? (-1, 1)
+			}
+		}
+		return x.len() < y.len() ?? (-1, x.len() > y.len() ?? (1, 0))
+	}
+
+	// Resolves every path, deepest first, and returns the merged tree: a
+	// folder is the tree of its resolved contents (none when empty).
+	internal def processEntries(m TreeMerge) !ObjectId {
+		let list string[] = m.paths.keys()
+		list.sort((a, b) => compareDirsFirst(a, b))
+		// The resolved files and folders, by path.
+		let results map<string, Version> = {}
+		for let i = list.len() - 1; i >= 0; i-- {
+			let path = list[i]
+			let e = m.paths.get(path)
+			continue when e is none
+			if e.dirmask != 0 && !e.resolved {
+				// A folder: its contents are done.
+				let tree = try folderTree(m, path, results)
+				e.result = tree
+				e.isNull = tree.mode == 0
+				results[path] = tree unless tree.mode == 0
+				continue when e.filemask == 0
+			}
+			if e.resolved || e.clean {
+				// Settled while collecting, or by a rename.
+				results[path] = e.result unless e.isNull || e.result.mode == 0
+				continue
+			}
+			try processEntry(m, path, e, results)
+		}
+		let root = try folderTree(m, "", results)
+		return root.mode == 0 ?? (try m.repo.writeTree([]), root.id)
+	}
+
+	// The tree of a folder from the results of the paths directly in it.
+	internal def folderTree(m TreeMerge, path string, results map<string, Version>) !Version {
+		let prefix = path == "" ?? ("", path + "/")
+		let items TreeEntry[] = []
+		for let (p, v) in results {
+			continue unless p.startsWith(prefix) && p.len() > prefix.len()
+			let rest = p.slice(prefix.len())
+			continue when rest.contains("/")
+			items.push(TreeEntry{name: rest, mode: canonicalMode(v.mode), id: v.id})
+		}
+		return Version{mode: 0, id: m.zero} when items.len() == 0
+		let id = try m.repo.writeTree(items)
+		return Version{mode: 0o40000, id: id}
+	}
+
+	// Resolves one path with a file part (merge-ort's process_entry),
+	// recording it as conflicted when it is.
+	internal def processEntry(m TreeMerge, path0 string, ci MergePath, results map<string, Version>) !none {
+		let path = path0
+		let e = ci
+		let dfIndex = 0
+		if e.dfConflict && (e.result.mode == 0 || e.dirmask == 0) {
+			// The folder came to nothing: the file can have the path.
+			e.dfConflict = false
+			e.clean = false
+			e.isNull = false
+			e.matchMask = e.matchMask & ~e.dirmask
+			for let k = 0; k < 3; k++ {
+				e.stages[k] = Version{mode: 0, id: m.zero} when (e.filemask & (1 << k)) == 0
+			}
+			e.dirmask = 0
+		} else if e.dfConflict {
+			// The folder stays; the file moves to a path of its own.
+			if e.filemask == 1 {
+				e.filemask = 0
+				return none
+			}
+			let moved = new MergePath(path, m.zero)
+			moved.stages = e.stages.clone()
+			moved.pathnames = e.pathnames.clone()
+			moved.filemask = e.filemask
+			moved.matchMask = e.matchMask & ~e.dirmask
+			moved.dfConflict = true
+			moved.pathConflict = e.pathConflict
+			for let k = 0; k < 3; k++ {
+				moved.stages[k] = Version{mode: 0, id: m.zero} when (moved.filemask & (1 << k)) == 0
+			}
+			dfIndex = (e.dirmask & 2) != 0 ?? (2, 1)
+			let branch = dfIndex == 1 ?? (m.branch1, m.branch2)
+			let oldPath = path
+			path = uniquePath(m, path, branch)
+			moved.path = path
+			m.paths[path] = moved
+			m.message([path, oldPath], true, "CONFLICT (file/directory): directory in the way of {oldPath} from {branch}; moving it to {path} instead.")
+			e.filemask = 0
+			e = moved
+		}
+		if e.matchMask != 0 {
+			e.clean = !e.dfConflict && !e.pathConflict
+			if e.matchMask == 6 {
+				e.result = e.stages[1]
+			} else {
+				let other = 7 & ~e.matchMask
+				let side = other == 4 ?? (2, 1)
+				e.result = e.stages[side]
+				e.isNull = e.result.mode == 0
+				e.clean = true when e.isNull
+			}
+		} else if e.filemask >= 6 && modeType(e.stages[1].mode) != modeType(e.stages[2].mode) {
+			if m.callDepth > 0 {
+				e.clean = false
+				e.result = e.stages[0]
+				e.isNull = e.result.mode == 0
+			} else {
+				// Different types: each gets a path of its own.
+				let oMode = e.stages[0].mode
+				let aMode = e.stages[1].mode
+				let bMode = e.stages[2].mode
+				let renameA = modeType(aMode) == 0o100000
+				let renameB = !renameA && modeType(bMode) == 0o100000
+				if !renameA && !renameB {
+					renameA = true
+					renameB = true
+				}
+				let aPath = renameA ?? (uniquePath(m, path, m.branch1), "")
+				let bPath = renameB ?? (uniquePath(m, path, m.branch2), "")
+				if renameA && renameB {
+					m.message([path, aPath, bPath], true, "CONFLICT (distinct types): {path} had different types on each side; renamed both of them so each can be recorded somewhere.")
+				} else {
+					m.message([path, renameA ?? (aPath, bPath)], true, "CONFLICT (distinct types): {path} had different types on each side; renamed one of them so each can be recorded somewhere.")
+				}
+				e.clean = false
+				let other = new MergePath(path, m.zero)
+				other.stages = e.stages.clone()
+				other.pathnames = e.pathnames.clone()
+				other.result = e.stages[2]
+				other.stages[1] = Version{mode: 0, id: m.zero}
+				other.filemask = 5
+				if modeType(bMode) != modeType(oMode) {
+					other.stages[0] = Version{mode: 0, id: m.zero}
+					other.filemask = 4
+				}
+				e.result = e.stages[1]
+				e.stages[2] = Version{mode: 0, id: m.zero}
+				e.filemask = 3
+				if modeType(aMode) != modeType(oMode) {
+					e.stages[0] = Version{mode: 0, id: m.zero}
+					e.filemask = 2
+				}
+				if !renameB {
+					bPath = path
+				}
+				other.path = bPath
+				m.paths[bPath] = other
+				results[bPath] = other.result
+				if renameA {
+					e.path = aPath
+					m.paths[aPath] = e
+					if renameB {
+						m.paths.delete(path)
+					}
+					path = aPath
+				}
+				m.paths[bPath] = other
+				m.conflicted[bPath] = other
+			}
+		} else if e.filemask >= 6 {
+			let (clean, merged) = try contentMerge(m, path, e.stages[0], e.stages[1], e.stages[2], e.pathnames, m.callDepth * 2)
+			e.clean = clean && !e.dfConflict && !e.pathConflict
+			e.result = merged
+			e.isNull = merged.mode == 0
+			if clean && e.dfConflict {
+				e.filemask = 1 << dfIndex
+				e.stages[dfIndex] = merged
+			}
+			if !clean {
+				let reason = modeType(merged.mode) == 0o160000 ?? ("submodule", e.filemask == 6 ?? ("add/add", "content"))
+				m.message([path], true, "CONFLICT ({reason}): Merge conflict in {path}")
+			}
+		} else if e.filemask == 3 || e.filemask == 5 {
+			let side = e.filemask == 5 ?? (2, 1)
+			let index = m.callDepth > 0 ?? (0, side)
+			e.result = e.stages[index]
+			e.clean = false
+			let modifyBranch = side == 1 ?? (m.branch1, m.branch2)
+			let deleteBranch = side == 1 ?? (m.branch2, m.branch1)
+			let unchanged = e.pathConflict && e.stages[0].id.equals(e.stages[side].id)
+			if !unchanged {
+				m.message([path], true, "CONFLICT (modify/delete): {path} deleted in {deleteBranch} and modified in {modifyBranch}.  Version {modifyBranch} of {path} left in tree.")
+			}
+		} else if e.filemask == 2 || e.filemask == 4 {
+			let side = e.filemask == 4 ?? (2, 1)
+			e.result = e.stages[side]
+			e.clean = !e.dfConflict && !e.pathConflict
+		} else if e.filemask == 1 {
+			e.isNull = true
+			e.result = Version{mode: 0, id: m.zero}
+			e.clean = !e.pathConflict
+		}
+		if e.isNull || e.result.mode == 0 {
+			results.delete(path)
+		} else {
+			results[path] = e.result
+		}
+		m.conflicted[path] = e unless e.clean
+		return none
+	}
+}

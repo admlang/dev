@@ -1,0 +1,360 @@
+partial module adm.dev.git {
+	use (
+		std.bytes
+		std.data.compress.zlib
+	)
+
+	// Options for patches.
+	struct PatchOptions {
+		diff        DiffOptions   = DiffOptions{}
+		changes     ChangeOptions = ChangeOptions{}
+		// Write binary changes as `GIT binary patch` data that `apply` can
+		// use (`--binary`); else `Binary files ... differ`.
+		binary      bool          = false
+		// Full ids on `index` lines (`--full-index`).
+		fullIndex   bool          = false
+		// The prefixes of the old and new paths (`a/`, `b/`).
+		srcPrefix   string        = "a/"
+		dstPrefix   string        = "b/"
+		// Treat every file as text (`--text`).
+		text        bool          = false
+	}
+
+	// Diff is the changes between two snapshots (trees, the index, the
+	// working tree), with their patch and line counts on demand.
+	type Diff {
+		changes  FileChange[]
+		options  PatchOptions
+		internal repo Repository
+
+		def new(repo Repository, changes FileChange[], options PatchOptions) {
+			self.repo = repo
+			self.changes = changes
+			self.options = options
+		}
+
+		// The patch text, as `git diff` prints it. Fails when an object or
+		// file cannot be read.
+		def patch() !string {
+			return string(try formatPatch(repo, changes, options))
+		}
+
+		// Lines added and removed per change, in the order of `changes`
+		// (`git diff --numstat`); -1 for both on a binary file.
+		// Fails when an object or file of a change cannot be read.
+		def stats() !(int, int)[] {
+			let out (int, int)[] = []
+			let attrs = try repo.attributes()
+			for let c in changes {
+				let old = try sideContent(repo, c, false)
+				let new0 = try sideContent(repo, c, true)
+				if !options.text && (isBinaryFor(attrs, c.oldPath, old) || isBinaryFor(attrs, c.newPath, new0)) {
+					out.push((-1, -1))
+					continue
+				}
+				let added = 0
+				let removed = 0
+				for let e in diffLinesFor(old, new0, options.diff) {
+					added += e.newCount
+					removed += e.oldCount
+				}
+				out.push((added, removed))
+			}
+			return out
+		}
+	}
+
+	// The changes between two revisions' trees.
+	internal def diffRevisions(repo Repository, from string, to string, options PatchOptions) !Diff {
+		let a = try repo.peel(try repo.resolve(from), ObjectKind.Tree)
+		let b = try repo.peel(try repo.resolve(to), ObjectKind.Tree)
+		return new Diff(repo, try diffTrees(repo, a, b, options.changes), options)
+	}
+
+	// The staged changes: a revision's tree (HEAD) to the index.
+	internal def diffStaged(repo Repository, base string, options PatchOptions) !Diff {
+		let spec = try newPathspec(options.changes.paths)
+		let head = try repo.headId()
+		let tree ?ObjectId = none
+		if !(base == "HEAD" && head is none) {
+			tree = try repo.peel(try repo.resolve(base), ObjectKind.Tree)
+		}
+		let a SnapshotEntry[] = []
+		try treeFiles(repo, tree, spec, "", a)
+		let idx = try repo.index()
+		let b SnapshotEntry[] = []
+		for let e in idx.entries {
+			continue unless e.stage == 0 && spec.matches(e.path) && !e.intentToAdd
+			b.push(SnapshotEntry{path: e.path, mode: e.mode, id: e.id})
+		}
+		return new Diff(repo, try compareSnapshots(repo, a, b, options.changes, false), options)
+	}
+
+	// The unstaged changes: the index to the working tree (no renames, as
+	// git diff does there).
+	internal def diffUnstaged(repo Repository, options PatchOptions) !Diff {
+		let spec = try newPathspec(options.changes.paths)
+		let idx = try repo.index()
+		let changes = try worktreeChanges(repo, idx, spec)
+		return new Diff(repo, changes, options)
+	}
+
+	// The number of hex digits git abbreviates ids to by default: from
+	// core.abbrev, else grown with the number of packed objects (7 for a
+	// small repository).
+	internal def abbrevLength(repo Repository) int {
+		let setting = repo.config.get("core.abbrev", "auto").lower()
+		return idLength(repo.format) * 2 when setting == "no"
+		if setting != "auto" {
+			let n = parseConfigInt(setting) onerror recover 7
+			return n < 4 ?? (4, n)
+		}
+		let count = packedCount(repo.objects)
+		let bits = 0
+		let v = count
+		for v > 1 {
+			v >>= 1
+			bits++
+		}
+		let len = (bits + 1 + 1) / 2
+		return len < 7 ?? (7, len)
+	}
+
+	internal def packedCount(db ObjectDatabase) int {
+		let n = 0
+		for let p in db.packs {
+			n += p.count
+		}
+		for let a in db.alternates {
+			n += packedCount(a)
+		}
+		return n
+	}
+
+	// The shortest prefix of the id, from the default length up, that no
+	// other object of the repository shares.
+	internal def uniqueAbbrev(repo Repository, id ObjectId, minimum int) string {
+		let hex = id.str()
+		let len = minimum
+		for len < hex.len() {
+			let prefix = hex.slice(0, len)
+			let found = objectsWithPrefixOrNone(repo, prefix)
+			break when found <= 1
+			len++
+		}
+		return hex.slice(0, len)
+	}
+
+	internal def objectsWithPrefixOrNone(repo Repository, prefix string) int {
+		let found = objectsWithPrefix(repo, prefix, 2) onerror recover ObjectId[]
+		return found.len()
+	}
+
+	// The patch text of the changes, as `git diff` writes it: a `diff --git`
+	// header per file with mode, rename, copy and `index` lines, then the
+	// hunks (or a binary notice or binary patch). A type change is written
+	// as a deletion and an addition. Fails when an object is missing.
+	def formatPatch(repo Repository, changes FileChange[], options PatchOptions = PatchOptions{}) !byte[] {
+		let out byte[] = []
+		let abbrev = options.fullIndex ?? (idLength(repo.format) * 2, abbrevLength(repo))
+		let attrs = try repo.attributes()
+		for let c in changes {
+			if c.kind == ChangeKind.TypeChanged {
+				let zero = zeroId(repo.format)
+				try writeFilePatch(repo, out, FileChange{...c, kind: ChangeKind.Deleted, newMode: 0, newId: zero}, options, abbrev, attrs)
+				try writeFilePatch(repo, out, FileChange{...c, kind: ChangeKind.Added, oldMode: 0, oldId: zero}, options, abbrev, attrs)
+				continue
+			}
+			continue when c.kind == ChangeKind.Unmerged
+			try writeFilePatch(repo, out, c, options, abbrev, attrs)
+		}
+		return out
+	}
+
+	// The content of one side of a change: its blob, a working tree file, or
+	// nothing for a side that does not exist.
+	internal def sideContent(repo Repository, c FileChange, newSide bool) !byte[] {
+		let id = newSide ?? (c.newId, c.oldId)
+		let mode = newSide ?? (c.newMode, c.oldMode)
+		return byte[] when mode == 0
+		if (mode & 0o170000) == 0o160000 {
+			return "Subproject commit {id.str()}\n".bytes()
+		}
+		return try changeContent(repo, c, newSide)
+	}
+
+	internal def writeFilePatch(repo Repository, out byte[], c FileChange, options PatchOptions, abbrev int, attrs AttributeRules) !none {
+		let a = quotePath(options.srcPrefix + c.oldPath)
+		let b = quotePath(options.dstPrefix + c.newPath)
+		out.push(..."diff --git {a} {b}\n".bytes())
+		let modeChanged = c.oldMode != 0 && c.newMode != 0 && c.oldMode != c.newMode
+		switch c.kind {
+			case ChangeKind.Added:
+				out.push(..."new file mode {"%06o".format(c.newMode)}\n".bytes())
+			case ChangeKind.Deleted:
+				out.push(..."deleted file mode {"%06o".format(c.oldMode)}\n".bytes())
+			case ChangeKind.Renamed, ChangeKind.Copied:
+				if modeChanged {
+					out.push(..."old mode {"%06o".format(c.oldMode)}\nnew mode {"%06o".format(c.newMode)}\n".bytes())
+				}
+				let verb = c.kind == ChangeKind.Renamed ?? ("rename", "copy")
+				out.push(..."similarity index {c.similarity}%\n{verb} from {quotePath(c.oldPath)}\n{verb} to {quotePath(c.newPath)}\n".bytes())
+			default:
+				if modeChanged {
+					out.push(..."old mode {"%06o".format(c.oldMode)}\nnew mode {"%06o".format(c.newMode)}\n".bytes())
+				}
+		}
+		let sameContent = c.oldId.equals(c.newId) && !c.inWorktree && c.oldMode != 0 && c.newMode != 0
+		return none when sameContent
+		let old = try sideContent(repo, c, false)
+		let new0 = try sideContent(repo, c, true)
+		if c.inWorktree && c.oldMode != 0 && c.newMode != 0 && old.hex() == new0.hex() {
+			return none
+		}
+		let oldAbbrev = uniqueAbbrev(repo, c.oldId, abbrev)
+		let newAbbrev = c.inWorktree ?? (c.newId.str().slice(0, abbrev), uniqueAbbrev(repo, c.newId, abbrev))
+		let modeTail = c.oldMode == c.newMode ?? (" {"%06o".format(c.newMode)}", "")
+		out.push(..."index {oldAbbrev}..{newAbbrev}{modeTail}\n".bytes())
+		let oldName = c.oldMode == 0 ?? ("/dev/null", a)
+		let newName = c.newMode == 0 ?? ("/dev/null", b)
+		let binary = !options.text && (isBinaryFor(attrs, c.oldPath, old) || isBinaryFor(attrs, c.newPath, new0))
+		if binary {
+			if options.binary {
+				out.push(..."GIT binary patch\n".bytes())
+				out.push(...binaryPatchSection(old, new0))
+				out.push(...binaryPatchSection(new0, old))
+				return none
+			}
+			out.push(..."Binary files {oldName} and {newName} differ\n".bytes())
+			return none
+		}
+		let diffOptions = options.diff
+		let driver = attrs.get(c.newMode == 0 ?? (c.oldPath, c.newPath), "diff")
+		let (funcname, ignoreCase) = funcnameFor(repo, driver)
+		if funcname != "" {
+			diffOptions = DiffOptions{...diffOptions, funcname: funcname, funcnameIgnoreCase: ignoreCase}
+		}
+		let hunks = formatHunks(splitLines(old), splitLines(new0), diffLinesFor(old, new0, diffOptions), diffOptions)
+		return none when hunks.len() == 0 && c.oldMode != 0 && c.newMode != 0
+		out.push(..."--- {oldName}\n+++ {newName}\n".bytes())
+		out.push(...hunks)
+		return none
+	}
+
+	internal def diffLinesFor(old byte[], new0 byte[], options DiffOptions) Edit[] {
+		let d = prepareDiff(splitLines(old), splitLines(new0), options)
+		runDiff(d, options)
+		compact(d, true, options)
+		compact(d, false, options)
+		return buildEdits(d)
+	}
+
+	// Whether git shows a file as binary: the `diff` attribute unset (or
+	// `binary`), else a NUL in its first 8000 bytes; `diff` set forces text.
+	internal def isBinaryFor(attrs AttributeRules, path string, data byte[]) bool {
+		let d = attrs.get(path, "diff")
+		return true when isUnset(d)
+		return false when isSet(d)
+		return isBinaryContent(data)
+	}
+
+	// The funcname patterns of a diff driver: diff.<driver>.xfuncname (or
+	// the older .funcname) from the configuration, else the library's
+	// pattern for one of git's built-in driver names; "" for none.
+	internal def funcnameFor(repo Repository, driver AttrValue) (string, bool) {
+		let name = attrText(driver)
+		return ("", false) when name == ""
+		let x = repo.config.get("diff.{name}.xfuncname")
+		return (x, false) unless x is none
+		let f = repo.config.get("diff.{name}.funcname")
+		return (f, false) unless f is none
+		return builtinFuncname(name)
+	}
+
+	// ---- binary patches -----------------------------------------------------------
+
+	// git's base85 alphabet.
+	internal const base85Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`\{|\}~"
+
+	// One section of a binary patch rebuilding `to` from `from`: a delta
+	// when it is smaller, else the literal content, deflated and written as
+	// base85 lines of up to 52 bytes, then a blank line.
+	internal def binaryPatchSection(from byte[], to byte[]) byte[] {
+		let literal = deflateBytes(to)
+		let d = from.len() == 0 ?? (none, delta(from, to, 0))
+		let out byte[] = []
+		let data = literal
+		let header = "literal {to.len()}\n"
+		if !(d is none) {
+			let deflated = deflateBytes(d)
+			if deflated.len() < literal.len() {
+				data = deflated
+				header = "delta {d.len()}\n"
+			}
+		}
+		out.push(...header.bytes())
+		let alphabet = base85Chars.bytes()
+		for let at = 0; at < data.len(); at += 52 {
+			let n = data.len() - at < 52 ?? (data.len() - at, 52)
+			out.push(n <= 26 ?? (byte(0x41 + n - 1), byte(0x61 + n - 27)))
+			for let k = 0; k < n; k += 4 {
+				let acc = uint64(0)
+				for let j = 0; j < 4; j++ {
+					let b = k + j < n ?? (uint64(data[at + k + j]), uint64(0))
+					acc = (acc << 8) | b
+				}
+				let chars byte[]
+				chars.len(5)
+				for let j = 4; j >= 0; j-- {
+					chars[j] = alphabet[int(acc % 85)]
+					acc /= 85
+				}
+				out.push(...chars)
+			}
+			out.push(0x0A)
+		}
+		out.push(0x0A)
+		return out
+	}
+
+	internal def deflateBytes(data byte[]) byte[] {
+		let buffer = new bytes.Buffer()
+		let w = new zlib.Writer(buffer, zlib.Level(9))
+		w.write(data) onerror recover 0
+		w.close() onerror recover none
+		return buffer.bytes()
+	}
+
+	// Decodes the base85 lines of a binary patch section. Fails on a
+	// malformed line.
+	internal def decodeBase85Lines(lines string[]) !byte[] {
+		let alphabet = base85Chars.bytes()
+		let value int[]
+		value.len(256)
+		value.fill(-1)
+		for let (i, c) in alphabet {
+			value[int(c)] = i
+		}
+		let out byte[] = []
+		for let line in lines {
+			let b = line.bytes()
+			fail "git: corrupt binary patch line" when b.len() < 6 || (b.len() - 1) % 5 != 0
+			let c = b[0]
+			let n = c >= 0x41 && c <= 0x5A ?? (int(c - 0x41) + 1, int(c - 0x61) + 27)
+			fail "git: corrupt binary patch line" when n < 1 || n > 52 || (b.len() - 1) / 5 * 4 < n
+			let decoded byte[] = []
+			for let k = 1; k < b.len(); k += 5 {
+				let acc = uint64(0)
+				for let j = 0; j < 5; j++ {
+					let v = value[int(b[k + j])]
+					fail "git: corrupt binary patch line" when v < 0
+					acc = acc * 85 + uint64(v)
+				}
+				fail "git: corrupt binary patch line" when acc > uint64(0xFFFFFFFF)
+				decoded.push(byte(acc >> 24), byte((acc >> 16) & 0xFF), byte((acc >> 8) & 0xFF), byte(acc & 0xFF))
+			}
+			out.push(...decoded[0:n])
+		}
+		return out
+	}
+}

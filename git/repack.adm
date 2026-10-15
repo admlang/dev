@@ -1,0 +1,313 @@
+partial module adm.dev.git {
+	use (
+		std.os
+		std.time
+	)
+
+	// How to repack.
+	struct RepackOptions {
+		// Write a reachability bitmap; none: for bare repositories, as git's
+		// `repack.writeBitmaps`.
+		bitmap          ?bool       = none
+		// Write objects no reference reaches as loose objects instead of
+		// dropping them, so `prune` can expire them by age (`-A`).
+		keepUnreachable bool        = true
+		pack            PackOptions = PackOptions{}
+	}
+
+	// The objects a repository keeps: those its references, HEAD, reflogs
+	// and index (of every worktree) reach.
+	internal def reachableRoots(repo Repository) !ObjectId[] {
+		let out ObjectId[] = []
+		let seen map<string, bool> = {}
+		let add = def (id ObjectId) {
+			return when id.isZero() || seen.hasKey(id.str())
+			seen[id.str()] = true
+			out.push(id)
+		}
+		let head = repo.headId() onerror recover none
+		add(head) unless head is none
+		let names string[] = ["HEAD"]
+		for let r in try repo.refs("refs/") {
+			names.push(r.name)
+			let id = repo.refTarget(r.name) onerror recover none
+			add(id) unless id is none
+		}
+		for let name in names {
+			for let e in repo.reflog(name) onerror recover ReflogEntry[] {
+				add(e.oldId)
+				add(e.newId)
+			}
+		}
+		let gitDirs string[] = [repo.gitDir]
+		let worktrees = os.join(repo.commonDir, "worktrees")
+		if try os.exists(worktrees) {
+			for let w in try os.readDir(worktrees) {
+				gitDirs.push(w.path) when w.info.isDir
+			}
+		}
+		for let dir in gitDirs {
+			let wtHead = string(os.readFile(os.join(dir, "HEAD")) onerror recover byte[]).trim()
+			if wtHead.len() == idLength(repo.format) * 2 {
+				let id = idOrNone(wtHead)
+				add(id) unless id is none
+			}
+			continue unless try os.exists(os.join(dir, "index"))
+			let idx = try readIndexFile(os.join(dir, "index"), repo.format, dir)
+			for let e in idx.entries {
+				add(e.id) unless (e.mode & 0o170000) == 0o160000 || !repo.objects.hasLocal(e.id)
+			}
+		}
+		return out
+	}
+
+	// Packs every reachable object into one new pack (with its index,
+	// reverse index and, when asked, bitmap) and removes the old packs and
+	// the loose objects it holds (`git repack -a -d`). Returns the new
+	// pack's checksum; none when there is nothing to pack. Fails when a
+	// file cannot be written; the old packs stay until the new one is
+	// complete.
+	internal def repackAll(repo Repository, options RepackOptions) !?ObjectId {
+		let roots = try reachableRoots(repo)
+		// A partial clone packs what it has; what it lacks stays with the
+		// remote.
+		let hook = repo.objects.fetchMissing
+		repo.objects.fetchMissing = none
+		let items = objectsToPack(repo, roots.filter(id => repo.objects.hasLocal(id)), [], ObjectFilter{}) onerror (err error) {
+			repo.objects.fetchMissing = hook
+			fail err
+		}
+		repo.objects.fetchMissing = hook
+		items = items.filter(it => repo.objects.hasLocal(it.id))
+		let packDir = os.join(repo.objects.dir, "pack")
+		let oldPacks = repo.objects.packs.clone()
+		let wasPromisor = oldPacks.filter(p => os.exists(p.path.slice(0, p.path.len() - 5) + ".promisor") onerror recover false).len() > 0
+		let kept = oldPacks.filter(p => os.exists(p.path.slice(0, p.path.len() - 5) + ".keep") onerror recover false)
+		if options.keepUnreachable {
+			try explodeUnreachable(repo, items, oldPacks)
+		}
+		let sum ?ObjectId = none
+		if items.len() > 0 {
+			let s = try writePackFiles(repo, items, options.pack)
+			sum = s
+			let base = os.join(packDir, "pack-{s.str()}")
+			if wasPromisor {
+				try writeAtomically(base + ".promisor", byte[], 0o444)
+			}
+			// A partial clone's pack is not closed under reachability: no bitmap.
+			let bitmap = options.bitmap
+			if !wasPromisor && (bitmap is none ?? (repo.isBare(), bitmap)) {
+				try writeBitmapFor(repo, base + ".pack", roots)
+			}
+		}
+		// The new pack is complete: the old ones and the multi-pack index go.
+		let fresh = sum is none ?? ("", "pack-{sum.str()}.pack")
+		for let p in oldPacks {
+			continue when os.base(p.path) == fresh || kept.filter(k => k.path == p.path).len() > 0
+			let stem = p.path.slice(0, p.path.len() - 5)
+			for let ext in string[".pack", ".idx", ".rev", ".bitmap", ".promisor", ".mtimes"] {
+				os.remove(stem + ext) onerror recover none
+			}
+		}
+		for let e in try os.readDir(packDir) {
+			let name = os.base(e.path)
+			if name.startsWith("multi-pack-index") {
+				os.remove(e.path) onerror recover none
+			}
+		}
+		try reopenObjects(repo)
+		try pruneLooseInPacks(repo)
+		return sum
+	}
+
+	// Opens the object database again (the packs changed), keeping its
+	// lazy-fetch hook.
+	internal def reopenObjects(repo Repository) !none {
+		let hook = repo.objects.fetchMissing
+		let level = repo.objects.level
+		repo.objects.close()
+		let fresh = new ObjectDatabase(repo.objects.dir, repo.format)
+		fresh.level = level
+		fresh.fetchMissing = hook
+		try fresh.open()
+		repo.objects = fresh
+		let b = repo.bitmap
+		b.close() unless b is none
+		repo.bitmap = none
+		repo.bitmapLoaded = false
+		return none
+	}
+
+	// Writes the objects of the old packs that the new pack leaves out as
+	// loose objects, so nothing is lost before `prune` decides.
+	internal def explodeUnreachable(repo Repository, items PackItem[], packs Pack[]) !none {
+		let keep map<string, bool> = {}
+		for let it in items {
+			keep[it.id.str()] = true
+		}
+		for let p in packs {
+			for let n = 0; n < p.count; n++ {
+				let id = p.idAt(n)
+				continue when keep.hasKey(id.str())
+				let (kind, data) = try repo.objects.readRaw(id)
+				let _ = try repo.objects.write(kind, data)
+				keep[id.str()] = true
+			}
+		}
+		return none
+	}
+
+	// Removes loose objects a pack holds (`git prune-packed`).
+	internal def pruneLooseInPacks(repo Repository) !none {
+		for let dir in try os.readDir(repo.objects.dir) {
+			let name = os.base(dir.path)
+			continue unless dir.info.isDir && name.len() == 2 && hexValue(name.bytes()[0]) >= 0 && hexValue(name.bytes()[1]) >= 0
+			for let f in try os.readDir(dir.path) {
+				let id = idOrNone(name + os.base(f.path))
+				continue when id is none
+				if !(repo.objects.findPacked(id) is none) {
+					os.remove(f.path) onerror recover none
+				}
+			}
+			os.remove(dir.path) onerror recover none
+		}
+		return none
+	}
+
+	// Removes loose objects nothing reaches that are older than `expiry`
+	// (`git prune --expire`). Returns how many went.
+	internal def pruneUnreachable(repo Repository, expiry time.Time) !int {
+		let roots = try reachableRoots(repo)
+		let hook = repo.objects.fetchMissing
+		repo.objects.fetchMissing = none
+		let items = objectsToPack(repo, roots.filter(id => repo.objects.hasLocal(id)), [], ObjectFilter{}) onerror (err error) {
+			repo.objects.fetchMissing = hook
+			fail err
+		}
+		repo.objects.fetchMissing = hook
+		let reachable map<string, bool> = {}
+		for let it in items {
+			reachable[it.id.str()] = true
+		}
+		let removed = 0
+		for let dir in try os.readDir(repo.objects.dir) {
+			let name = os.base(dir.path)
+			continue unless dir.info.isDir && name.len() == 2 && hexValue(name.bytes()[0]) >= 0 && hexValue(name.bytes()[1]) >= 0
+			for let f in try os.readDir(dir.path) {
+				let id = idOrNone(name + os.base(f.path))
+				continue when id is none || reachable.hasKey(id.str())
+				continue when f.info.modTime > expiry
+				os.remove(f.path) onerror recover none
+				removed++
+			}
+			os.remove(dir.path) onerror recover none
+		}
+		return removed
+	}
+
+	// ---- bitmaps --------------------------------------------------------------
+
+	// Writes `<pack>.bitmap`: type bitmaps, the reachable set of the tips
+	// and of every hundredth commit, and the name-hash cache.
+	internal def writeBitmapFor(repo Repository, packPath string, roots ObjectId[]) !none {
+		let p = new Pack(packPath, repo.format)
+		try p.load()
+		let b = new PackBitmap()
+		b.pack = p
+		b.count = p.count
+		b.indexAt = p.reverse()
+		b.bitOf = inverseOrder(b.indexAt)
+		// Types by bit.
+		for let bit = 0; bit < p.count; bit++ {
+			let id = p.idAt(b.indexAt[bit])
+			let (kind, _) = try repo.info(id)
+			switch kind {
+				case ObjectKind.Commit:
+					b.commits.add(bit)
+				case ObjectKind.Tree:
+					b.trees.add(bit)
+				case ObjectKind.Blob:
+					b.blobs.add(bit)
+				case ObjectKind.Tag:
+					b.tags.add(bit)
+			}
+		}
+		// Selection: tips, and every hundredth commit of a date walk.
+		let tips ObjectId[] = []
+		for let r in roots {
+			let c = repo.peel(r, ObjectKind.Commit) onerror recover zeroId(repo.format)
+			tips.push(c) unless c.isZero() || tips.filter(t => t.equals(c)).len() > 0
+		}
+		let walk = new RevWalk(repo)
+		for let t in tips {
+			try walk.push(t)
+		}
+		let ordered = try walk.all()
+		let selected map<string, bool> = {}
+		for let t in tips {
+			selected[t.str()] = true
+		}
+		for let (i, c) in ordered {
+			selected[c.id.str()] = true when i % 100 == 0
+		}
+		// Oldest first, so each set stops at the sets already made.
+		let entries int[] = []
+		for let i = ordered.len() - 1; i >= 0; i-- {
+			let c = ordered[i]
+			continue unless selected.hasKey(c.id.str())
+			let bit = b.bitOfId(c.id)
+			continue when bit < 0
+			let set = try reachableBits(repo, b, [c.id], none)
+			fail "git: the pack does not hold everything {c.id.short()} reaches" when b.extra.len() > 0
+			b.byBit[bit] = entries.len()
+			b.decoded[entries.len()] = set
+			entries.push(bit)
+		}
+		let hashLen = idLength(repo.format)
+		let out byte[] = "BITM".bytes()
+		out.push(0, 1, 0, 0x5)
+		putBe(out, int64(entries.len()), 4)
+		out.push(...p.data[p.data.len() - hashLen:])
+		out.push(...writeEwah(b.commits, p.count))
+		out.push(...writeEwah(b.trees, p.count))
+		out.push(...writeEwah(b.blobs, p.count))
+		out.push(...writeEwah(b.tags, p.count))
+		for let (i, bit) in entries {
+			putBe(out, int64(b.indexAt[bit]), 4)
+			out.push(0, 0)
+			out.push(...writeEwah(b.decoded[i], p.count))
+		}
+		// The name hashes in index order, from the paths the pack was made
+		// with.
+		let names = try nameHashesFor(repo, p, roots)
+		for let n = 0; n < p.count; n++ {
+			putBe(out, int64(names[n]), 4)
+		}
+		let h = newHasher(repo.format)
+		out.push(...h.hash(out))
+		p.close()
+		return try writeAtomically(packPath.slice(0, packPath.len() - 5) + ".bitmap", out, 0o444)
+	}
+
+	// git's name hash of each object of a pack, by index position: the path
+	// a walk from the roots first meets it at; 0 for commits and tags.
+	internal def nameHashesFor(repo Repository, p Pack, roots ObjectId[]) !uint32[] {
+		let out uint32[]
+		out.len(p.count)
+		for let i = 0; i < p.count; i++ {
+			out[i] = 0
+		}
+		let saved = repo.bitmapLoaded
+		repo.bitmapLoaded = true
+		let items = objectsToPack(repo, roots.filter(id => repo.objects.hasLocal(id)), []) onerror (err error) {
+			repo.bitmapLoaded = saved
+			fail err
+		}
+		repo.bitmapLoaded = saved
+		for let it in items {
+			let n = p.find(it.id.bytes)
+			out[n] = uint32(nameHash(it.path)) when n >= 0 && it.path != ""
+		}
+		return out
+	}
+}

@@ -1,0 +1,184 @@
+partial module adm.dev.git {
+	// Bitset is a set of small integers as 64-bit words, low bits first: the
+	// uncompressed form of git's EWAH bitmaps.
+	internal type Bitset {
+		words uint64[] = []
+
+		def new() {}
+
+		def has(i int) bool {
+			let w = i >> 6
+			return false when w >= words.len()
+			return (words[w] & (uint64(1) << uint(i & 63))) != 0
+		}
+
+		def add(i int) {
+			let w = i >> 6
+			if w >= words.len() {
+				let old = words.len()
+				words.len(w + 1)
+				for let k = old; k <= w; k++ {
+					words[k] = 0
+				}
+			}
+			words[w] = words[w] | (uint64(1) << uint(i & 63))
+		}
+
+		def addAll(other Bitset) {
+			if other.words.len() > words.len() {
+				let old = words.len()
+				words.len(other.words.len())
+				for let k = old; k < words.len(); k++ {
+					words[k] = 0
+				}
+			}
+			for let k = 0; k < other.words.len(); k++ {
+				words[k] = words[k] | other.words[k]
+			}
+		}
+
+		def remove(other Bitset) {
+			let n = words.len() < other.words.len() ?? (words.len(), other.words.len())
+			for let k = 0; k < n; k++ {
+				words[k] = words[k] & ~other.words[k]
+			}
+		}
+
+		def intersect(other Bitset) {
+			for let k = 0; k < words.len(); k++ {
+				words[k] = k < other.words.len() ?? (words[k] & other.words[k], uint64(0))
+			}
+		}
+
+		def count() int {
+			let n = 0
+			for let w in words {
+				let x = w
+				for x != 0 {
+					x = x & (x - 1)
+					n++
+				}
+			}
+			return n
+		}
+
+		// The members in increasing order.
+		def members() int[] {
+			let out int[] = []
+			for let k = 0; k < words.len(); k++ {
+				let x = words[k]
+				for x != 0 {
+					let low = x & (~x + 1)
+					out.push(k * 64 + trailingZeros(low))
+					x = x & (x - 1)
+				}
+			}
+			return out
+		}
+
+		def clone() Bitset {
+			let b = new Bitset()
+			b.words = words.clone()
+			return b
+		}
+	}
+
+	internal def trailingZeros(x uint64) int {
+		let n = 0
+		let v = x
+		for (v & 1) == 0 && n < 64 {
+			v = v >> 1
+			n++
+		}
+		return n
+	}
+
+	// Reads an EWAH bitmap at `at`: the bits, and where the bitmap ends.
+	// Fails when it runs past the data.
+	internal def readEwah(data byte[], at int) !(Bitset, int) {
+		fail "git: truncated bitmap" when at + 8 > data.len()
+		let bits = be32(data, at)
+		let count = be32(data, at + 4)
+		let wordsAt = at + 8
+		let end = wordsAt + count * 8 + 4
+		fail "git: truncated bitmap" when end > data.len()
+		let out = new Bitset()
+		out.words.len((bits + 63) / 64)
+		for let k = 0; k < out.words.len(); k++ {
+			out.words[k] = 0
+		}
+		let pos = 0
+		let i = 0
+		for i < count {
+			let rlw = uint64(be64(data, wordsAt + i * 8))
+			i++
+			let bit = (rlw & 1) != 0
+			let run = int((rlw >> 1) & 0xFFFFFFFF)
+			let literals = int(rlw >> 33)
+			if bit {
+				for let k = 0; k < run && pos + k < out.words.len(); k++ {
+					out.words[pos + k] = ~uint64(0)
+				}
+			}
+			pos += run
+			for let k = 0; k < literals; k++ {
+				fail "git: truncated bitmap" when i >= count
+				let w = uint64(be64(data, wordsAt + i * 8))
+				i++
+				out.words[pos] = w when pos < out.words.len()
+				pos++
+			}
+		}
+		// Bits past the size are not members.
+		if bits % 64 != 0 && out.words.len() > 0 {
+			let last = out.words.len() - 1
+			out.words[last] = out.words[last] & ((uint64(1) << uint(bits % 64)) - 1)
+		}
+		return (out, end)
+	}
+
+	// An EWAH bitmap of `bits` bits holding the set.
+	internal def writeEwah(set Bitset, bits int) byte[] {
+		let n = (bits + 63) / 64
+		let words uint64[] = []
+		let rlwAt = 0
+		let k = 0
+		for k < n {
+			let w = k < set.words.len() ?? (set.words[k], uint64(0))
+			// A run of all-zero or all-one words, then literal words up to the
+			// next run.
+			let run = 0
+			let fill = false
+			if w == 0 || w == ~uint64(0) {
+				fill = w != 0
+				for k < n && run < 0x7FFFFFFF {
+					let x = k < set.words.len() ?? (set.words[k], uint64(0))
+					break unless x == (fill ?? (~uint64(0), uint64(0)))
+					run++
+					k++
+				}
+			}
+			let literals uint64[] = []
+			for k < n && literals.len() < 0x3FFFFFFF {
+				let x = k < set.words.len() ?? (set.words[k], uint64(0))
+				break when x == 0 || x == ~uint64(0)
+				literals.push(x)
+				k++
+			}
+			rlwAt = words.len()
+			words.push((uint64(literals.len()) << 33) | (uint64(run) << 1) | (fill ?? (uint64(1), uint64(0))))
+			words.push(...literals)
+		}
+		if words.len() == 0 {
+			words.push(0)
+		}
+		let out byte[] = []
+		putBe(out, int64(bits), 4)
+		putBe(out, int64(words.len()), 4)
+		for let w in words {
+			putBe(out, int64(w), 8)
+		}
+		putBe(out, int64(rlwAt), 4)
+		return out
+	}
+}

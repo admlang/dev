@@ -1,0 +1,581 @@
+partial module adm.dev.git {
+	use std.time
+
+	// What an object is. The values are the type numbers packfiles use.
+	enum ObjectKind {
+		Commit = 1,
+		Tree   = 2,
+		Blob   = 3,
+		Tag    = 4
+	}
+
+	// The kind's name as object headers write it: `commit`, `tree`, `blob`
+	// or `tag`.
+	def kindName(kind ObjectKind) string {
+		switch kind {
+			case ObjectKind.Commit:
+				return "commit"
+			case ObjectKind.Tree:
+				return "tree"
+			case ObjectKind.Tag:
+				return "tag"
+			default:
+				return "blob"
+		}
+	}
+
+	// The kind named `commit`, `tree`, `blob` or `tag`. Fails on any other name.
+	def parseKind(name string) !ObjectKind {
+		switch name {
+			case "commit":
+				return ObjectKind.Commit
+			case "tree":
+				return ObjectKind.Tree
+			case "blob":
+				return ObjectKind.Blob
+			case "tag":
+				return ObjectKind.Tag
+		}
+		fail "git: unknown object type {name}"
+	}
+
+	// Signature names who made a commit or tag and when: `Ana <ana@example.com>
+	// 1700000000 +0100` in the object.
+	type Signature {
+		name   string
+		email  string
+		// The instant, to the second.
+		date   time.Time
+		// The time zone it was recorded in, east of UTC.
+		offset duration
+
+		// A signature made now, in UTC unless `offset` says otherwise.
+		def new(name string, email string, date time.Time = time.now(), offset duration = 0s) {
+			self.name = name
+			self.email = email
+			self.date = date
+			self.offset = offset
+		}
+
+		// The signature as objects and reflogs write it.
+		def str() string {
+			let seconds = date.unixNs() / 1000000000
+			let minutes = int(offset) / 60000000000
+			let sign = minutes < 0 ?? ("-", "+")
+			let m = minutes < 0 ?? (-minutes, minutes)
+			return "{name} <{email}> {seconds} {sign}{"%02d".format(m / 60)}{"%02d".format(m % 60)}"
+		}
+	}
+
+	// Reads an ident line as git does: the name before the first `<`, the
+	// address up to the next `>`, then seconds and a `+hhmm` zone, either of
+	// which may be missing.
+	def parseSignature(line string) !Signature {
+		return try parseSignatureBytes(line.bytes(), 0, line.bytes().len())
+	}
+
+	internal def parseSignatureBytes(data byte[], start int, end int) !Signature {
+		let lt = indexByte(data, 0x3C, start, end)
+		fail "git: malformed signature" when lt < 0
+		let gt = indexByte(data, 0x3E, lt + 1, end)
+		fail "git: malformed signature" when gt < 0
+		let nameEnd = lt
+		for nameEnd > start && data[nameEnd - 1] == 0x20 {
+			nameEnd--
+		}
+		let name = string(data[start:nameEnd])
+		let email = string(data[lt + 1:gt])
+		let i = gt + 1
+		for i < end && data[i] == 0x20 {
+			i++
+		}
+		let seconds = int64(0)
+		for i < end && data[i] >= 0x30 && data[i] <= 0x39 {
+			seconds = seconds * 10 + int64(data[i] - 0x30)
+			i++
+		}
+		for i < end && data[i] == 0x20 {
+			i++
+		}
+		let minutes = 0
+		if i + 5 <= end && (data[i] == 0x2B || data[i] == 0x2D) {
+			let hh = int(data[i + 1] - 0x30) * 10 + int(data[i + 2] - 0x30)
+			let mm = int(data[i + 3] - 0x30) * 10 + int(data[i + 4] - 0x30)
+			minutes = hh * 60 + mm
+			minutes = -minutes when data[i] == 0x2D
+		}
+		let sig = new Signature(name, email, time.fromUnixNs(seconds * 1000000000), duration(int64(minutes) * 60000000000))
+		return sig
+	}
+
+	// One header of a commit or tag beyond those it has fields for
+	// (`mergetag`, `gpgsig`, `gpgsig-sha256`, ...), its value with the
+	// continuation lines joined by `\n`.
+	struct Header {
+		key   string
+		value string
+	}
+
+	// Commit is a snapshot (its tree) with its parents, who wrote it and
+	// committed it, and why.
+	type Commit {
+		id        ObjectId
+		tree      ObjectId
+		parents   ObjectId[]
+		author    Signature
+		committer Signature
+		// The message's character set when it is not UTF-8; empty otherwise.
+		encoding  string           = ""
+		// Headers the object holds besides those above, in order.
+		headers   Header[]         = []
+		message   string
+		internal repo ?Repository = none
+
+		def new(id ObjectId, tree ObjectId, parents ObjectId[], author Signature, committer Signature, message string) {
+			self.id = id
+			self.tree = tree
+			self.parents = parents
+			self.author = author
+			self.committer = committer
+			self.message = message
+		}
+
+		// The first paragraph of the message on one line, as `git log
+		// --oneline` shows it.
+		summary string {
+			def get() string {
+				let lines string[] = []
+				for let line in message.split("\n") {
+					let t = line.trim()
+					if t == "" {
+						break when lines.len() > 0
+						continue
+					}
+					lines.push(t)
+				}
+				return lines.join(" ")
+			}
+		}
+
+		// The value of the first header named `key`, none without one.
+		def header(key string) ?string {
+			for let h in headers {
+				return h.value when h.key == key
+			}
+			return none
+		}
+
+		// The commit's bytes as stored: what its id hashes.
+		def encode() byte[] {
+			let out byte[] = "tree {tree.str()}\n".bytes()
+			for let p in parents {
+				out.push(..."parent {p.str()}\n".bytes())
+			}
+			out.push(..."author {author.str()}\ncommitter {committer.str()}\n".bytes())
+			out.push(..."encoding {encoding}\n".bytes()) unless encoding == ""
+			for let h in headers {
+				out.push(...encodeHeader(h))
+			}
+			out.push(0x0A)
+			return out.push(...message.bytes())
+		}
+
+		// The commit's tree. Fails when the commit was not read from a
+		// repository or its tree is missing.
+		def root() !Tree {
+			let r = repo
+			fail "git: commit {id.short()} has no repository" when r is none
+			return try r.tree(tree)
+		}
+	}
+
+	internal def encodeHeader(h Header) byte[] {
+		return "{h.key} {h.value.replace("\n", "\n ")}\n".bytes()
+	}
+
+	// Reads a commit's stored bytes. Fails when a required header is
+	// missing or malformed.
+	def parseCommit(id ObjectId, data byte[]) !Commit {
+		let format = id.format()
+		let tree ?ObjectId = none
+		let parents ObjectId[] = []
+		let author ?Signature = none
+		let committer ?Signature = none
+		let encoding = ""
+		let headers Header[] = []
+		let i = 0
+		let n = data.len()
+		for i < n && data[i] != 0x0A {
+			let eol = indexByte(data, 0x0A, i, n)
+			eol = n when eol < 0
+			let sp = indexByte(data, 0x20, i, eol)
+			fail "git: malformed commit {id.short()}" when sp < 0
+			let key = string(data[i:sp])
+			switch key {
+				case "tree":
+					tree = try parseHexId(data, sp + 1, eol, format)
+				case "parent":
+					parents.push(try parseHexId(data, sp + 1, eol, format))
+				case "author":
+					author = try parseSignatureBytes(data, sp + 1, eol)
+				case "committer":
+					committer = try parseSignatureBytes(data, sp + 1, eol)
+				case "encoding":
+					encoding = string(data[sp + 1:eol])
+				default:
+					let (value, next) = readHeaderValue(data, sp + 1, eol, n)
+					headers.push(Header{key: key, value: value})
+					i = next
+					continue
+			}
+			i = eol + 1
+		}
+		fail "git: commit {id.short()} has no tree" when tree is none
+		fail "git: commit {id.short()} has no author" when author is none
+		fail "git: commit {id.short()} has no committer" when committer is none
+		let message = i < n ?? (string(data[i + 1:]), "")
+		let c = new Commit(id, tree, parents, author, committer, message)
+		c.encoding = encoding
+		c.headers = headers
+		return c
+	}
+
+	// A header value from `start` to the end of its line and every
+	// continuation line after it (each starting with a space); returns the
+	// value and where the next header starts.
+	internal def readHeaderValue(data byte[], start int, eol int, n int) (string, int) {
+		let value = data[start:eol].clone()
+		let i = eol + 1
+		for i < n && data[i] == 0x20 {
+			let e = indexByte(data, 0x0A, i, n)
+			e = n when e < 0
+			value.push(0x0A)
+			value.push(...data[i + 1:e])
+			i = e + 1
+		}
+		return (string(value), i)
+	}
+
+	internal def parseHexId(data byte[], start int, end int, format ObjectFormat) !ObjectId {
+		let want = idLength(format) * 2
+		fail "git: malformed object id" when end - start != want
+		let raw byte[]
+		raw.len(want / 2)
+		for let i = 0; i < raw.len(); i++ {
+			let hi = hexValue(data[start + i * 2])
+			let lo = hexValue(data[start + i * 2 + 1])
+			fail "git: malformed object id" when hi < 0 || lo < 0
+			raw[i] = byte(hi << 4 | lo)
+		}
+		return new ObjectId(raw)
+	}
+
+	internal def hexValue(c byte) int {
+		return int(c - 0x30) when c >= 0x30 && c <= 0x39
+		return int(c - 0x61) + 10 when c >= 0x61 && c <= 0x66
+		return int(c - 0x41) + 10 when c >= 0x41 && c <= 0x46
+		return -1
+	}
+
+	// The index of the first `b` in data[from:end], or -1.
+	internal def indexByte(data byte[], b byte, from int, end int) int {
+		for let i = from; i < end; i++ {
+			return i when data[i] == b
+		}
+		return -1
+	}
+
+	// Tag is an annotated tag: a name for an object with who tagged it and a
+	// message, and often a signature.
+	type Tag {
+		id      ObjectId
+		// The object the tag names and its kind.
+		target  ObjectId
+		kind    ObjectKind
+		name    string
+		tagger  ?Signature = none
+		headers Header[]   = []
+		message string
+		internal repo ?Repository = none
+
+		def new(id ObjectId, target ObjectId, kind ObjectKind, name string, message string) {
+			self.id = id
+			self.target = target
+			self.kind = kind
+			self.name = name
+			self.message = message
+		}
+
+		// The tag's bytes as stored: what its id hashes.
+		def encode() byte[] {
+			let out byte[] = "object {target.str()}\ntype {kindName(kind)}\ntag {name}\n".bytes()
+			let t = tagger
+			out.push(..."tagger {t.str()}\n".bytes()) unless t is none
+			for let h in headers {
+				out.push(...encodeHeader(h))
+			}
+			out.push(0x0A)
+			return out.push(...message.bytes())
+		}
+	}
+
+	// Reads a tag's stored bytes. Fails when a required header is missing
+	// or malformed.
+	def parseTag(id ObjectId, data byte[]) !Tag {
+		let format = id.format()
+		let target ?ObjectId = none
+		let kind ?ObjectKind = none
+		let name = ""
+		let tagger ?Signature = none
+		let headers Header[] = []
+		let i = 0
+		let n = data.len()
+		for i < n && data[i] != 0x0A {
+			let eol = indexByte(data, 0x0A, i, n)
+			eol = n when eol < 0
+			let sp = indexByte(data, 0x20, i, eol)
+			fail "git: malformed tag {id.short()}" when sp < 0
+			let key = string(data[i:sp])
+			switch key {
+				case "object":
+					target = try parseHexId(data, sp + 1, eol, format)
+				case "type":
+					kind = try parseKind(string(data[sp + 1:eol]))
+				case "tag":
+					name = string(data[sp + 1:eol])
+				case "tagger":
+					tagger = try parseSignatureBytes(data, sp + 1, eol)
+				default:
+					let (value, next) = readHeaderValue(data, sp + 1, eol, n)
+					headers.push(Header{key: key, value: value})
+					i = next
+					continue
+			}
+			i = eol + 1
+		}
+		fail "git: tag {id.short()} names no object" when target is none
+		fail "git: tag {id.short()} has no type" when kind is none
+		let message = i < n ?? (string(data[i + 1:]), "")
+		let t = new Tag(id, target, kind, name, message)
+		t.tagger = tagger
+		t.headers = headers
+		return t
+	}
+
+	// The mode of a tree entry: what the entry is.
+	enum EntryMode {
+		File       = 0o100644,
+		Executable = 0o100755,
+		Symlink    = 0o120000,
+		Tree       = 0o40000,
+		Submodule  = 0o160000
+	}
+
+	// TreeEntry is one name in a tree: its mode and the object it names (a
+	// blob, a tree, or for a submodule a commit of another repository).
+	struct TreeEntry {
+		name string
+		mode EntryMode
+		id   ObjectId
+	}
+
+	// Whether the mode names a subtree.
+	def isTree(mode EntryMode) bool {
+		return mode == EntryMode.Tree
+	}
+
+	// Tree is a folder: entries sorted by name, a subtree sorting as if its
+	// name ended in `/`.
+	type Tree {
+		id      ObjectId
+		entries TreeEntry[]
+		internal repo ?Repository = none
+
+		def new(id ObjectId, entries TreeEntry[]) {
+			self.id = id
+			self.entries = entries
+		}
+
+		// The entry with the name, none without one.
+		def entry(name string) ?TreeEntry {
+			let i = searchEntry(entries, name, false)
+			i = searchEntry(entries, name, true) when i < 0
+			return i < 0 ?? (none, entries[i])
+		}
+
+		// The entry at a `/`-separated path below the tree, none when a part
+		// of it is missing. Fails when a tree on the way cannot be read.
+		def find(path string) !?TreeEntry {
+			let parts = path.split("/").filter(p => p != "")
+			return none when parts.len() == 0
+			let tree = self
+			for let i = 0; i < parts.len(); i++ {
+				let e = tree.entry(parts[i])
+				return none when e is none
+				return e when i == parts.len() - 1
+				return none unless isTree(e.mode)
+				tree = try (try tree.load()).tree(e.id)
+			}
+			return none
+		}
+
+		// The blob at a path below the tree. Fails when nothing is there, it
+		// is not a file, or it cannot be read.
+		def file(path string) !Blob {
+			let e = try find(path)
+			fail "git: {path} is not in tree {id.short()}" when e is none
+			fail "git: {path} is not a file" when isTree(e.mode) || e.mode == EntryMode.Submodule
+			return try (try load()).blob(e.id)
+		}
+
+		// The subtree at a path below the tree. Fails when nothing is there,
+		// it is not a folder, or it cannot be read.
+		def folder(path string) !Tree {
+			let e = try find(path)
+			fail "git: {path} is not in tree {id.short()}" when e is none
+			fail "git: {path} is not a folder" unless isTree(e.mode)
+			return try (try load()).tree(e.id)
+		}
+
+		internal def load() !Repository {
+			let r = repo
+			fail "git: tree {id.short()} has no repository" when r is none
+			return r
+		}
+
+		// The tree's bytes as stored: what its id hashes. Entries are written
+		// in the order they are held; `sortEntries` puts them in git's.
+		def encode() byte[] {
+			let out byte[] = []
+			for let e in entries {
+				out.push(..."{"%o".format(int(e.mode))} {e.name}".bytes())
+				out.push(0)
+				out.push(...e.id.bytes)
+			}
+			return out
+		}
+	}
+
+	// The index of the entry named `name` in sorted entries, searched for
+	// as a subtree or not, or -1.
+	internal def searchEntry(entries TreeEntry[], name string, asTree bool) int {
+		let lo = 0
+		let hi = entries.len()
+		for lo < hi {
+			let mid = (lo + hi) / 2
+			let e = entries[mid]
+			let c = compareTreeNames(e.name, isTree(e.mode), name, asTree)
+			return mid when c == 0
+			if c < 0 {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		return -1
+	}
+
+	// Sorts entries as trees store them: by name, bytewise, a subtree's
+	// name compared as if it ended in `/`.
+	internal def sortEntries(entries TreeEntry[]) TreeEntry[] {
+		return entries.sort((a, b) => compareTreeNames(a.name, isTree(a.mode), b.name, isTree(b.mode)))
+	}
+
+	// Compares two entry names in tree order: -1, 0 or 1.
+	internal def compareTreeNames(a string, aTree bool, b string, bTree bool) int {
+		let x = a.bytes()
+		let y = b.bytes()
+		let n = x.len() < y.len() ?? (x.len(), y.len())
+		for let i = 0; i < n; i++ {
+			if x[i] != y[i] {
+				return x[i] < y[i] ?? (-1, 1)
+			}
+		}
+		let cx = x.len() > n ?? (int(x[n]), aTree ?? (0x2F, 0))
+		let cy = y.len() > n ?? (int(y[n]), bTree ?? (0x2F, 0))
+		return 0 when cx == cy
+		return cx < cy ?? (-1, 1)
+	}
+
+	// Reads a tree's stored bytes. Fails on an entry that is cut short or a
+	// mode that is not octal. Modes git writes in older forms (`100664`,
+	// `040000`) read as the mode they mean.
+	def parseTree(id ObjectId, data byte[]) !Tree {
+		let size = idLength(id.format())
+		let entries TreeEntry[] = []
+		let i = 0
+		let n = data.len()
+		for i < n {
+			let mode = 0
+			for i < n && data[i] != 0x20 {
+				let d = data[i]
+				fail "git: malformed tree {id.short()}" unless d >= 0x30 && d <= 0x37
+				mode = mode * 8 + int(d - 0x30)
+				i++
+			}
+			let nul = indexByte(data, 0, i + 1, n)
+			fail "git: malformed tree {id.short()}" when nul < 0 || nul + 1 + size > n
+			let name = string(data[i + 1:nul])
+			let raw = data[nul + 1:nul + 1 + size].clone()
+			entries.push(TreeEntry{name: name, mode: canonicalMode(mode), id: new ObjectId(raw)})
+			i = nul + 1 + size
+		}
+		return new Tree(id, entries)
+	}
+
+	// The mode git reads a stored mode as.
+	internal def canonicalMode(mode int) EntryMode {
+		switch mode & 0o170000 {
+			case 0o40000:
+				return EntryMode.Tree
+			case 0o120000:
+				return EntryMode.Symlink
+			case 0o160000:
+				return EntryMode.Submodule
+		}
+		return (mode & 0o100) != 0 ?? (EntryMode.Executable, EntryMode.File)
+	}
+
+	// Blob is a file's content.
+	type Blob {
+		id   ObjectId
+		data byte[]
+
+		def new(id ObjectId, data byte[]) {
+			self.id = id
+			self.data = data
+		}
+
+		// The content as text. Fails when it is not UTF-8 or holds a NUL
+		// byte.
+		def text() !string {
+			let s = string(data)
+			fail "git: blob {id.short()} is not UTF-8 text" unless s.bytes().len() == data.len() && s.isUTF8()
+			return s
+		}
+
+		// Whether git would call the content binary: a NUL byte in its first
+		// 8000 bytes.
+		def isBinary() bool {
+			let n = data.len() < 8000 ?? (data.len(), 8000)
+			return indexByte(data, 0, 0, n) >= 0
+		}
+	}
+
+	// Object is any object a repository holds.
+	type Object = Commit | Tree | Blob | Tag
+
+	// Reads an object's stored bytes as the kind.
+	// Fails when the data is not a valid object of the kind.
+	def parseObject(kind ObjectKind, id ObjectId, data byte[]) !Object {
+		switch kind {
+			case ObjectKind.Commit:
+				return try parseCommit(id, data)
+			case ObjectKind.Tree:
+				return try parseTree(id, data)
+			case ObjectKind.Tag:
+				return try parseTag(id, data)
+		}
+		return new Blob(id, data)
+	}
+}
