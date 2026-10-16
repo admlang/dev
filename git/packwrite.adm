@@ -11,11 +11,11 @@ partial module adm.dev.git {
 	// One object to pack, with the path it was reached by (for grouping
 	// similar files as delta candidates).
 	internal struct PackItem {
-		id    ObjectId
-		path  string = ""
+		id   ObjectId
+		path string   = ""
 		// The path's name hash when known without the path (a bitmap's hash
 		// cache); -1 to hash `path`.
-		hash  int64  = -1
+		hash int64    = -1
 	}
 
 	// git's path hash for delta ordering: the last sixteen non-blank bytes
@@ -174,13 +174,13 @@ partial module adm.dev.git {
 	// Which objects a partial clone leaves out (`--filter=`).
 	internal struct ObjectFilter {
 		// `blob:none`: no blobs.
-		noBlobs   bool = false
+		noBlobs   bool  = false
 		// `blob:limit=<n>`: blobs of n bytes or more are left out (-1: no
 		// limit).
 		blobLimit int64 = -1
 		// `tree:<depth>`: trees deeper than depth are left out (-1: no
 		// limit).
-		treeDepth int  = -1
+		treeDepth int   = -1
 	}
 
 	// The filter `git clone --filter=` names: `blob:none`,
@@ -212,22 +212,22 @@ partial module adm.dev.git {
 	// An object being written: where it is stored now, what it deltas
 	// against, and where it lands in the new pack.
 	internal type PackSlot {
-		item     PackItem
-		kind     ObjectKind
-		size     int
-		hash     int64
+		item      PackItem
+		kind      ObjectKind
+		size      int
+		hash      int64
 		// A delta base among the objects written (index), or -1.
-		base     int    = -1
-		delta    byte[] = []
-		depth    int    = 0
+		base      int          = -1
+		delta     byte[]       = []
+		depth     int          = 0
 		// Reused as stored: the entry's raw bytes from a pack.
-		reuse    ?PackedEntry = none
-		offset   int    = -1
-		crc      uint32 = 0
-		written  bool   = false
+		reuse     ?PackedEntry = none
+		offset    int          = -1
+		crc       uint32       = 0
+		written   bool         = false
 		// A base the receiver has (a thin pack): deltas may point at it by
 		// id, and it is not written.
-		preferred bool  = false
+		preferred bool         = false
 
 		def new(item PackItem, kind ObjectKind, size int) {
 			self.item = item
@@ -240,29 +240,32 @@ partial module adm.dev.git {
 	// A stored pack entry that can be copied: its pack, its offset, and
 	// for a delta the offset (or id) of its base.
 	internal struct PackedEntry {
-		pack     Pack
-		offset   int
-		kind     int
-		baseAt   int = -1
-		baseId   ?ObjectId = none
+		pack   Pack
+		offset int
+		kind   int
+		baseAt int       = -1
+		baseId ?ObjectId = none
 		// Where the compressed data starts and the entry ends.
-		dataAt   int
-		end      int
+		dataAt int
+		end    int
 	}
 
 	// Options for writing packs.
 	internal struct PackOptions {
 		// Objects compared as delta bases (pack.window).
-		window      int  = 10
+		window           int  = 10
 		// Longest delta chain made (pack.depth).
-		depth       int  = 50
+		depth            int  = 50
+		// Objects larger are stored whole, never searched for deltas
+		// (core.bigFileThreshold).
+		bigFileThreshold int  = 512 << 20
 		// Copy objects and deltas as stored in packs.
-		reuse       bool = true
+		reuse            bool = true
 		// zlib level (pack.compression).
-		level       int  = 6
+		level            int  = 6
 		// Deltas name their base by its offset in the pack; false names it
 		// by id, for readers without `ofs-delta`.
-		ofsDelta    bool = true
+		ofsDelta         bool = true
 	}
 
 	// The stored entry of a packed object, none for a loose one.
@@ -310,11 +313,7 @@ partial module adm.dev.git {
 	}
 
 	internal def compressBytes(data byte[], level int) byte[] {
-		let buffer = new bytes.Buffer()
-		let w = new zlib.Writer(buffer, zlib.Level(level))
-		w.write(data) onerror recover 0
-		w.close() onerror recover none
-		return buffer.bytes()
+		return zlib.compress(data, zlib.Level(level))
 	}
 
 	// A pack being written to a stream: entries after a header, the
@@ -322,7 +321,7 @@ partial module adm.dev.git {
 	internal type PackStream {
 		out    io.Writer
 		hasher hash.Hasher
-		count  int = 0
+		count  int         = 0
 
 		def new(out io.Writer, format ObjectFormat) {
 			self.out = out
@@ -440,75 +439,146 @@ partial module adm.dev.git {
 		return out
 	}
 
-	// Writes every slot not reused as stored: objects read here, compressed
-	// on tasks a batch at a time, then written in order (offsets and delta
-	// headers need the entries before them).
+	// Writes every slot not reused as stored, a batch at a time: while one
+	// batch's entries are written in order (offsets and delta headers need
+	// the entries before them), the next is read and compressed on tasks.
 	internal def writeSlots(repo Repository, slots PackSlot[], stream PackStream, options PackOptions) !none {
 		let order = writeOrder(slots)
+		let batches int[][] = []
 		let at = 0
 		for at < order.len() {
 			let batch int[] = []
 			let bytes = 0
-			for at < order.len() && batch.len() < 1024 && bytes < 64 << 20 {
+			for at < order.len() && batch.len() < 1024 && bytes < 16 << 20 {
 				let i = order[at]
 				batch.push(i)
 				bytes += slots[i].size
 				at++
 			}
-			// What each needs compressed: a delta made here or a whole object.
-			let inputs byte[][] = []
-			for let i in batch {
-				let s = slots[i]
-				if !(s.reuse is none) {
-					inputs.push(byte[])
-				} else if s.base >= 0 {
-					inputs.push(s.delta)
-				} else {
-					let (_, data) = try repo.raw(s.item.id)
-					inputs.push(data)
-				}
+			batches.push(batch)
+		}
+		return none when batches.len() == 0
+		let next = async compressBatch(repo.objects.dir, repo.format, slots, batches[0], options.level)
+		for let (b, batch) in batches {
+			let (compressed, missing) = try await next
+			if b + 1 < batches.len() {
+				next = async compressBatch(repo.objects.dir, repo.format, slots, batches[b + 1], options.level)
 			}
-			let compressed = compressAll(inputs, batch.mapElem(i => slots[i].reuse is none), options.level)
+			let failure ?error = none
 			for let (k, i) in batch {
-				try writeEntry(slots, i, compressed[k], stream, options)
+				if missing[k] {
+					let found = repo.raw(slots[i].item.id) onerror (err error) {
+						failure = err
+						recover (ObjectKind.Blob, byte[])
+					}
+					break unless failure is none
+					let (_, data) = found
+					compressed[k] = compressBytes(data, options.level)
+				}
+				writeEntry(slots, i, compressed[k], stream, options) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+			}
+			if !(failure is none) {
+				// The next batch's tasks finish before the failure is reported.
+				if b + 1 < batches.len() {
+					let _ = await next onerror recover (byte[][], bool[])
+				}
+				fail failure
 			}
 		}
 		return none
 	}
 
-	// Compresses the inputs marked, on tasks of about a megabyte each.
-	internal def compressAll(inputs byte[][], wanted bool[], level int) byte[][] {
-		let out byte[][] = []
-		out.len(inputs.len())
+	// What each slot of `batch` writes, compressed: its delta or its object
+	// (nothing for one reused as stored), and true in the second list for
+	// an object the readers here lack (the caller reads it, where the
+	// repository can fetch it). Tasks of about a megabyte of input each read
+	// with readers of their own (packs keep caches that are not shared
+	// between tasks).
+	internal def compressBatch(dir string, format ObjectFormat, slots PackSlot[], batch int[], level int) !(byte[][], bool[]) {
 		let starts int[] = [0]
 		let size = 0
-		for let k = 0; k < inputs.len(); k++ {
-			size += inputs[k].len()
-			if size >= 1 << 20 && k + 1 < inputs.len() {
+		for let k = 0; k < batch.len(); k++ {
+			let s = slots[batch[k]]
+			size += s.reuse is none ?? (s.base >= 0 ?? (s.delta.len(), s.size), 0)
+			if size >= 1 << 20 && k + 1 < batch.len() {
 				starts.push(k + 1)
 				size = 0
 			}
 		}
-		starts.push(inputs.len())
-		let tasks (async byte[][])[] = []
+		starts.push(batch.len())
+		let tasks (async !(byte[][], bool[]))[] = []
 		for let t = 0; t + 1 < starts.len(); t++ {
-			tasks.push(async compressRange(inputs, wanted, starts[t], starts[t + 1], level))
+			tasks.push(async compressSlots(dir, format, slots, batch[starts[t]:starts[t + 1]].clone(), level))
 		}
-		for let (t, task) in tasks {
-			let part = await task
-			for let (k, data) in part {
-				out[starts[t] + k] = data
+		let out byte[][] = []
+		let missing bool[] = []
+		let failure ?error = none
+		for let task in tasks {
+			let (part, lacking) = await task onerror (err error) {
+				failure = err
+				recover (byte[][], bool[])
 			}
+			out.push(...part)
+			missing.push(...lacking)
 		}
-		return out
+		fail failure unless failure is none
+		return (out, missing)
 	}
 
-	internal def compressRange(inputs byte[][], wanted bool[], from int, to int, level int) byte[][] {
+	// Compresses what the slots of `part` write, reading objects with a
+	// reader of its own; true in the second list for an object that reader
+	// does not have. One compressor serves the small inputs, reset per
+	// input: a fresh one allocates and clears its tables, which costs more
+	// than a small object's compression. A large input is compressed on
+	// tasks of its own (zlib.compress).
+	internal def compressSlots(dir string, format ObjectFormat, slots PackSlot[], part int[], level int) !(byte[][], bool[]) {
+		let odb = new ObjectDatabase(dir, format)
+		try odb.open()
+		let w = new zlib.Writer(new bytes.Buffer(), zlib.Level(level))
 		let out byte[][] = []
-		for let k = from; k < to; k++ {
-			out.push(wanted[k] ?? (compressBytes(inputs[k], level), byte[]))
+		let missing bool[] = []
+		let failure ?error = none
+		for let i in part {
+			let s = slots[i]
+			if !(s.reuse is none) {
+				out.push(byte[])
+				missing.push(false)
+				continue
+			}
+			let input = s.delta
+			if s.base < 0 {
+				let found = odb.lookup(s.item.id) onerror (err error) {
+					failure = err
+					recover none
+				}
+				break unless failure is none
+				if found is none {
+					out.push(byte[])
+					missing.push(true)
+					continue
+				}
+				let (_, data) = found
+				input = data
+			}
+			if input.len() >= 1 << 20 {
+				out.push(compressBytes(input, level))
+			} else {
+				let buffer = new bytes.Buffer()
+				w.reset(buffer)
+				// Writing to a Buffer cannot fail.
+				w.write(input) onerror recover 0
+				w.close() onerror recover none
+				out.push(buffer.bytes())
+			}
+			missing.push(false)
 		}
-		return out
+		odb.close()
+		fail failure unless failure is none
+		return (out, missing)
 	}
 
 	// Writes one slot whose base (if any) is written: its header, then the
@@ -559,18 +629,29 @@ partial module adm.dev.git {
 		for let (i, s) in slots {
 			continue unless s.reuse is none
 			continue unless s.kind == ObjectKind.Blob || s.kind == ObjectKind.Tree
-			continue when s.size < 50
+			continue when s.size < 50 || s.size > options.bigFileThreshold
 			order.push(i)
 		}
 		return none when order.len() < 2
 		order.sort((a, b) => compareDeltaOrder(slots[a], slots[b]))
+		// Segments of about equal bytes, as the work grows with them: a few
+		// large objects of one path can outweigh thousands of small ones.
+		let total = 0
+		for let i in order {
+			total += slots[i].size
+		}
+		let targetBytes = total / deltaTasks
 		let segments int[][] = []
-		let target = (order.len() / deltaTasks).max(deltaSegmentMin)
 		let at = 0
 		for at < order.len() {
-			let end = (at + target).min(order.len())
+			let end = at
+			let bytes = 0
+			for end < order.len() && (end - at < deltaSegmentMin || bytes < targetBytes) {
+				bytes += slots[order[end]].size
+				end++
+			}
 			// Keep objects of one path together.
-			for end < order.len() && end > at && slots[order[end]].hash == slots[order[end - 1]].hash {
+			for end < order.len() && slots[order[end]].hash == slots[order[end - 1]].hash {
 				end++
 			}
 			segments.push(order[at:end].clone())
@@ -597,7 +678,7 @@ partial module adm.dev.git {
 	// Tasks a delta search is spread over, and the smallest segment worth a
 	// task of its own.
 	internal const deltaTasks = 16
-	internal const deltaSegmentMin = 512
+	internal const deltaSegmentMin = 16
 
 	// Searches one segment with a reader of its own (packs keep caches that
 	// are not shared between tasks).
@@ -616,9 +697,13 @@ partial module adm.dev.git {
 
 	internal def searchDeltas(odb ObjectDatabase, slots PackSlot[], segment int[], options PackOptions) !none {
 		let window = options.window
-		// The window: slot index and the delta index of its content.
+		// The window: slot index, content, and the delta index of the
+		// content, built when a target first tries it as a base.
 		let winIds int[] = []
+		let winData byte[][] = []
 		let winIndex DeltaIndex[] = []
+		let winIndexed bool[] = []
+		let unindexed = new DeltaIndex(byte[])
 		for let i in segment {
 			let s = slots[i]
 			let (_, data) = try odb.readRaw(s.item.id)
@@ -630,10 +715,16 @@ partial module adm.dev.git {
 					continue unless b.kind == s.kind
 					continue when b.depth >= options.depth
 					// Sizes too far apart never make a useful delta.
-					continue when b.size < s.size / 32
+					continue when b.size < s.size / 32 || s.size < b.size / 32
 					let limit0 = best is none ?? (s.size / 2, best.len())
 					let limit = limit0 * (options.depth - b.depth) / (options.depth + 1)
 					continue when limit < 20
+					// A delta inserts at least the bytes the target has beyond its base.
+					continue when s.size - b.size >= limit
+					if !winIndexed[k] {
+						winIndex[k] = new DeltaIndex(winData[k])
+						winIndexed[k] = true
+					}
 					let d = makeDelta(winIndex[k], data, limit)
 					if !(d is none) {
 						best = d
@@ -647,10 +738,14 @@ partial module adm.dev.git {
 				}
 			}
 			winIds.push(i)
-			winIndex.push(new DeltaIndex(data))
+			winData.push(data)
+			winIndex.push(unindexed)
+			winIndexed.push(false)
 			if winIds.len() > window {
 				winIds.shift()
+				winData.shift()
 				winIndex.shift()
+				winIndexed.shift()
 			}
 		}
 		return none

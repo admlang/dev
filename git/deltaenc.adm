@@ -1,118 +1,237 @@
 partial module adm.dev.git {
+	use std.simd
+
 	// Bytes in a block the delta encoder indexes the source by.
 	internal const deltaBlock = 16
 
-	// An index of a delta source: the positions of its 16-byte blocks by
-	// hash, built once to delta many targets against it.
+	// The multiplier of the rolling block hash: a block's hash is
+	// sum(byte[k] * rollBase^(15 - k)) over its 16 bytes, modulo 2^32, so
+	// the scan of a target updates it in two steps per byte.
+	internal const rollBase = uint32(0x01000193)
+
+	// A match this long ends the search for a longer one at that position.
+	internal const goodMatch = 4096
+
+	// The source bytes copies can reach: a copy instruction holds a 32-bit
+	// offset, so a larger source's tail is only inserted.
+	internal const deltaReach = 4294967295
+
+	// An index of a delta source: its 16-byte blocks by hash, built once to
+	// delta many targets against it. About one block a bucket; each entry
+	// keeps its block's whole hash, so a scan rejects most entries without
+	// reading the source, and a filter of 8 bits a block (one set per
+	// block) lets it pass most positions without reading the buckets.
 	internal type DeltaIndex {
-		src    byte[]
-		// Hash slot to the first block position + 1 (0: none), and each
-		// position to the next one with the same slot.
-		heads  int[]
-		chain  int[]
-		mask   int
+		src     byte[]
+		// Bucket k's entries are starts[k] up to starts[k + 1], later blocks
+		// first (the last occurrence is the one most likely to continue):
+		// the hash and offset of each.
+		starts  uint32[]
+		hashes  uint32[]
+		offsets uint32[]
+		// The bucket of a hash is its top bits after a multiplicative mix,
+		// its filter bit more of them.
+		shift   int
+		filter  uint64[]
+		fshift  int
 
 		def new(src byte[]) {
 			self.src = src
-			let blocks = src.len() / deltaBlock
+			let blocks = src.len().min(deltaReach) / deltaBlock
 			let size = 16
-			for size < blocks * 2 {
+			let bits = 4
+			for size < blocks {
 				size <<= 1
+				bits++
 			}
-			mask = size - 1
-			heads.len(size)
-			heads.fill(0)
-			chain.len(blocks + 1)
-			chain.fill(0)
-			// Later blocks first in each chain, so the search finds the last
-			// occurrence first, as it is the one most likely to continue.
+			shift = 32 - bits
+			let fbits = 6
+			for (1 << fbits) < blocks * 8 {
+				fbits++
+			}
+			fshift = 32 - fbits
+			filter.len(1 << (fbits - 6))
+			filter.fill(0)
+			let blockHashes uint32[]
+			blockHashes.len(blocks)
+			starts.len(size + 1)
+			starts.fill(0)
+			// A block's hash is the dot product of its bytes with the powers
+			// of rollBase, 16 lanes at once.
+			let powers uint32[]
+			powers.len(deltaBlock)
+			let p = uint32(1)
+			for let k = deltaBlock - 1; k >= 0; k-- {
+				powers[k] = p
+				p *= rollBase
+			}
+			let weights = simd.load16<uint32>(powers, 0)
 			for let b = 0; b < blocks; b++ {
-				let h = blockHash(src, b * deltaBlock) & mask
-				chain[b + 1] = heads[h]
-				heads[h] = b + 1
+				let h = (simd.convert<byte, uint32>(simd.load16<byte>(src, b * deltaBlock)) * weights).sum()
+				blockHashes[b] = h
+				starts[blockSlot(h, shift) + 1]++
+				let f = blockSlot(h, fshift)
+				filter[f >> 6] |= uint64(1) << uint64(f & 63)
+			}
+			for let k = 1; k <= size; k++ {
+				starts[k] += starts[k - 1]
+			}
+			let next = starts.clone()
+			hashes.len(blocks)
+			offsets.len(blocks)
+			for let b = blocks - 1; b >= 0; b-- {
+				let h = blockHashes[b]
+				let k = blockSlot(h, shift)
+				let at = int(next[k])
+				next[k] = uint32(at + 1)
+				hashes[at] = h
+				offsets[at] = uint32(b * deltaBlock)
 			}
 		}
 	}
 
-	// The hash of the 16 bytes at `at`.
-	internal def blockHash(data byte[], at int) int {
+	// The rolling hash of the 16 bytes at `at`.
+	internal def blockHash(data byte[], at int) uint32 {
 		let h = uint32(0)
 		for let k = 0; k < deltaBlock; k++ {
-			h = h * uint32(0x01000193) ^ uint32(data[at + k])
+			h = h * rollBase + uint32(data[at + k])
 		}
-		return int(h >> 1)
+		return h
+	}
+
+	internal def blockSlot(h uint32, shift int) int {
+		return int((h * uint32(0x9E3779B1)) >> shift)
+	}
+
+	// How many bytes from `a[at]` and `b[bt]` on are equal, at most `max`;
+	// 32 compared a step.
+	internal def matchLength(a byte[], at int, b byte[], bt int, max int) int {
+		let len = 0
+		for len + 32 <= max {
+			let diff = simd.ne(simd.loadBytes32(a, at + len), simd.loadBytes32(b, bt + len)).bits()
+			return len + diff.trailingZeros() when diff != 0
+			len += 32
+		}
+		for len < max && a[at + len] == b[bt + len] {
+			len++
+		}
+		return len
+	}
+
+	// rollBase^15: what the byte leaving the window added to the hash.
+	internal def rollLeave() uint32 {
+		let leave = uint32(1)
+		for let k = 1; k < deltaBlock; k++ {
+			leave *= rollBase
+		}
+		return leave
+	}
+
+	// The first position from `from` (before `end`, at most
+	// `target.len() - 16 + 1`) whose block hash one of the first 64 entries
+	// of its bucket shares, with that hash; `end` when there is none.
+	internal def scanDelta(index DeltaIndex, target byte[], from int, end int, leave uint32) (int, uint32) {
+		let starts = index.starts
+		let hashes = index.hashes
+		let shift = index.shift
+		let filter = index.filter
+		let fshift = index.fshift
+		let i = from
+		let h = blockHash(target, i)
+		for {
+			let f = blockSlot(h, fshift)
+			if filter[f >> 6] & (uint64(1) << uint64(f & 63)) != 0 {
+				let k = blockSlot(h, shift)
+				let e = int(starts[k])
+				let last = int(starts[k + 1]).min(e + 64)
+				for e < last {
+					return (i, h) when hashes[e] == h
+					e++
+				}
+			}
+			i++
+			return (end, h) when i >= end
+			h = (h - uint32(target[i - 1]) * leave) * rollBase + uint32(target[i + deltaBlock - 1])
+		}
 	}
 
 	// A git delta that rebuilds `target` from the indexed source: copy
 	// instructions for runs found in the source (16 bytes or longer),
-	// insert instructions for the rest. None when the delta would not be
-	// smaller than `limit` bytes (0: no limit).
+	// insert instructions of up to 127 bytes for the rest. None when the
+	// delta would not be smaller than `limit` bytes (0: no limit).
 	internal def makeDelta(index DeltaIndex, target byte[], limit int = 0) ?byte[] {
 		let src = index.src
+		let hashes = index.hashes
+		let offsets = index.offsets
+		let srcLen = src.len().min(deltaReach)
 		let out byte[] = []
 		deltaVarintOut(out, src.len())
 		deltaVarintOut(out, target.len())
-		let pending = 0
-		let pendingAt = 0
+		let leave = rollLeave()
 		let n = target.len()
+		// Positions up to `lastBlock` start a whole block of the target.
+		let lastBlock = srcLen >= deltaBlock ?? (n - deltaBlock, -1)
+		// Bytes from `pendingFrom` up to `i` are still to be inserted.
+		let pendingFrom = 0
 		let i = 0
-		for i < n {
+		for i <= lastBlock {
+			let end = lastBlock + 1
+			// Pending this many bytes, the inserts alone reach the limit
+			// (a later copy can take back at most the last 126 of them).
+			let stop = pendingFrom + limit - out.len() + 126
+			let refused = limit > 0 && stop <= end
+			if refused {
+				end = stop
+				return none when end <= i
+			}
+			let (at, h) = scanDelta(index, target, i, end, leave)
+			if at >= end {
+				return none when refused
+				i = end
+				break
+			}
+			let k = blockSlot(h, index.shift)
+			let e = int(index.starts[k])
+			let last = int(index.starts[k + 1]).min(e + 64)
 			let bestLen = 0
 			let bestOff = 0
-			if i + deltaBlock <= n && src.len() >= deltaBlock {
-				let h = blockHash(target, i) & index.mask
-				let b = index.heads[h]
-				let tries = 0
-				for b > 0 && tries < 64 {
-					let off = (b - 1) * deltaBlock
-					// Extend forward from the block.
-					let len = 0
-					for off + len < src.len() && i + len < n && src[off + len] == target[i + len] {
-						len++
-					}
+			for e < last {
+				if hashes[e] == h {
+					let off = int(offsets[e])
+					let len = matchLength(src, off, target, at, (srcLen - off).min(n - at))
 					if len >= deltaBlock && len > bestLen {
 						bestLen = len
 						bestOff = off
+						break when len >= goodMatch
 					}
-					b = index.chain[b]
-					tries++
 				}
+				e++
 			}
 			if bestLen < deltaBlock {
-				if pending == 0 {
-					pendingAt = i
-				}
-				pending++
-				i++
-				if pending == 127 {
-					flushInsert(out, target, pendingAt, pending)
-					pending = 0
-				}
+				i = at + 1
 				continue
 			}
-			// Extend backward into bytes still waiting to be inserted.
+			// Extend backward into the bytes waiting to be inserted, those
+			// after the last full insert of 127.
+			let open = (at - pendingFrom) % 127
 			let back = 0
-			for back < pending && bestOff - back > 0 && src[bestOff - back - 1] == target[i - back - 1] {
+			for back < open && bestOff - back > 0 && src[bestOff - back - 1] == target[at - back - 1] {
 				back++
 			}
-			if pending - back > 0 {
-				flushInsert(out, target, pendingAt, pending - back)
-			}
-			pending = 0
+			flushInserts(out, target, pendingFrom, at - back)
 			let off = bestOff - back
 			let len = bestLen + back
-			i += bestLen
 			for len > 0 {
 				let chunk = len > 0x10000 ?? (0x10000, len)
 				copyOp(out, off, chunk)
 				off += chunk
 				len -= chunk
 			}
+			i = at + bestLen
+			pendingFrom = i
 			return none when limit > 0 && out.len() >= limit
 		}
-		if pending > 0 {
-			flushInsert(out, target, pendingAt, pending)
-		}
+		flushInserts(out, target, pendingFrom, n)
 		return none when limit > 0 && out.len() >= limit
 		return out
 	}
@@ -123,10 +242,16 @@ partial module adm.dev.git {
 		return makeDelta(new DeltaIndex(src), target, limit)
 	}
 
-	internal def flushInsert(out byte[], data byte[], at int, count int) {
-		out.push(byte(count))
-		for let k = 0; k < count; k++ {
-			out.push(data[at + k])
+	// Insert instructions for `data[from:to]`, 127 bytes each but the last.
+	internal def flushInserts(out byte[], data byte[], from int, to int) {
+		let at = from
+		for at < to {
+			let count = (to - at).min(127)
+			out.push(byte(count))
+			let start = out.len()
+			out.len(start + count)
+			data[at:at + count].copy(out[start:])
+			at += count
 		}
 	}
 

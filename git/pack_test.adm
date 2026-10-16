@@ -63,7 +63,74 @@ partial module adm.dev.git {
 		return !(r is none) && r.kind >= packOfsDelta
 	}
 
+	// `n` bytes of a generator seeded with `seed`, without repeats worth a copy.
+	internal def noise(n int, seed int) byte[] {
+		let out byte[]
+		out.len(n)
+		let state = seed
+		for let i = 0; i < n; i++ {
+			state = (state * 1103515245 + 12345) % 2147483648
+			out[i] = byte((state >> 16) & 0xff)
+		}
+		return out
+	}
+
 	check "Packs" {
+		@test()
+		def makesDeltas() !none {
+			// Targets built from pieces of the source and new bytes: insert
+			// runs past 127 bytes before copies whose start extends backward,
+			// copies past 64 KiB, the source's tail, edits every few bytes.
+			let src = noise(150000, 7)
+			let cases byte[][] = [
+				src[:100] + noise(300, 1) + src[5000:90000] + noise(20, 2) + src[90010:],
+				noise(130, 3) + src[60000:60300] + noise(254, 4) + src[1000:2000],
+				src[70000:] + src[:70000],
+				src[149990:] + noise(40, 5),
+				noise(5000, 6),
+				byte[],
+				src[:15],
+			]
+			let edited = src.clone()
+			for let k = 0; k < edited.len(); k += 37 {
+				edited[k] = edited[k] ^ 0x55
+			}
+			cases.push(edited)
+			for let seed = 0; seed < 24; seed++ {
+				// Alternate copies and inserts of sizes around the 127 and
+				// 16-byte boundaries.
+				let t byte[] = []
+				let at = (seed * 977) % 100000
+				for let piece = 0; piece < 12; piece++ {
+					let copy = 10 + (seed * 31 + piece * 17) % 300
+					t = t + src[at:at + copy] + noise((seed + piece * 7) % 140, seed * 100 + piece)
+					at = (at + copy + 1000 + seed) % 140000
+				}
+				cases.push(t)
+			}
+			let index = new DeltaIndex(src)
+			for let (c, target) in cases {
+				let d = makeDelta(index, target)
+				fail "case {c}: no delta without a limit" when d is none
+				fail "case {c}: the delta does not rebuild the target" unless (try applyDelta(src, d)).equals(target)
+				// The limit is exact: a delta of n bytes passes a limit of n + 1
+				// and is refused at n.
+				let fits = makeDelta(index, target, d.len() + 1)
+				fail "case {c}: refused under a limit it fits" when fits is none
+				fail "case {c}: a limit changed the delta" unless fits.equals(d)
+				fail "case {c}: a delta of {d.len()} passed a limit of {d.len()}" unless makeDelta(index, target, d.len()) is none
+			}
+			// The first case copies most of its bytes.
+			let first = makeDelta(index, cases[0])
+			fail "first case: no delta" when first is none
+			fail "first case: {first.len()} bytes" when first.len() > 1000
+			// A source shorter than a block: inserts only.
+			let short = makeDelta(new DeltaIndex(src[:10]), src[:300])
+			fail "short source: no delta" when short is none
+			fail "short source: wrong delta" unless (try applyDelta(src[:10], short)).equals(src[:300])
+			return none
+		}
+
 		@test()
 		def indexesGitPacks() !none {
 			for let name in string["basic", "sha256"] {
