@@ -1,5 +1,5 @@
 // Git repositories, objects and transports
-@manifest(version = "0.1.0")
+@manifest(version = "0.1.1")
 library adm.dev.git {
 	use (
 		adm.dev.git
