@@ -1,0 +1,326 @@
+partial module adm.dev.github {
+	use (
+		std.net.http
+		std.net.url
+		std.proto.auth.oauth2
+		std.services.runtime::(Runtime)
+		std.time
+		adm.dev.github.api::*
+	)
+
+	// Where github.com's API is.
+	internal const publicApi = "https://api.github.com"
+
+	// Client is a client of GitHub's API as one identity. Any number of
+	// tasks may share it. `connect` makes one with a token, `connectApp`
+	// as a GitHub App, `deviceFlow` as a user who signs in.
+	//
+	// ```
+	// let gh = try github.connect(token)
+	// let repo = gh.repo("admlang", "examples")
+	// let pr = try repo.pullRequests.create("feature", "main", title = "Add geo examples")
+	// try pr.comment("Ready for review")
+	// ```
+	//
+	// Calls fail with a GitHubError: ErrorKind.Connection when GitHub
+	// cannot be reached, ErrorKind.TimedOut when a call takes longer than
+	// `timeout`, ErrorKind.RateLimited when the rate limit stays exhausted
+	// longer than `rateLimitWait`, and GitHub's answer otherwise (NotFound,
+	// Denied, Invalid, Conflict, Gone, Argument, Server), with its message.
+	partial type Client {
+		internal link Link
+
+		def new(link Link) {
+			self.link = link
+		}
+
+		// How long a call waits for an exhausted rate limit to reset before
+		// it fails; 0s fails at once.
+		rateLimitWait duration {
+			def get() duration {
+				return link.rateLimitWait
+			}
+
+			def set(given duration) {
+				link.rateLimitWait = given
+			}
+		}
+
+		// How long a call may take.
+		timeout duration {
+			def get() duration {
+				return link.timeout
+			}
+
+			def set(given duration) {
+				link.timeout = given
+			}
+		}
+
+		// The rate limit as the last answer said.
+		def limits() RateLimit {
+			return link.rateLimit()
+		}
+
+		// A repository, by its owner and name. Nothing is sent until a
+		// call is made on it.
+		def repo(owner string, name string) Repo {
+			return new Repo(link, owner, name)
+		}
+
+		// A repository by its full name, `owner/name`.
+		// Fails with ErrorKind.Argument when the name has no `/`.
+		def repo(fullName string) !Repo {
+			let slash = fullName.indexOf("/")
+			fail errorOf(ErrorKind.Argument, "github: {fullName} is not owner/name") when slash <= 0 || slash == fullName.len() - 1
+			return new Repo(link, fullName.slice(0, slash), fullName.slice(slash + 1))
+		}
+
+		// An organization, by its login.
+		def org(name string) Org {
+			return new Org(link, name)
+		}
+
+		// A user, by their login.
+		def user(login string) User {
+			return new User(link, login)
+		}
+
+		// The user the credentials belong to.
+		me Me {
+			def get() Me {
+				return new Me(link)
+			}
+		}
+
+		// asInstallation returns a Client acting as an installation of the
+		// app this Client is (`connectApp`), its token renewed a minute
+		// before it expires; limited to the repositories (names, not full
+		// names) and permissions given when any are.
+		def asInstallation(installationId int, repositories string[] = [], permissions map<string, string> = {}) Client {
+			let auth = new InstallationAuth(link, installationId, repositories, permissions)
+			return new Client(new Link(link.base, link.uploads, link.graphqlUrl, auth))
+		}
+
+		// installationFor returns a Client acting as the installation of
+		// this app on a repository.
+		// Fails with ErrorKind.NotFound when the app is not installed there,
+		// ErrorKind.Denied when this Client is not an app.
+		def installationFor(owner string, repo string) !Client {
+			let found = Installation{}
+			try link.call(http.Method.GET, "/repos/{segment(owner)}/{segment(repo)}/installation", new Params(), none, found)
+			return asInstallation(found.id)
+		}
+	}
+
+	// connect makes a Client with a token: a personal access token
+	// (classic or fine-grained), an OAuth token, an installation token, or
+	// `GITHUB_TOKEN` in Actions. With no token given it takes the
+	// environment's `GITHUB_TOKEN` (then `GH_TOKEN`), else it makes
+	// anonymous requests. `url` is a GitHub Enterprise Server
+	// (`https://ghe.example.com`); with none, `GITHUB_API_URL` (set in
+	// Actions) or github.com.
+	// Fails with ErrorKind.Argument when the URL does not read.
+	def connect(token string = "", url string = "") !Client {
+		let given = token
+		given = envText("GITHUB_TOKEN") when given == ""
+		given = envText("GH_TOKEN") when given == ""
+		let secret ?Secret<string> = none
+		secret = new Secret<string>(given) unless given == ""
+		return new Client(try linkFor(url, new TokenAuth(secret)))
+	}
+
+	// connectApp makes a Client acting as a GitHub App: requests carry a
+	// JWT signed with the app's private key (the PEM GitHub hands out),
+	// renewed before it expires. Such a Client reaches the `app` endpoints
+	// (`gh.app.listInstallations()`); `asInstallation` and
+	// `installationFor` act for one installation.
+	// Fails with ErrorKind.Argument when the key does not read or the URL
+	// does not.
+	def connectApp(appId string, privateKey string, url string = "") !Client {
+		let key = try appKey(privateKey)
+		return new Client(try linkFor(url, new AppAuth(appId, key)))
+	}
+
+	// The endpoints of github.com or of an Enterprise Server.
+	internal def linkFor(given string, auth Authenticator) !Link {
+		let chosen = given == "" ?? (envText("GITHUB_API_URL"), given)
+		let server = chosen.trimSuffix("/")
+		if server == "" || server == publicApi || server == "https://github.com" {
+			let graphql = envText("GITHUB_GRAPHQL_URL")
+			return new Link(publicApi, "https://uploads.github.com", graphql == "" ?? ("{publicApi}/graphql", graphql), auth)
+		}
+		let parsed = url.parse(server) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "github: {server} is not a URL: {err.message}", cause = err)
+		}
+		fail errorOf(ErrorKind.Argument, "github: {server} has no host") when parsed.host == ""
+		let root = "{parsed.scheme}://{parsed.host}"
+		return new Link("{root}/api/v3", "{root}/api/uploads", "{root}/api/graphql", auth)
+	}
+
+	internal def envText(name string) string {
+		let value = Runtime.getEnv(name)
+		return value is none ?? ("", value)
+	}
+
+	// DeviceFlow is an OAuth app's sign-in on a device: the user opens
+	// `verificationUri` and enters `userCode`, and `poll` waits until they
+	// have.
+	//
+	// ```
+	// let flow = try github.deviceFlow(clientId, scopes = ["repo"])
+	// print("Open {flow.verificationUri} and enter {flow.userCode}")
+	// let gh = try flow.poll()
+	// ```
+	type DeviceFlow {
+		userCode        string
+		verificationUri string
+		// When the code stops working.
+		expires         time.Time
+		internal oauth  oauth2.Client
+		internal device oauth2.DeviceAuthorization
+		internal server string
+
+		def new(oauth oauth2.Client, device oauth2.DeviceAuthorization, server string) {
+			self.oauth = oauth
+			self.device = device
+			self.server = server
+			userCode = device.userCode
+			verificationUri = device.verificationUri
+			expires = device.expiresAt
+		}
+
+		// poll waits until the user has signed in and returns a Client with
+		// their token.
+		// Fails with ErrorKind.Denied when they refused or the code
+		// expired.
+		def poll() !Client {
+			let token = oauth.poll(device) onerror (err error) {
+				fail errorOf(ErrorKind.Denied, "github: the device sign-in did not complete: {err.message}", cause = err)
+			}
+			return new Client(try linkFor(server, new TokenAuth(token.accessToken)))
+		}
+	}
+
+	// deviceFlow starts the sign-in of a user on a device for an OAuth app
+	// (or a GitHub App with the device flow on), asking for the scopes
+	// given.
+	// Fails with ErrorKind.Denied when GitHub refuses the client id or the
+	// device flow is off for it.
+	def deviceFlow(clientId string, scopes string[] = [], url string = "") !DeviceFlow {
+		let oauth = oauthClient(clientId, "", url)
+		let device = oauth.deviceAuthorization(scopes) onerror (err error) {
+			fail errorOf(ErrorKind.Denied, "github: the device sign-in did not start: {err.message}", cause = err)
+		}
+		return new DeviceFlow(oauth, device, url)
+	}
+
+	// oauthClient is the OAuth client of an app on github.com (or an
+	// Enterprise Server), for the web flow: `authorize` makes the address
+	// to send the user to, `exchange` turns the code GitHub sends back
+	// into a token for `connect`.
+	def oauthClient(clientId string, clientSecret string = "", url string = "") oauth2.Client {
+		let server = url == "" ?? ("https://github.com", url.trimSuffix("/"))
+		let metadata = new oauth2.ServerMetadata(server)
+		metadata.authorizationEndpoint = "{server}/login/oauth/authorize"
+		metadata.tokenEndpoint = "{server}/login/oauth/access_token"
+		metadata.deviceAuthorizationEndpoint = "{server}/login/device/code"
+		let oauth = new oauth2.Client(clientId, metadata)
+		oauth.secret = new Secret<string>(clientSecret) unless clientSecret == ""
+		return oauth
+	}
+
+	// Repo is a repository: its own calls (`get`, `update`, `delete`, ...)
+	// and its collections (`issues`, `pullRequests`, `releases`,
+	// `branches`, `actions`, ...).
+	partial type Repo {
+		owner         string
+		name          string
+		internal link Link
+
+		def new(link Link, owner string, name string) {
+			self.link = link
+			self.owner = owner
+			self.name = name
+		}
+
+		// `owner/name`.
+		def fullName() string {
+			return "{owner}/{name}"
+		}
+	}
+
+	// Org is an organization: its own calls and its collections.
+	partial type Org {
+		org           string
+		internal link Link
+
+		def new(link Link, org string) {
+			self.link = link
+			self.org = org
+		}
+
+		// A team of the organization, by its slug.
+		def team(slug string) OrgTeam {
+			return new OrgTeam(link, org, slug)
+		}
+	}
+
+	// OrgTeam is a team of an organization, by its slug.
+	partial type OrgTeam {
+		org           string
+		slug          string
+		internal link Link
+
+		def new(link Link, org string, slug string) {
+			self.link = link
+			self.org = org
+			self.slug = slug
+		}
+	}
+
+	// User is a user, by login.
+	partial type User {
+		login         string
+		internal link Link
+
+		def new(link Link, login string) {
+			self.link = link
+			self.login = login
+		}
+	}
+
+	// Me is the user the credentials belong to.
+	partial type Me {
+		internal link Link
+
+		def new(link Link) {
+			self.link = link
+		}
+	}
+
+	// A pull request's own calls.
+	partial type PullRequest {
+		// comment adds a comment to the pull request's conversation (an
+		// issue comment) and returns it.
+		// Fails with ErrorKind.Argument when the pull request did not come
+		// from a repository's call, and as the call does.
+		def comment(body string) !IssueComment {
+			let from = origin
+			fail errorOf(ErrorKind.Argument, "github: the pull request did not come from a repository") when from is none
+			return try new Repo(from.link, from.owner, from.name).issues.comments.create(number, body)
+		}
+	}
+
+	// An issue's own calls.
+	partial type Issue {
+		// comment adds a comment to the issue and returns it.
+		// Fails with ErrorKind.Argument when the issue did not come from a
+		// repository's call, and as the call does.
+		def comment(body string) !IssueComment {
+			let from = origin
+			fail errorOf(ErrorKind.Argument, "github: the issue did not come from a repository") when from is none
+			return try new Repo(from.link, from.owner, from.name).issues.comments.create(number, body)
+		}
+	}
+}

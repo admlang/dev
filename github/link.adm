@@ -1,0 +1,277 @@
+// The HTTP side of the client: requests to the REST API with the
+// credentials, the API version and conditional requests, the rate limit
+// read from every answer and waited for, and GitHub's errors read into
+// GitHubErrors.
+internal partial module adm.dev.github.api {
+	use (
+		std.bytes
+		std.data.encoding::(JSON, json)
+		std.net.http
+		std.time
+		adm.dev.github::*
+	)
+
+	// The API version requests name (`X-GitHub-Api-Version`).
+	const apiVersion = "2022-11-28"
+
+	// How many answers the conditional-request cache keeps.
+	const cachedAnswers = 256
+
+	// How often a request is sent again after a secondary rate limit.
+	const secondaryRetries = 3
+
+	// Authenticator hands out the `Authorization` header of a request.
+	interface Authenticator {
+		// The header value; "" for none.
+		def header() !string
+		// Called when the server refused the credentials (401), so what
+		// renews them does.
+		def refused()
+	}
+
+	// What a conditional GET keeps of an answer: its ETag and body.
+	struct CachedAnswer {
+		etag string
+		body byte[]
+	}
+
+	// Link is what a Client and its repositories, organizations and
+	// collections share: where the API is, the credentials, the rate limit
+	// and the cache of conditional requests.
+	type Link {
+		// `https://api.github.com`, or `https://host/api/v3` on GitHub
+		// Enterprise Server.
+		base                  string
+		// Where release assets are uploaded.
+		uploads               string
+		// The GraphQL endpoint.
+		graphqlUrl            string
+		credentials           Authenticator
+		// How long a call waits for an exhausted rate limit to reset
+		// before it fails with RateLimited; 0s fails at once.
+		rateLimitWait         duration                  = 15min
+		// How long a call that does not stream may take.
+		timeout               duration                  = 1min
+		userAgent             string                    = "adm.dev.github"
+		internal client       http.Client
+		internal cache        map<string, CachedAnswer> = {}
+		internal atomic limit RateLimit                 = RateLimit{}
+
+		def new(base string, uploads string, graphqlUrl string, credentials Authenticator) {
+			self.base = base
+			self.uploads = uploads
+			self.graphqlUrl = graphqlUrl
+			self.credentials = credentials
+			let transport = new http.Transport()
+			transport.maxIdlePerHost = 8
+			client = new http.Client()
+			client.transport = transport
+		}
+
+		// The rate limit as the last answer told it.
+		def rateLimit() RateLimit {
+			return limit
+		}
+
+		// call sends a request with an optional body and decodes the JSON
+		// answer onto `target` (none: the answer is dropped). `server` is
+		// "uploads" for the uploads host.
+		// Fails as `fetch` does, and with ErrorKind.Protocol when the answer
+		// does not decode.
+		def call(method http.Method, path string, query Params, body ?byte[], target ?any, media string = "application/json", server string = "") !none {
+			let data = try fetch(method, path, query, body, media, server)
+			if !(target is none) && data.len() > 0 {
+				new JSON().decode(data, target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "github: {method} {path}: the answer does not read as the API says: {err.message}", cause = err)
+				}
+			}
+			return none
+		}
+
+		// fetch sends a request and returns the answer's body.
+		// Fails with a GitHubError: Connection or TimedOut as the request
+		// fails, RateLimited when the rate limit stays exhausted longer than
+		// `rateLimitWait`, and GitHub's error for a status of 400 and above.
+		def fetch(method http.Method, path string, query Params, body ?byte[], media string = "application/json", server string = "") !byte[] {
+			let root = server == "uploads" ?? (uploads, base)
+			let target = "{root}{path}"
+			let encoded = query.encode()
+			target = "{target}?{encoded}" unless encoded == ""
+			let (data, _) = try exchange(method, target, body, media)
+			return data
+		}
+
+		// exchange sends a request to a full URL (a page's `next` link
+		// among them) and returns the body and the answer; a GET is made
+		// conditional on the ETag of the last answer to it, and a 304 hands
+		// back that answer's body.
+		// Fails as `fetch` does.
+		def exchange(method http.Method, target string, body ?byte[], media string = "application/json", accept string = "application/vnd.github+json") !(byte[], http.Response) {
+			let renewed = false
+			let secondary = 0
+			for {
+				try waitForLimit(target)
+				let req = http.newRequest(method, target, body is none ?? (none, new bytes.Reader(body))) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "github: {method} {target}: {err.message}", cause = err)
+				}
+				req.headers.set("Accept", accept)
+				req.headers.set("X-GitHub-Api-Version", apiVersion)
+				req.headers.set("User-Agent", userAgent)
+				req.headers.set("Content-Type", media) unless body is none
+				let authorization = try credentials.header()
+				req.headers.set("Authorization", authorization) unless authorization == ""
+				let cached = method == http.Method.GET ?? (cachedFor(target), none)
+				req.headers.set("If-None-Match", cached.etag) unless cached is none
+				req.deadline = time.now() + timeout when timeout > 0s
+				let res = client.do(req) onerror (err error) {
+					fail transportError(err, "{method} {target}")
+				}
+				noteLimit(res)
+				let data = res.bytes() onerror (err error) {
+					fail transportError(err, "{method} {target}")
+				}
+				res.close() onerror recover none
+				return (cached.body, res) when res.status == 304 && !(cached is none)
+				if res.status == 401 && !renewed {
+					credentials.refused()
+					renewed = true
+					continue
+				}
+				if res.status := 403 || 429 {
+					let wait = rateLimitedWait(res, data, secondary)
+					if !(wait is none) {
+						fail errorOf(ErrorKind.RateLimited, "github: {method} {target}: rate limited for {wait}; longer than rateLimitWait", res.status) when wait > rateLimitWait
+						secondary += 1
+						time.sleep(wait)
+						continue
+					}
+				}
+				fail statusError(data, res, "{method} {target}") when res.status >= 400
+				if method == http.Method.GET {
+					let etag = res.header("ETag")
+					remember(target, etag, data) unless etag == ""
+				}
+				return (data, res)
+			}
+			fail errorOf(ErrorKind.Server, "github: {method} {target}: no answer")
+		}
+
+		// Waits for an exhausted rate limit to reset, when it resets within
+		// `rateLimitWait`.
+		// Fails with ErrorKind.RateLimited when it does not.
+		internal def waitForLimit(target string) !none {
+			let known = limit
+			return none unless known.limit > 0 && known.remaining == 0
+			let reset = known.reset
+			return none when reset is none
+			let wait = reset - time.now()
+			return none when wait <= 0s
+			fail errorOf(ErrorKind.RateLimited, "github: {target}: the rate limit resets in {wait}; longer than rateLimitWait") when wait > rateLimitWait
+			time.sleep(wait)
+			return none
+		}
+
+		// Reads the rate limit an answer reports.
+		internal atomic def noteLimit(res http.Response) {
+			let total = res.header("X-RateLimit-Limit")
+			return when total == "" || !total.isNumeric()
+			let next = RateLimit{limit: total.toInt<int>(), resource: res.header("X-RateLimit-Resource")}
+			let remaining = res.header("X-RateLimit-Remaining")
+			next.remaining = remaining.toInt<int>() when remaining.isNumeric()
+			let used = res.header("X-RateLimit-Used")
+			next.used = used.toInt<int>() when used.isNumeric()
+			let reset = res.header("X-RateLimit-Reset")
+			next.reset = time.fromUnixNs(int64(reset.toInt<int>()) * 1000000000) when reset.isNumeric()
+			limit = next
+		}
+
+		internal atomic def cachedFor(target string) ?CachedAnswer {
+			return cache.get(target)
+		}
+
+		internal atomic def remember(target string, etag string, body byte[]) {
+			if !cache.hasKey(target) && cache.len() >= cachedAnswers {
+				let keys = cache.keys()
+				cache.delete(keys[0])
+			}
+			cache[target] = CachedAnswer{etag: etag, body: body}
+		}
+	}
+
+	// How long to wait before sending again a request GitHub refused for a
+	// rate limit: until the primary limit resets, or the `Retry-After` of a
+	// secondary limit (a minute when it names none); none when the refusal
+	// is not about a rate limit, or a secondary one went on too often.
+	def rateLimitedWait(res http.Response, data byte[], secondary int) ?duration {
+		if res.header("X-RateLimit-Remaining") == "0" {
+			let reset = res.header("X-RateLimit-Reset")
+			return none unless reset.isNumeric()
+			let wait = time.fromUnixNs(int64(reset.toInt<int>()) * 1000000000) - time.now()
+			return wait > 0s ?? (wait + 1s, 1s)
+		}
+		let after = res.header("Retry-After")
+		let secondaryLimit = after != "" || string(data).lower().contains("secondary rate limit")
+		return none unless secondaryLimit && secondary < secondaryRetries
+		return after.isNumeric() ?? (1s * float(after.toInt<int>()), 1min)
+	}
+
+	// The error of a failed request that got no answer.
+	def transportError(err error, about string) GitHubError {
+		return err when err is GitHubError
+		let message = err.message.lower()
+		let kind = message.contains("timeout") || message.contains("timed out") || message.contains("deadline") ?? (ErrorKind.TimedOut, ErrorKind.Connection)
+		return errorOf(kind, "github: {about}: {err.message}", cause = err)
+	}
+
+	// What GitHub writes in an error's body.
+	struct ErrorBody {
+		@json(omitempty = true)
+		message string = ""
+		@json("documentation_url", omitempty = true)
+		documentationUrl string = ""
+		@json(omitempty = true)
+		errors ValidationProblem[] = []
+	}
+
+	// The GitHubError a failed answer says.
+	def statusError(data byte[], res http.Response, about string) GitHubError {
+		let body = ErrorBody{}
+		new JSON().decode(data, body) onerror recover none
+		let message = body.message == "" ?? (string(data).trim(), body.message)
+		message = "{res.status} {res.reason}" when message == ""
+		let out = errorOf(kindOfStatus(res.status, message), "github: {about}: {message}", res.status)
+		out.problems = body.errors
+		out.documentationUrl = body.documentationUrl
+		out.requestId = res.header("X-GitHub-Request-Id")
+		return out
+	}
+
+	def kindOfStatus(status int, message string) ErrorKind {
+		switch {
+			case status == 401:
+				return ErrorKind.Denied
+			case status == 403 && message.lower().contains("rate limit"):
+				return ErrorKind.RateLimited
+			case status == 403:
+				return ErrorKind.Denied
+			case status == 404:
+				return ErrorKind.NotFound
+			case status == 409:
+				return ErrorKind.Conflict
+			case status == 410:
+				return ErrorKind.Gone
+			case status == 422:
+				return ErrorKind.Invalid
+			case status == 429:
+				return ErrorKind.RateLimited
+			case status >= 400 && status < 500:
+				return ErrorKind.Argument
+		}
+		return ErrorKind.Server
+	}
+
+	// The error of a failure of this library.
+	def errorOf(kind ErrorKind, message string, status int = 0, cause ?error = none) GitHubError {
+		return GitHubError{message: message, code: kind.value, cause: cause, kind: kind, status: status}
+	}
+}

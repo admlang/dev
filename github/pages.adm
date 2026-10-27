@@ -1,0 +1,158 @@
+partial module adm.dev.github {
+	use (
+		std.data.encoding::(JSON)
+		std.net.http
+		adm.dev.github.api::*
+	)
+
+	// Pages is a list GitHub hands out a page at a time: `all` walks every
+	// page, `page` reads one. Nothing is sent until one of them is called.
+	//
+	// ```
+	// for let issue in try repo.issues.list(state = github.State.Open).all() {
+	// 	print("#{issue.number} {issue.title}")
+	// }
+	// let newest = try repo.releases.list().page(1, size = 5)
+	// ```
+	type Pages<T> {
+		// Objects per page `all` asks for: GitHub's largest is 100.
+		pageSize        int           = 100
+		internal link   Link
+		internal path   string
+		internal query  Params
+		// The member of an answer's object that holds the list
+		// (`workflow_runs`, `items`); "" when the answer is the list.
+		internal key    string
+		internal binder ?def (T) none = none
+
+		def new(link Link, path string, query Params, key string, binder ?def (T) none = none) {
+			self.link = link
+			self.path = path
+			self.query = query
+			self.key = key
+			self.binder = binder
+		}
+
+		// page returns one page of the list: the `number`th (from 1) of
+		// `size` objects.
+		// Fails as Client's calls do.
+		def page(number int = 1, size int = 30) !T[] {
+			let (items, _, _) = try fetch(urlOf(number, size))
+			return items
+		}
+
+		// all walks every page, fetching the next as the iteration reaches
+		// it; at most `limit` objects when above 0. The first page is read
+		// at once.
+		// Fails as Client's calls do, for the first page; a later page that
+		// fails ends the iteration with its error in `failure`.
+		def all(limit int = 0) !PageStream<T> {
+			let size = limit > 0 && limit < pageSize ?? (limit, pageSize)
+			let (items, next, total) = try fetch(urlOf(1, size))
+			return new PageStream<T>(self, items, next, total, limit)
+		}
+
+		internal def urlOf(number int, size int) string {
+			let ask = query.clone()
+			ask.put("per_page", size)
+			ask.put("page", number)
+			return "{link.base}{path}?{ask.encode()}"
+		}
+
+		// One page from its URL: its objects, the next page's URL ("" for
+		// the last) and the total count when the answer has one.
+		// Fails as Client's calls do.
+		def fetch(target string) !(T[], string, int) {
+			let (data, res) = try link.exchange(http.Method.GET, target, none)
+			let codec = new JSON()
+			let items T[] = []
+			let total = -1
+			if key == "" {
+				codec.decode(data, items) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "github: GET {target}: the page is not a list: {err.message}", cause = err)
+				}
+			} else {
+				let tree = codec.parse(data) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "github: GET {target}: the page is not JSON: {err.message}", cause = err)
+				}
+				if tree is map<string, any> {
+					let count = tree.get("total_count")
+					total = count when count is int
+					let list = tree.get(key)
+					if !(list is none) {
+						codec.decode(codec.encode(list), items) onerror (err error) {
+							fail errorOf(ErrorKind.Protocol, "github: GET {target}: {key} is not a list of the objects: {err.message}", cause = err)
+						}
+					}
+				}
+			}
+			let bind = binder
+			if !(bind is none) {
+				for let item in items {
+					bind(item)
+				}
+			}
+			return (items, nextLink(res.header("Link")), total)
+		}
+	}
+
+	// PageStream is every object of a list, fetched a page at a time as
+	// the iteration needs it; `Pages.all` makes one.
+	type PageStream<T> {
+		// The failure that ended the iteration; none while it runs or when
+		// it reached the end.
+		failure         ?error   = none
+		// The number of objects GitHub says the list has, for the lists
+		// that say (searches, workflow runs); -1 for the others.
+		total           int
+		internal pages  Pages<T>
+		internal items  T[]
+		internal taken  int      = 0
+		internal next   string
+		internal limit  int
+		internal handed int      = 0
+
+		def new(pages Pages<T>, items T[], next string, total int, limit int) {
+			self.pages = pages
+			self.items = items
+			self.next = next
+			self.total = total
+			self.limit = limit
+		}
+
+		// Implements Iterator<T>: the next object; none at the end, at the
+		// limit, or when a page fails (`failure` says why).
+		def iterate() ?T {
+			return none when limit > 0 && handed >= limit
+			if taken >= items.len() {
+				return none when next == ""
+				let (more, after, _) = pages.fetch(next) onerror (err error) {
+					failure = err
+					next    = ""
+					recover (T[], "", 0)
+				}
+				items = more
+				taken = 0
+				next = after
+				return none when items.len() == 0
+			}
+			let item = items[taken]
+			taken += 1
+			handed += 1
+			return item
+		}
+	}
+
+	// The `next` URL of a `Link` header; "" when there is none.
+	internal def nextLink(header string) string {
+		for let part in header.split(",") {
+			let pieces = part.split(";")
+			continue when pieces.len() < 2
+			let target = pieces[0].trim().trimPrefix("<").trimSuffix(">")
+			for let piece in pieces[1:] {
+				return target when piece.trim() == "rel=\"next\""
+			}
+		}
+		return ""
+	}
+}

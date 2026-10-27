@@ -1,5 +1,6 @@
-// GitHub REST, GraphQL and webhooks client
-@manifest(version = "0.0.1")
+// A GitHub REST, GraphQL and webhooks client as an ADM library, over
+// std.net.http.
+@manifest(version = "0.1.0")
 library adm.dev.github {
 	use (
 		adm.dev.github

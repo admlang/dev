@@ -1,0 +1,161 @@
+// The parameters of a request: those of its query string, or the members
+// of its JSON body, each left out when the caller gave none.
+internal partial module adm.dev.github.api {
+	use (
+		std.data.encoding::(JSON)
+		std.net.url
+		std.time
+		adm.dev.github::*
+	)
+
+	// Params are a request's parameters, in the order they were put.
+	type Params {
+		internal values map<string, any> = {}
+
+		def new() {}
+
+		def put(name string, value string) {
+			values[name] = value
+		}
+
+		def put(name string, value ?string) {
+			values[name] = value unless value is none
+		}
+
+		def put(name string, value int) {
+			values[name] = value
+		}
+
+		def put(name string, value ?int) {
+			values[name] = value unless value is none
+		}
+
+		def put(name string, value float) {
+			values[name] = value
+		}
+
+		def put(name string, value ?float) {
+			values[name] = value unless value is none
+		}
+
+		def put(name string, value bool) {
+			values[name] = value
+		}
+
+		def put(name string, value ?bool) {
+			values[name] = value unless value is none
+		}
+
+		def put(name string, value time.Time) {
+			values[name] = value.str()
+		}
+
+		def put(name string, value ?time.Time) {
+			values[name] = value.str() unless value is none
+		}
+
+		def put(name string, value State) {
+			values[name] = value.value
+		}
+
+		def put(name string, value ?State) {
+			values[name] = value.value unless value is none
+		}
+
+		def put(name string, value string[]) {
+			values[name] = value unless value.len() == 0
+		}
+
+		def put(name string, value int[]) {
+			values[name] = value unless value.len() == 0
+		}
+
+		def put(name string, value any) {
+			values[name] = value unless value is none
+		}
+
+		def len() int {
+			return values.len()
+		}
+
+		// A copy, to add to without changing these.
+		def clone() Params {
+			let out = new Params()
+			out.values = values.clone()
+			return out
+		}
+
+		// The parameters as a query string, sorted by name; a list joined
+		// with commas.
+		def encode() string {
+			let query = new url.Values()
+			for let (name, value) in values {
+				query.set(name, textOf(value))
+			}
+			return query.encode()
+		}
+
+		// The parameters as a JSON object.
+		def json() byte[] {
+			return new JSON().encode(values)
+		}
+	}
+
+	// A query value as text.
+	def textOf(value any) string {
+		return value when value is string
+		if value is any[] {
+			let parts string[] = []
+			for let part in value {
+				parts.push(textOf(part))
+			}
+			return parts.join(",")
+		}
+		return "{value}"
+	}
+
+	// A path parameter as it goes in a path: escaped, its slashes kept
+	// (a file's path, a ref `heads/main`).
+	def segment(value string) string {
+		let parts string[] = []
+		for let part in value.split("/") {
+			parts.push(url.pathEscape(part))
+		}
+		return parts.join("/")
+	}
+
+	def segment(value int) string {
+		return "{value}"
+	}
+
+	// A path parameter GitHub takes as a number or a name (a workflow's id
+	// or file name).
+	def segment(value any) string {
+		return value is string ?? (segment(value), "{value}")
+	}
+
+	// A body the caller gave whole: text and bytes as they are, any other
+	// value as JSON.
+	def encodeBody(body any) byte[] {
+		return body.bytes() when body is string
+		return body when body is byte[]
+		return new JSON().encode(body)
+	}
+
+	// An answer that is an object of any members, read as JSON.
+	// Fails with ErrorKind.Protocol when it is not a JSON object.
+	def parseObject(data byte[]) !map<string, any> {
+		let parsed = try parseValue(data)
+		fail errorOf(ErrorKind.Protocol, "github: the answer is not a JSON object") unless parsed is map<string, any>
+		return parsed
+	}
+
+	// An answer that is not an object, read as JSON.
+	// Fails with ErrorKind.Protocol when it is not JSON.
+	def parseValue(data byte[]) !any {
+		return none when data.len() == 0
+		return new JSON().parse(data) onerror (err error) {
+			fail errorOf(ErrorKind.Protocol, "github: the answer is not JSON: {err.message}", cause = err)
+		}
+	}
+}

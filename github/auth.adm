@@ -1,0 +1,138 @@
+// Who requests are made as: a token, a GitHub App (a JWT it signs), or
+// one of its installations (a token the app asks for and renews).
+internal partial module adm.dev.github.api {
+	use (
+		std.crypto::(parsePKCS1PrivateKey, parsePKCS8PrivateKey)
+		std.data.encoding::(pemDecodeAll)
+		std.net.http
+		std.proto.auth.jose
+		std.time
+		adm.dev.github::*
+	)
+
+	// How long an app's JWT is valid: GitHub takes at most ten minutes.
+	const appTokenLife = 9min
+
+	// How long before its expiry an installation token is renewed.
+	const renewBefore = 1min
+
+	// A token as it is: a personal or fine-grained token, `GITHUB_TOKEN`
+	// in Actions, an OAuth user token; none for anonymous requests.
+	type TokenAuth {
+		internal token ?Secret<string>
+
+		def new(token ?Secret<string>) {
+			self.token = token
+		}
+
+		def header() !string {
+			let given = token
+			return given is none ?? ("", "Bearer {given.reveal()}")
+		}
+
+		def refused() {}
+	}
+
+	// A GitHub App's own credentials: a JWT signed with its private key,
+	// issued to its id and renewed before it expires.
+	type AppAuth {
+		appId               string
+		internal key        jose.Jwk
+		internal issued     string     = ""
+		internal issuedTill ?time.Time = none
+
+		def new(appId string, key jose.Jwk) {
+			self.appId = appId
+			self.key = key
+		}
+
+		atomic def header() !string {
+			let till = issuedTill
+			if issued == "" || till is none || time.now() + renewBefore >= till {
+				let now = time.now()
+				let claims = new jose.Claims()
+				claims.issuer = appId
+				// GitHub's clock may be a little behind.
+				claims.issuedAt = now - 1min
+				claims.expires = now + appTokenLife
+				issued = claims.sign(key, jose.SignatureAlgorithm.RS256) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "github: the app's JWT cannot be signed: {err.message}", cause = err)
+				}
+				issuedTill = now + appTokenLife
+			}
+			return "Bearer {issued}"
+		}
+
+		atomic def refused() {
+			issued = ""
+		}
+	}
+
+	// An installation of a GitHub App: a token the app asks for with its
+	// JWT, for the repositories and permissions named (all of the
+	// installation's when none), renewed a minute before it expires.
+	type InstallationAuth {
+		installationId      int
+		repositories        string[]            = []
+		permissions         map<string, string> = {}
+		internal app        Link
+		internal issued     string              = ""
+		internal issuedTill ?time.Time          = none
+
+		def new(app Link, installationId int, repositories string[], permissions map<string, string>) {
+			self.app = app
+			self.installationId = installationId
+			self.repositories = repositories
+			self.permissions = permissions
+		}
+
+		atomic def header() !string {
+			let till = issuedTill
+			try renew() when issued == "" || till is none || time.now() + renewBefore >= till
+			return "Bearer {issued}"
+		}
+
+		internal def renew() !none {
+			let body = new Params()
+			body.put("repositories", repositories)
+			body.put("permissions", permissions) when permissions.len() > 0
+			let out = InstallationToken{}
+			try app.call(http.Method.POST, "/app/installations/{installationId}/access_tokens", new Params(), body.json(), out)
+			fail errorOf(ErrorKind.Protocol, "github: the installation token came back empty") when out.token == ""
+			issued = out.token
+			issuedTill = time.parse(out.expiresAt) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "github: the installation token's expiry {out.expiresAt} does not read: {err.message}", cause = err)
+			}
+			return none
+		}
+
+		atomic def refused() {
+			issued = ""
+		}
+	}
+
+	// The signing key of an app's PEM private key (PKCS #1, as GitHub
+	// hands it out, or PKCS #8).
+	// Fails with ErrorKind.Argument when the text holds no RSA private
+	// key.
+	def appKey(pem string) !jose.Jwk {
+		let blocks = pemDecodeAll(pem) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "github: the app's private key is not PEM: {err.message}", cause = err)
+		}
+		for let block in blocks {
+			if block.kind == "RSA PRIVATE KEY" {
+				let key = parsePKCS1PrivateKey(block.bytes) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "github: the app's private key does not read: {err.message}", cause = err)
+				}
+				return new jose.Jwk(key)
+			}
+			if block.kind == "PRIVATE KEY" {
+				let key = parsePKCS8PrivateKey(block.bytes) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "github: the app's private key does not read: {err.message}", cause = err)
+				}
+				return new jose.Jwk(key)
+			}
+		}
+		fail errorOf(ErrorKind.Argument, "github: the PEM text holds no private key")
+	}
+}

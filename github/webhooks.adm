@@ -1,0 +1,151 @@
+partial module adm.dev.github {
+	use (
+		std.crypto::(constantTimeEqual)
+		std.crypto.hash::(Hash, hmac)
+		std.data.encoding::(JSON, json, hexencode)
+		std.net.http
+		adm.dev.github.api::*
+	)
+
+	// The longest webhook body taken: GitHub caps payloads at 25 MB.
+	internal const longestPayload = 25 * 1024 * 1024
+
+	// WebhookEvent is one webhook delivery: what happened (`name`, `action`), and
+	// its payload, which the accessor of its name decodes
+	// (`event.push()`, `event.pullRequest()`, ...).
+	partial type WebhookEvent {
+		// The `X-GitHub-Event` header: `push`, `pull_request`, `issues`.
+		name           string
+		// The payload's `action` (`opened`, `closed`); "" for events
+		// without one (`push`).
+		action         string = ""
+		// The delivery's id (`X-GitHub-Delivery`), the same when GitHub
+		// redelivers it.
+		delivery       string = ""
+		// The hook's id (`X-GitHub-Hook-ID`).
+		hookId         string = ""
+		// The installation the event is for, when it came to a GitHub
+		// App; 0 otherwise.
+		installationId int    = 0
+		// The payload as GitHub sent it.
+		payload        byte[] = []
+
+		def new(name string, payload byte[]) {
+			self.name = name
+			self.payload = payload
+		}
+
+		// decode reads the payload into a value of the program's (a struct
+		// of the fields it needs).
+		// Fails with ErrorKind.Protocol when it does not read as one.
+		def decode(target any) !none {
+			new JSON().decode(payload, target) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "github: the {name} payload does not read as the type: {err.message}", cause = err)
+			}
+			return none
+		}
+	}
+
+	// What every payload has that WebhookEvent lifts out of it.
+	internal struct EventHead {
+		@json(omitempty = true)
+		action string = ""
+		@json(omitempty = true)
+		installation EventInstallation = EventInstallation{}
+	}
+
+	internal struct EventInstallation {
+		@json(omitempty = true)
+		id int = 0
+	}
+
+	// Webhooks checks webhook deliveries against the hook's secret
+	// (`X-Hub-Signature-256`, HMAC-SHA256 of the body) and hands each to a
+	// function as a WebhookEvent.
+	//
+	// ```
+	// let hooks = new github.Webhooks(secret)
+	// try server.handle("/github", hooks.handler((event github.WebhookEvent) => print(event.name)))
+	// ```
+	type Webhooks {
+		internal secret string
+
+		// Deliveries signed with `secret`; "" takes them unsigned (a hook
+		// without a secret).
+		def new(secret string) {
+			self.secret = secret
+		}
+
+		// handler is an http.Handler that checks each delivery and calls
+		// `handle` with its event. A `ping` (the hook's first delivery) is
+		// answered without a call.
+		def handler(handle def (WebhookEvent) none) WebhookHandler {
+			return new WebhookHandler(self, def (event WebhookEvent) !none {
+				handle(event)
+				return none
+			})
+		}
+
+		// handler for a function that can fail: a delivery it fails on is
+		// answered 500, which GitHub shows in the hook's deliveries.
+		def handler(handle def (WebhookEvent) !none) WebhookHandler {
+			return new WebhookHandler(self, handle)
+		}
+
+		// verify checks a delivery's body against its `X-Hub-Signature-256`
+		// header (`sha256=` and hex).
+		def verify(body byte[], signature string) bool {
+			return true when secret == ""
+			return false unless signature.startsWith("sha256=")
+			let expected = "sha256=" + hexencode(hmac(Hash.SHA256, secret.bytes(), body))
+			return constantTimeEqual(expected.bytes(), signature.lower().bytes())
+		}
+
+		// event reads a delivery whose signature checked: its headers and
+		// body.
+		// Fails with ErrorKind.Argument when the body is not JSON.
+		def event(headers http.Header, body byte[]) !WebhookEvent {
+			let made = new WebhookEvent(headers.get("X-GitHub-Event"), body)
+			made.delivery = headers.get("X-GitHub-Delivery")
+			made.hookId = headers.get("X-GitHub-Hook-ID")
+			let head = EventHead{}
+			new JSON().decode(body, head) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "github: the delivery is not JSON: {err.message}", cause = err)
+			}
+			made.action = head.action
+			made.installationId = head.installation.id
+			return made
+		}
+	}
+
+	// WebhookHandler is the http.Handler `Webhooks.handler` makes: a
+	// delivery that is not a POST is answered 405, one too large 413, one
+	// whose signature does not check 401, one that is not JSON 400, one the
+	// function fails on 500, and the others 204.
+	type WebhookHandler {
+		internal hooks  Webhooks
+		internal handle def (WebhookEvent) !none
+
+		def new(hooks Webhooks, handle def (WebhookEvent) !none) {
+			self.hooks = hooks
+			self.handle = handle
+		}
+
+		// Implements http.Handler.
+		// Fails when the answer cannot be written, or the function fails on
+		// the event.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "webhook deliveries come by POST") unless ctx.method() == http.Method.POST
+			let body = try ctx.bytes()
+			return ctx.text(413, "the delivery is larger than 25 MB") when body.len() > longestPayload
+			return ctx.text(401, "the signature does not match") unless hooks.verify(body, ctx.header("X-Hub-Signature-256"))
+			let headers = ctx.request.headers
+			let event = hooks.event(headers, body) onerror (err error) {
+				return ctx.text(400, err.message)
+			}
+			return ctx.noContent() when event.name == "ping"
+			try handle(event)
+			return ctx.noContent()
+		}
+	}
+}

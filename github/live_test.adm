@@ -1,0 +1,72 @@
+// Tests against GitHub itself; without ADM_TEST_GITHUB_TOKEN and
+// ADM_TEST_GITHUB_REPO they pass without running. They open an issue in
+// the repository, comment on it and close it again, and make and delete a
+// label named `adm-test-*`.
+partial module adm.dev.github {
+	use (
+		std.crypto
+		std.testing
+	)
+
+	@env("ADM_TEST_GITHUB_TOKEN")
+	internal const liveToken string
+
+	// `owner/name` of a scratch repository the token may write to.
+	@env("ADM_TEST_GITHUB_REPO")
+	internal const liveRepo string
+
+	internal def liveName(what string) string {
+		let suffix = (crypto.rand(4) onerror recover byte[1, 2, 3, 4]).hex().lower()
+		return "adm-test-{what}-{suffix}"
+	}
+
+	check "GitHub" {
+		@test()
+		def TestLiveRepository() !none {
+			return none when liveToken == "" || liveRepo == ""
+			let gh = try connect(liveToken)
+			let repo = try gh.repo(liveRepo)
+			let read = try repo.get()
+			assert read.fullName.lower() == liveRepo.lower()
+			let limits = gh.limits()
+			assert limits.limit > 0 && limits.remaining < limits.limit
+			let issue = try repo.issues.create(liveName("issue"), body = "Opened by the adm.dev.github tests.")
+			let comment = try issue.comment("A comment of the tests.")
+			assert comment.id > 0
+			let comments = try repo.issues.comments.list(issue.number).page(1)
+			assert comments.len() == 1
+			let closed = try repo.issues.update(issue.number, state = State.Closed)
+			assert closed.state == "closed"
+			let found = try repo.issues.list(state = State.All).all(limit = 50)
+			let seen = false
+			for let listed in found {
+				seen = true when listed.number == issue.number
+			}
+			assert seen
+			let label = liveName("label")
+			try repo.labels.create(label, color = "ededed")
+			try repo.labels.delete(label)
+			return none
+		}
+
+		@test()
+		def TestLiveGraphQL() !none {
+			return none when liveToken == ""
+			let gh = try connect(liveToken)
+			let out = LiveViewer{}
+			try gh.graphql(`query { viewer { login } }`, target = out)
+			assert out.viewer.login != ""
+			let me = try gh.me.get()
+			assert me.login == out.viewer.login
+			return none
+		}
+	}
+
+	internal struct LiveViewer {
+		viewer LiveLogin = LiveLogin{}
+	}
+
+	internal struct LiveLogin {
+		login string = ""
+	}
+}

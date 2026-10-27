@@ -1,3 +1,113 @@
+// A GitHub API client: REST and GraphQL, authenticated as a token, a
+// GitHub App (its installation tokens renewed before they expire) or an
+// OAuth app's user, with pagination, conditional requests and the rate
+// limit waited for, and webhooks checked and handed out as typed events.
+// GitHub Enterprise Server is reached through its URL.
+//
+// ```adm
+// let gh = try github.connect()                     // GITHUB_TOKEN
+// let repo = gh.repo("admlang", "examples")
+// for let issue in try repo.issues.list(state = github.State.Open).all() {
+// 	print("#{issue.number} {issue.title}")
+// }
+// ```
 partial module adm.dev.github {
-	// GitHub API over std.net.http: REST and GraphQL, authentication as a token, a GitHub App (installation tokens) or an OAuth app, pagination and rate limits, webhook signature verification and typed events, GitHub Enterprise base URLs
+	use (
+		std.errors
+		std.data.encoding::(json)
+		std.time
+		adm.dev.github.api::*
+	)
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is GitHubError`.
+	enum ErrorKind {
+		// GitHub cannot be reached, or the connection broke.
+		Connection  = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut    = "timeout",
+		// An argument GitHub or the client does not take (400 and other
+		// 4xx), or credentials the client cannot read.
+		Argument    = "argument",
+		// The credentials were refused (401), or they may not do this (403).
+		Denied      = "denied",
+		// No such repository, user or object, or one the credentials may
+		// not see (404).
+		NotFound    = "notfound",
+		// The request conflicts with the object's state (409).
+		Conflict    = "conflict",
+		// The object went away (410).
+		Gone        = "gone",
+		// The request does not pass validation (422); `problems` says why.
+		Invalid     = "invalid",
+		// The rate limit is exhausted for longer than the client waits.
+		RateLimited = "ratelimited",
+		// A GraphQL query answered with errors.
+		Query       = "query",
+		// What GitHub sent is not what the API says it sends.
+		Protocol    = "protocol",
+		// GitHub failed (500 and the rest).
+		Server      = "server",
+	}
+
+	// GitHubError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct GitHubError {
+		message          string
+		code             string
+		cause            ?error
+		stack            errors.StackTrace
+		kind             ErrorKind
+		// The HTTP status GitHub answered with; 0 when the failure is not
+		// an answer of GitHub.
+		status           int
+		// What a 422 says about each field it refused.
+		problems         ValidationProblem[] = []
+		// The page of GitHub's documentation the error names.
+		documentationUrl string              = ""
+		// GitHub's id of the request, for its support.
+		requestId        string              = ""
+	}
+
+	// ValidationProblem is one reason a request did not pass validation.
+	struct ValidationProblem {
+		@json(omitempty = true)
+		resource string = ""
+		@json(omitempty = true)
+		field string = ""
+		// `missing`, `missing_field`, `invalid`, `already_exists`,
+		// `unprocessable`, `custom`.
+		@json(omitempty = true)
+		code string = ""
+		@json(omitempty = true)
+		message string = ""
+	}
+
+	// State filters issues and pull requests, and sets theirs.
+	enum State {
+		Open   = "open",
+		Closed = "closed",
+		All    = "all",
+	}
+
+	// RateLimit is how much of a rate limit is left, as the last answer
+	// said.
+	struct RateLimit {
+		// Requests allowed per window; 0 before the first answer.
+		limit     int        = 0
+		remaining int        = 0
+		used      int        = 0
+		// When the window starts again.
+		reset     ?time.Time = none
+		// `core`, `search`, `graphql`, ...
+		resource  string     = ""
+	}
+
+	// RepoRef is where an object came from: the repository its own methods
+	// call the API about.
+	internal struct RepoRef {
+		link  Link
+		owner string
+		name  string
+	}
 }

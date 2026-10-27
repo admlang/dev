@@ -1,0 +1,422 @@
+// Tests that need no GitHub: a loopback server that answers as the API
+// does, an app key made for the tests, and webhook deliveries signed
+// here.
+partial module adm.dev.github {
+	use (
+		std.bytes
+		std.crypto.hash::(Hash, hmac)
+		std.data.encoding::(hexencode)
+		std.net.http
+		std.net.http.httptest
+		std.proto.auth.jose
+		std.testing
+		std.time
+		adm.dev.github.api::*
+	)
+
+	// An answer the loopback server gives a method and path.
+	internal struct FakeAnswer {
+		status  int
+		body    string
+		headers map<string, string> = {}
+	}
+
+	// A loopback server that answers as GitHub does: the answers given for
+	// a method and path in turn (the last one again), else `body`.
+	internal type FakeGitHub {
+		// What an unanswered request gets: 200 with it, 204 when "".
+		body             string                    = "{}"
+		seen             string[]                  = []
+		paths            string[]                  = []
+		bodies           string[]                  = []
+		headers          map<string, string>[]     = []
+		internal answers map<string, FakeAnswer[]> = {}
+
+		def new() {}
+
+		def answer(key string, status int, body string, headers map<string, string> = {}) {
+			let list = answers.get(key)
+			if list is none {
+				answers[key] = [FakeAnswer{status: status, body: body, headers: headers}]
+				return
+			}
+			list.push(FakeAnswer{status: status, body: body, headers: headers})
+		}
+
+		def handle(ctx http.Context) !none {
+			let path = ctx.path()
+			let query = ctx.request.url.rawQuery
+			let method = ctx.method().value
+			seen.push("{method} {path}{query == "" ?? ("", "?" + query)}")
+			paths.push("{method} {path}")
+			bodies.push(try ctx.text())
+			let picked map<string, string> = {}
+			for let name in ["Authorization", "X-GitHub-Api-Version", "If-None-Match", "Content-Type", "Accept", "User-Agent"] {
+				picked[name] = ctx.header(name) unless ctx.header(name) == ""
+			}
+			headers.push(picked)
+			let list = answers.get("{method} {path}")
+			if list is none {
+				return ctx.noContent() when body == ""
+				ctx.setHeader("Content-Type", "application/json")
+				return ctx.text(200, body)
+			}
+			let next = list[0]
+			list.remove(0) when list.len() > 1
+			for let (name, value) in next.headers {
+				ctx.setHeader(name, value)
+			}
+			ctx.setHeader("Content-Type", "application/json")
+			return ctx.noContent(next.status) when next.status := 204 || 304
+			return ctx.text(next.status, next.body)
+		}
+
+		// Whether the last request had the method and a path that matches
+		// the pattern, `*` standing for one parameter.
+		def last(method string, pattern string) bool {
+			return false when paths.len() == 0
+			let (verb, path) = splitRequest(paths[paths.len() - 1])
+			return false unless verb == method
+			let got = path.split("/")
+			let want = pattern.split("/")
+			return false unless got.len() == want.len() || pattern.endsWith("*")
+			for let (at, part) in want {
+				return true when at == want.len() - 1 && part == "*" && got.len() >= want.len()
+				return false when at >= got.len()
+				continue when part == "*"
+				return false unless part == got[at]
+			}
+			return got.len() == want.len()
+		}
+	}
+
+	internal def splitRequest(line string) (string, string) {
+		let space = line.indexOf(" ")
+		return (line.slice(0, space), line.slice(space + 1))
+	}
+
+	internal def fakeGitHub(fake FakeGitHub) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			return try fake.handle(ctx)
+		})
+		return try httptest.Server.start(mux)
+	}
+
+	// A Client whose API, uploads and GraphQL are the loopback server.
+	internal def fakeClient(server httptest.Server, auth ?Authenticator = none) !Client {
+		let root = "http://{server.address().str()}"
+		let credentials Authenticator = auth is none ?? (new TokenAuth(new Secret<string>("test-token")), auth)
+		return new Client(new Link(root, "{root}/uploads", "{root}/graphql", credentials))
+	}
+
+	internal def kindOf(err error) ErrorKind {
+		return err.kind when err is GitHubError
+		return ErrorKind.Server
+	}
+
+	// A key made for these tests only.
+	internal const testAppKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEAteDdABwU4z8czlpIhp9PO51y/ovy51/8wlc98/L3uRb5LjF0
+YAmhLhms+f6jzHMMR7Xmha7bfr4fWaAVNYShdEfbvQd1GrY9ACYrVDPzaXImidEy
+xwmlTXlg/Slh3+OH4HGbXAC660WDhal7sSnF/QBJjkYr5lx+blkinbNJdCXdi6YH
+4MKP3siQSauZyrb3yWNwWOCeMQ/79yge7UqwKw1qdoQxlfBgiRND05RMHh7mqCRg
+KQXcJmZGMBAwhW3LePLzdWH1Zu3Ymj3eLjkg6SUgeFvFrzbj5RPKouo7anXXN6aV
+fHqnMSkXckvCyc3C5277/la5jswOddIFbRVAqwIDAQABAoIBADA3B683QoxJl1vW
+0EIr6me94hW7yO1wY0OruAc7IlOlVPJbduPcuadMdDAjwo149EjwXkeTJqnvQcVT
+LDwvSFPYltaCKxelNv+ansLoML+D3NaNKD5efr1Oj5kdRs6A9WzZARv/L44eM/MT
+jnBVSCC9WkKGtK2RWIztQUF4HWFWE/V523zeVcd8EIk5ZTqa3ov1wBK7JsFphVzZ
+MX5e4yJ93P8jd/9IhXzXnGxrpX3o9psxa+ljJszvdbZbyxlDwMXa6HOJ51071jVa
+He+jlbZ13VTNBxNTR8NheCZV57esyIag63qsdlKTgiZDzeOVwf6ShRKVGeHgDThp
+4+d4jxECgYEA3dwhTyM9/IB4f0PSkhA1RjIKV6w46yfE/6lSMvm9l+c2ZgnPKUrQ
+y6GtBB5C4fxsTtDP+F6MJ3F6almGyHlo5rvf5JYIxvKsQkQ1/jr28PNQEmA4xHP4
+JFmj2CsqoAIdZCKUtKGeW6fVgNEUm/Vn6qjSYteSK12fNBDLomXDWvECgYEA0d23
+NF8oMR4VtxrnvIrymz96dMTcjARQ1NLEcr1Xr/jLTZWVMfuPnap5yoFD6yTSdwJR
+pByfYXeJ2n/0C3zXKaGAn6kB6/XEa8GZdefJdwjHygfOEteOmKntmaIAIZdqrmZR
+5LEpPeJBV9FChl+kaKD5vnOpB+O2vhxz+W6AvVsCgYBc/xvbP0uJXxSjS/ulDDQ4
+k1swetl1ALub6w6wnWyyktGDnhL/HQQ+hyut8T1Z2uRPeUnjs0YOdou4roRH3lRx
+e0kTWSyesDQypsL3KSI/x83Flh3Vg0L9gbGjOBzq61gElFY/DQwDIWvmTj3UTd7c
+Rx3BHtl/YgQM4AlrrjpgEQKBgDX3swYHtlkzKFhm1dLZVFvx7fabLS/gaDziWlw7
+LpJ1AyrXXX919k+QKDOYHDQayviJox71sVKqH8wNfV964gW1n1LvbiwUjkc7iNAW
+I+u1WVMtwKN9xRCjGhOY4jnBK1DfxQ1vNXDRfwYrLNVLQQca5j5AleYOe87VmEk7
+TmXjAoGAfe1j+r1IGgPVeqNkJizf+sPzlC8xBu0jLItWa8tuLx5rXyEnHtA5Gg3l
+qgZ4MW0UvmKtbKXesL1HoyHhLbC25QS38m1FEBCwzvMqnrr7iM+l/wt+zGwpxe31
+GzU/+SlU9pU2QLIsT419aE9a1OmKSAm+46gPXHLqi7hwhaZ5gFs=
+-----END RSA PRIVATE KEY-----`
+
+	check "Client" {
+		@test()
+		def TestRequestsAndErrors() !none {
+			let fake = new FakeGitHub()
+			fake.answer("GET /repos/admlang/adm", 200, `{"id":1,"full_name":"admlang/adm","name":"adm","private":false,"owner":{"login":"admlang","id":2}}`)
+			fake.answer("GET /repos/admlang/missing", 404, `{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}`, {"X-GitHub-Request-Id": "AB:12"})
+			fake.answer("POST /repos/admlang/adm/issues", 422, `{"message":"Validation Failed","errors":[{"resource":"Issue","field":"title","code":"missing_field"}]}`)
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
+			let repo = try (try gh.repo("admlang/adm")).get()
+			assert repo.fullName == "admlang/adm" && repo.owner.login == "admlang"
+			assert fake.headers[0]["Authorization"] == "Bearer test-token" && fake.headers[0]["X-GitHub-Api-Version"] == "2022-11-28"
+			assert fake.headers[0]["Accept"] == "application/vnd.github+json"
+			let missing = gh.repo("admlang", "missing").get() onerror (err error) {
+				assert kindOf(err) == ErrorKind.NotFound && err.message.contains("Not Found")
+				assert err is GitHubError && err.requestId == "AB:12" && err.documentationUrl.endsWith("/rest")
+				recover FullRepository{}
+			}
+			assert missing.name == ""
+			let refused = gh.repo("admlang", "adm").issues.create("") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Invalid
+				assert err is GitHubError && err.problems.len() == 1 && err.problems[0].field == "title"
+				recover new Issue()
+			}
+			assert refused.number == 0
+			assert fake.bodies[fake.bodies.len() - 1] == `{"title":""}`
+			let bad = gh.repo("nothing") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover gh.repo("a", "b")
+			}
+			assert bad.fullName() == "a/b"
+			return none
+		}
+
+		@test()
+		def TestPullRequestsAndComments() !none {
+			let fake = new FakeGitHub()
+			fake.answer("POST /repos/admlang/examples/pulls", 201, `{"number":7,"title":"Add geo examples","state":"open","head":{"ref":"feature"},"base":{"ref":"main"}}`)
+			fake.answer("POST /repos/admlang/examples/issues/7/comments", 201, `{"id":99,"body":"Ready for review"}`)
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
+			let repo = gh.repo("admlang", "examples")
+			let pr = try repo.pullRequests.create("feature", "main", title = "Add geo examples")
+			assert pr.number == 7 && pr.title == "Add geo examples"
+			assert fake.bodies[0].contains(`"head":"feature"`) && fake.bodies[0].contains(`"base":"main"`) && fake.bodies[0].contains(`"title":"Add geo examples"`)
+			assert !fake.bodies[0].contains("draft")
+			let comment = try pr.comment("Ready for review")
+			assert comment.id == 99 && fake.bodies[1] == `{"body":"Ready for review"}`
+			let loose = new PullRequest()
+			let orphan = loose.comment("x") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover IssueComment{}
+			}
+			assert orphan.id == 0
+			return none
+		}
+
+		@test()
+		def TestPages() !none {
+			let fake = new FakeGitHub()
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let root = "http://{server.address().str()}"
+			fake.answer("GET /repos/admlang/adm/issues", 200, `[{"number":1,"title":"one"},{"number":2,"title":"two"}]`, {"Link": "<{root}/repositories/1/issues?page=2&per_page=2>; rel=\"next\", <{root}/repositories/1/issues?page=2&per_page=2>; rel=\"last\""})
+			fake.answer("GET /repositories/1/issues", 200, `[{"number":3,"title":"three"}]`)
+			fake.answer("GET /repos/admlang/adm/actions/runs", 200, `{"total_count":2,"workflow_runs":[{"id":10},{"id":11}]}`)
+			let gh = try fakeClient(server)
+			let repo = gh.repo("admlang", "adm")
+			let titles string[] = []
+			let stream = try repo.issues.list(state = State.Open, labels = "bug").all()
+			for let issue in stream {
+				titles.push(issue.title)
+				// Issues from a repository can comment.
+				assert !(issue.origin is none)
+			}
+			assert titles.len() == 3 && titles[2] == "three" && stream.failure is none
+			assert fake.seen[0] == "GET /repos/admlang/adm/issues?labels=bug&page=1&per_page=100&state=open"
+			let runs = try repo.actions.runs.list().all()
+			let ids int[] = []
+			for let run in runs {
+				ids.push(run.id)
+			}
+			assert ids.len() == 2 && runs.total == 2
+			let first = try repo.actions.runs.list().page(2, size = 5)
+			assert fake.seen[fake.seen.len() - 1].endsWith("page=2&per_page=5")
+			assert first.len() == 2
+			let limited = try repo.issues.list().all(limit = 1)
+			let count = 0
+			for let _ in limited {
+				count += 1
+			}
+			assert count == 1
+			assert nextLink("<https://x/a?page=3>; rel=\"next\"") == "https://x/a?page=3" && nextLink("") == ""
+			return none
+		}
+
+		@test()
+		def TestRateLimitsAndCache() !none {
+			let fake = new FakeGitHub()
+			let soon = "{time.now().unixNs() / 1000000000 + 1}"
+			fake.answer("GET /repos/a/b", 403, `{"message":"API rate limit exceeded"}`, {"X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": soon})
+			fake.answer("GET /repos/a/b", 429, `{"message":"You have exceeded a secondary rate limit"}`, {"Retry-After": "1"})
+			fake.answer("GET /repos/a/b", 200, `{"name":"b"}`, {"ETag": "\"v1\"", "X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "4999", "X-RateLimit-Used": "1", "X-RateLimit-Resource": "core"})
+			fake.answer("GET /repos/a/b", 304, "", {"ETag": "\"v1\""})
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
+			let started = time.now()
+			let repo = try gh.repo("a", "b").get()
+			assert repo.name == "b" && fake.seen.len() == 3 && time.now() - started >= 1s
+			let limits = gh.limits()
+			assert limits.limit == 5000 && limits.remaining == 4999 && limits.resource == "core"
+			// A conditional request: 304 hands back the cached answer.
+			let again = try gh.repo("a", "b").get()
+			assert again.name == "b" && fake.headers[3]["If-None-Match"] == "\"v1\""
+			let strict = try fakeClient(server)
+			strict.rateLimitWait = 0s
+			let wait = time.now().unixNs() / 1000000000 + 3600
+			fake.answer("GET /repos/c/d", 403, `{"message":"API rate limit exceeded"}`, {"X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "{wait}"})
+			let limited = strict.repo("c", "d").get() onerror (err error) {
+				assert kindOf(err) == ErrorKind.RateLimited
+				recover FullRepository{}
+			}
+			assert limited.name == ""
+			return none
+		}
+
+		@test()
+		def TestEnterpriseUrls() !none {
+			let ghes = try linkFor("https://ghe.example.com", new TokenAuth(none))
+			assert ghes.base == "https://ghe.example.com/api/v3" && ghes.uploads == "https://ghe.example.com/api/uploads" && ghes.graphqlUrl == "https://ghe.example.com/api/graphql"
+			let public = try linkFor("https://api.github.com", new TokenAuth(none))
+			assert public.uploads == "https://uploads.github.com"
+			return none
+		}
+	}
+
+	check "Apps" {
+		@test()
+		def TestAppAndInstallations() !none {
+			let fake = new FakeGitHub()
+			let expires = (time.now() + 1h).str()
+			fake.answer("POST /app/installations/42/access_tokens", 201, "\{\"token\":\"ghs_installation\",\"expires_at\":\"{expires}\"\}")
+			fake.answer("GET /repos/admlang/adm/installation", 200, `{"id":42,"account":{"login":"admlang"}}`)
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let key = try appKey(testAppKey)
+			let app = try fakeClient(server, new AppAuth("1234", key))
+			try app.app.authenticated()
+			let jwt = fake.headers[0]["Authorization"].trimPrefix("Bearer ")
+			let verified = try (try jose.parseJws(jwt)).verify(key.publicKey(), [jose.SignatureAlgorithm.RS256])
+			let claims = try jose.parseClaims(string(verified))
+			let issuer = claims.issuer
+			assert !(issuer is none) && issuer == "1234"
+			let installed = try app.installationFor("admlang", "adm")
+			try installed.repo("admlang", "adm").get()
+			try installed.repo("admlang", "adm").get()
+			// One token, asked for once, used for both calls.
+			let asked = fake.paths.filter(p => p == "POST /app/installations/42/access_tokens")
+			assert asked.len() == 1
+			assert fake.headers[fake.headers.len() - 1]["Authorization"] == "Bearer ghs_installation"
+			let scoped = app.asInstallation(42, repositories = ["adm"], permissions = {"contents": "read"})
+			try scoped.repo("admlang", "adm").get()
+			assert fake.bodies.filter(b => b.contains(`"repositories":["adm"]`) && b.contains(`"contents":"read"`)).len() == 1
+			let wrong = appKey("not a key") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover key
+			}
+			return none
+		}
+
+		@test()
+		def TestDeviceFlow() !none {
+			let fake = new FakeGitHub()
+			fake.answer("POST /login/device/code", 200, `{"device_code":"dc","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":900,"interval":1}`)
+			fake.answer("POST /login/oauth/access_token", 400, `{"error":"authorization_pending"}`)
+			fake.answer("POST /login/oauth/access_token", 200, `{"access_token":"gho_user","token_type":"bearer","scope":"repo"}`)
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let root = "http://{server.address().str()}"
+			let flow = try deviceFlow("client-1", scopes = ["repo"], url = root)
+			assert flow.userCode == "ABCD-1234" && flow.verificationUri == "https://github.com/login/device"
+			let gh = try flow.poll()
+			assert fake.bodies.filter(b => b.contains("device_code=dc")).len() == 2
+			assert gh.limits().limit == 0
+			return none
+		}
+	}
+
+	check "GraphQL" {
+		@test()
+		def TestQueriesAndPages() !none {
+			let fake = new FakeGitHub()
+			fake.answer("POST /graphql", 200, `{"data":{"viewer":{"login":"octocat"}}}`)
+			fake.answer("POST /graphql", 200, `{"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}`)
+			fake.answer("POST /graphql", 200, `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"c1"},"nodes":[{"number":1,"title":"a"}]}}}}`)
+			fake.answer("POST /graphql", 200, `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"c2"},"edges":[{"node":{"number":2,"title":"b"}}]}}}}`)
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
+			let out = ViewerData{}
+			try gh.graphql(`query { viewer { login } }`, target = out)
+			assert out.viewer.login == "octocat"
+			assert fake.bodies[0] == `{"query":"query { viewer { login } }"}`
+			let failed = gh.graphql(`query { repository(owner: "x", name: "y") { id } }`) onerror (err error) {
+				assert kindOf(err) == ErrorKind.Query && err.message.contains("Could not resolve")
+				recover none
+			}
+			let titles string[] = []
+			for let node in try gh.graphqlPages<IssueNode>(`query($cursor: String) { x }`, "repository.issues", {"owner": "admlang"}).all() {
+				titles.push(node.title)
+			}
+			assert titles.len() == 2 && titles[1] == "b"
+			assert fake.bodies[3].contains(`"cursor":"c1"`) && fake.bodies[3].contains(`"owner":"admlang"`)
+			return none
+		}
+	}
+
+	internal struct ViewerData {
+		viewer ViewerNode = ViewerNode{}
+	}
+
+	internal struct ViewerNode {
+		login string = ""
+	}
+
+	internal struct IssueNode {
+		number int    = 0
+		title  string = ""
+	}
+
+	check "Webhooks" {
+		@test()
+		def TestDeliveries() !none {
+			let events WebhookEvent[] = []
+			let hooks = new Webhooks("It's a Secret to Everybody")
+			let mux = new http.ServeMux()
+			try mux.handle("/github", hooks.handler((event WebhookEvent) => events.push(event)))
+			let server = try httptest.Server.start(mux)
+			defer server.close()
+			let client = server.client()
+			let target = "http://{server.address().str()}/github"
+			let payload = `{"action":"opened","number":5,"installation":{"id":77},"pull_request":{"number":5,"title":"Fix","user":{"login":"octocat"}},"repository":{"full_name":"admlang/adm"},"sender":{"login":"octocat"}}`
+			let delivered = try client.do(try signedDelivery(target, "pull_request", payload, "It's a Secret to Everybody"))
+			assert delivered.status == 204 && events.len() == 1
+			let event = events[0]
+			assert event.name == "pull_request" && event.action == "opened" && event.delivery == "d-1" && event.installationId == 77
+			let opened = try event.pullRequest()
+			fail "no payload" when opened is none
+			let pull = opened.pullRequest
+			let repository = opened.repository
+			fail "no pull request or repository" when pull is none || repository is none
+			assert opened.number == 5 && pull.title == "Fix" && repository.fullName == "admlang/adm"
+			assert try event.push() is none
+			let forged = try client.do(try signedDelivery(target, "push", payload, "wrong secret"))
+			assert forged.status == 401 && events.len() == 1
+			let ping = try client.do(try signedDelivery(target, "ping", `{"zen":"Keep it logically awesome."}`, "It's a Secret to Everybody"))
+			assert ping.status == 204 && events.len() == 1
+			// GitHub's documented example of a signature.
+			assert new Webhooks("It's a Secret to Everybody").verify("Hello, World!".bytes(), "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17")
+			return none
+		}
+	}
+
+	// A webhook delivery as GitHub sends it, signed with the secret given.
+	internal def signedDelivery(target string, name string, payload string, secret string) !http.Request {
+		let req = try http.newRequest(http.Method.POST, target, new bytes.Reader(payload.bytes()))
+		req.headers.set("Content-Type", "application/json")
+		req.headers.set("X-GitHub-Event", name)
+		req.headers.set("X-GitHub-Delivery", "d-1")
+		req.headers.set("X-Hub-Signature-256", "sha256=" + hexencode(hmac(Hash.SHA256, secret.bytes(), payload.bytes())))
+		return req
+	}
+}
