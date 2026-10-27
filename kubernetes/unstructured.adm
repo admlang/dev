@@ -1,0 +1,177 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON)
+		adm.dev.kubernetes.api::(errorOf)
+	)
+
+	// Unstructured is an object of any kind as its JSON tree: a custom
+	// resource, a kind the library has no type for, or a document of a
+	// manifest. Fields are read and set by their dotted path
+	// (`spec.replicas`, `metadata.labels.app`).
+	//
+	// ```
+	// let tabs = try cluster.objects("stable.example.com/v1", "CronTab", "shop")
+	// let tab = try tabs.get("nightly")
+	// print(tab.get("spec.cronSpec"))
+	// tab.set("spec.replicas", 2)
+	// try tabs.update(tab)
+	// ```
+	type Unstructured {
+		content map<string, any> = {}
+
+		def new() {}
+
+		def new(content map<string, any>) {
+			self.content = content
+		}
+
+		// An object with its `apiVersion`, `kind` and name set.
+		def new(apiVersion string, kind string, name string, namespace string = "") {
+			content["apiVersion"] = apiVersion
+			content["kind"] = kind
+			self.name = name
+			self.namespace = namespace unless namespace == ""
+		}
+
+		apiVersion string {
+			def get() string {
+				return text("apiVersion")
+			}
+
+			def set(given string) {
+				content["apiVersion"] = given
+			}
+		}
+
+		kind string {
+			def get() string {
+				return text("kind")
+			}
+
+			def set(given string) {
+				content["kind"] = given
+			}
+		}
+
+		// The object's `metadata.name`.
+		name string {
+			def get() string {
+				return text("metadata.name")
+			}
+
+			def set(given string) {
+				self.set("metadata.name", given)
+			}
+		}
+
+		// The object's `metadata.namespace`; empty for a kind of the whole
+		// cluster.
+		namespace string {
+			def get() string {
+				return text("metadata.namespace")
+			}
+
+			def set(given string) {
+				self.set("metadata.namespace", given)
+			}
+		}
+
+		// Implements Object: the metadata read into its type; empty when it
+		// does not read as metadata.
+		def objectMeta() ObjectMeta {
+			let out = ObjectMeta{}
+			let metadata = content.get("metadata")
+			return out when metadata is none
+			let codec = new JSON()
+			codec.decode(codec.encode(metadata), out) onerror recover none
+			return out
+		}
+
+		// get returns the value at a dotted path; none when a step of it is
+		// missing or not an object.
+		def get(path string) ?any {
+			let at any = content
+			for let step in path.split(".") {
+				return none unless at is map<string, any>
+				return none unless at.hasKey(step)
+				at = at[step]
+			}
+			return at
+		}
+
+		// text returns the string at a dotted path; "" when there is none.
+		def text(path string) string {
+			let value = get(path)
+			return value is string ?? (value, "")
+		}
+
+		// set puts a value at a dotted path, making the objects on the way.
+		def set(path string, value any) {
+			let steps = path.split(".")
+			let last = steps.len() - 1
+			let at = content
+			for let i in 0..last {
+				let next = at.get(steps[i])
+				if next is map<string, any> {
+					at = next
+				} else {
+					let made map<string, any> = {}
+					at[steps[i]] = made
+					at = made
+				}
+			}
+			at[steps[last]] = value
+		}
+
+		// remove takes the value at a dotted path away; nothing happens
+		// when there is none.
+		def remove(path string) {
+			let steps = path.split(".")
+			let last = steps.len() - 1
+			let at = content
+			for let i in 0..last {
+				let next = at.get(steps[i])
+				return unless next is map<string, any>
+				at = next
+			}
+			at.delete(steps[last])
+		}
+
+		// decode reads the object into a typed value (`Deployment`, a struct
+		// of the program's for a custom resource).
+		// Fails with ErrorKind.Argument when it does not read as one.
+		def decode(target any) !none {
+			let codec = new JSON()
+			codec.decode(codec.encode(content), target) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: the {kind} does not read as the type given: {err.message}", cause = err)
+			}
+			return none
+		}
+
+		// Implements JSONEncoder.
+		def json() byte[] {
+			return new JSON().encode(content)
+		}
+
+		// Implements JSONDecoder.
+		// Fails when the JSON is not an object.
+		def json(data byte[]) !none {
+			let parsed = try new JSON().parse(data)
+			fail errorOf(ErrorKind.Protocol, "kubernetes: an object is not a JSON object") unless parsed is map<string, any>
+			content = parsed
+			return none
+		}
+	}
+
+	// unstructured returns a typed object (or any value written as JSON)
+	// as an Unstructured.
+	// Fails with ErrorKind.Argument when it is not written as a JSON
+	// object.
+	def unstructured(object any) !Unstructured {
+		let out = new Unstructured()
+		out.json(new JSON().encode(object)) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the value is not an object: {err.message}", cause = err)
+		}
+		return out
+	}
+}

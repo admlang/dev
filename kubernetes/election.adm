@@ -1,0 +1,223 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// Cluster's leader elections.
+	partial type Cluster {
+		// leaderElection elects one leader among the programs that run it
+		// with the same lease (`coordination.k8s.io/v1` Lease) in the
+		// namespace given (the default one when none), each under an
+		// identity of its own (the pod's name).
+		def leaderElection(lease string, identity string, namespace string = "") LeaderElection {
+			return new LeaderElection(leases(namespace), lease, identity)
+		}
+	}
+
+	// LeaderElection makes one of several programs the leader, as a
+	// controller that runs in several replicas needs: the leader holds a
+	// lease and renews it; the others wait for it to expire.
+	//
+	// ```
+	// let election = cluster.leaderElection("shop-controller", identity = podName)
+	// election.onStartedLeading = def () { reconcileUntilCancelled() }
+	// election.onStoppedLeading = def () { print("no longer leading") }
+	// try election.run()          // returns once leadership is lost or `close` is called
+	// ```
+	//
+	// `onStartedLeading` runs in a task of its own once the lease is
+	// held; that task is cancelled (its `time.sleep`, awaits and socket
+	// waits return early) when leadership is lost. A leader that cannot
+	// renew within `renewDeadline` stops leading before its lease can
+	// expire for the others. Lease times are taken from this program's
+	// clock as the record was seen to change, so clocks that differ
+	// between nodes do not matter.
+	type LeaderElection {
+		// How long a lease holds without renewal: how long the others wait
+		// after the leader is gone.
+		leaseDuration        duration           = 15s
+		// How long the leader keeps trying to renew before it stops
+		// leading; shorter than `leaseDuration`.
+		renewDeadline        duration           = 10s
+		// How often a candidate tries to acquire and the leader renews.
+		retryPeriod          duration           = 2s
+		// Give the lease up when `close` is called while leading, so
+		// another takes over at once.
+		releaseOnClose       bool               = true
+		onStartedLeading     ?def () none       = none
+		onStoppedLeading     ?def () none       = none
+		// Called with the identity of each new leader, this one's too.
+		onNewLeader          ?def (string) none = none
+		// The lease's name and this candidate's identity.
+		lease                string
+		identity             string
+		internal leases      Resources<Lease>
+		internal observed    ?Lease             = none
+		internal observedAt  time.Time          = time.Time{}
+		internal leaderSeen  string             = ""
+		internal leading     bool               = false
+		internal atomic shut bool               = false
+
+		def new(leases Resources<Lease>, lease string, identity string) {
+			self.leases = leases
+			self.lease = lease
+			self.identity = identity
+		}
+
+		// The identity of the leader as last seen; "" before the first
+		// look at the lease.
+		def leader() string {
+			return leaderSeen
+		}
+
+		// Whether this candidate leads.
+		def isLeader() bool {
+			return leading
+		}
+
+		// run acquires the lease, waiting while another holds it, then
+		// leads until it cannot renew or `close` is called, and returns.
+		// Fails with ErrorKind.Argument when the durations do not fit
+		// (renewDeadline must be shorter than leaseDuration, retryPeriod
+		// shorter than renewDeadline) or the identity is empty.
+		def run() !none {
+			fail errorOf(ErrorKind.Argument, "kubernetes: a leader election needs an identity") when identity == ""
+			fail errorOf(ErrorKind.Argument, "kubernetes: renewDeadline must be shorter than leaseDuration") unless renewDeadline < leaseDuration
+			fail errorOf(ErrorKind.Argument, "kubernetes: retryPeriod must be shorter than renewDeadline") unless retryPeriod < renewDeadline
+			for !shut {
+				break when tryAcquireOrRenew()
+				time.sleep(retryPeriod)
+			}
+			return none when shut
+			leading = true
+			let work = async lead()
+			let lastRenew = time.now()
+			for !shut {
+				time.sleep(retryPeriod)
+				break when shut
+				if tryAcquireOrRenew() {
+					lastRenew = time.now()
+					continue
+				}
+				break when time.now() - lastRenew >= renewDeadline
+			}
+			leading = false
+			work.cancel("leadership lost")
+			release() when shut && releaseOnClose
+			let stopped = onStoppedLeading
+			stopped() unless stopped is none
+			return none
+		}
+
+		// What the leader runs while it leads.
+		internal def lead() {
+			let started = onStartedLeading
+			started() unless started is none
+		}
+
+		// A create or update of the lease; none when it fails for whatever
+		// reason (another candidate wrote first, the server is away).
+		internal def tryWrite(record Lease, create bool) !?Lease {
+			return try leases.create(record) when create
+			return try leases.update(record)
+		}
+
+		// Takes the lease when it is free or expired, or renews it when this
+		// candidate holds it; false when another holds it or the server
+		// cannot be reached.
+		internal def tryAcquireOrRenew() bool {
+			let now = time.now()
+			let found = leases.find(lease) onerror recover none
+			if found is none {
+				let made = new Lease()
+				made.name = lease
+				made.spec = leaseSpec(none, now)
+				let created = tryWrite(made, true) onerror recover none
+				return false when created is none
+				seen(created, now)
+				return true
+			}
+			let current Lease = found
+			seen(current, now) when observedVersion() != current.metadata.resourceVersion
+			let holder = holderOf(current)
+			let held = holder != "" && holder != identity
+			return false when held && now < observedAt + durationOf(current)
+			current.spec = leaseSpec(current, now)
+			let updated = tryWrite(current, false) onerror recover none
+			return false when updated is none
+			seen(updated, now)
+			return true
+		}
+
+		// The spec this candidate writes: the holder, its times, and a
+		// transition counted when the holder changes.
+		internal def leaseSpec(current ?Lease, now time.Time) LeaseSpec {
+			let spec = LeaseSpec{}
+			spec.holderIdentity = identity
+			spec.leaseDurationSeconds = int(leaseDuration.seconds())
+			spec.renewTime = new MicroTime(now)
+			if current is none {
+				spec.acquireTime = new MicroTime(now)
+				spec.leaseTransitions = 0
+				return spec
+			}
+			let old = current.spec
+			let transitions = old.leaseTransitions
+			let count = transitions is none ?? (0, transitions)
+			if holderOf(current) == identity {
+				spec.acquireTime = old.acquireTime
+				spec.leaseTransitions = count
+			} else {
+				spec.acquireTime = new MicroTime(now)
+				spec.leaseTransitions = count + 1
+			}
+			return spec
+		}
+
+		internal def seen(record Lease, now time.Time) {
+			observed = record
+			observedAt = now
+			let holder = holderOf(record)
+			if holder != leaderSeen {
+				leaderSeen = holder
+				let call = onNewLeader
+				call(holder) unless call is none || holder == ""
+			}
+		}
+
+		internal def observedVersion() string {
+			let record = observed
+			return record is none ?? ("", record.metadata.resourceVersion)
+		}
+
+		// Gives the lease up: no holder, a lease of one second.
+		internal def release() {
+			let record = observed
+			return when record is none || holderOf(record) != identity
+			let spec = LeaseSpec{}
+			spec.leaseDurationSeconds = 1
+			spec.renewTime = new MicroTime(time.now())
+			spec.leaseTransitions = record.spec.leaseTransitions
+			record.spec = spec
+			leases.update(record) onerror recover new Lease()
+		}
+
+		// close stops the election: a candidate stops waiting, a leader
+		// stops leading (giving the lease up with `releaseOnClose`) and
+		// `run` returns.
+		def close() {
+			shut = true
+		}
+	}
+
+	internal def holderOf(record Lease) string {
+		let holder = record.spec.holderIdentity
+		return holder is none ?? ("", holder)
+	}
+
+	internal def durationOf(record Lease) duration {
+		let seconds = record.spec.leaseDurationSeconds
+		return seconds is none ?? (15s, 1s * float(seconds))
+	}
+}

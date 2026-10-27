@@ -1,5 +1,5 @@
-// Kubernetes API client
-@manifest(version = "0.0.1")
+// A Kubernetes API client as an ADM library, over std.net.http.
+@manifest(version = "0.1.0")
 library adm.dev.kubernetes {
 	use (
 		adm.dev.kubernetes

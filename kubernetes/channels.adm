@@ -1,0 +1,235 @@
+// The streams of exec, attach and port-forward: what arrives on each
+// stream is kept until it is read, and what is written goes out on the
+// connection, a WebSocket of the `channel.k8s.io` protocols or SPDY/3.1.
+internal partial module adm.dev.kubernetes.api {
+	use (
+		std.net.http.websocket
+		std.time
+		adm.dev.kubernetes::*
+	)
+
+	// The streams of an exec or attach, by channel number (also the
+	// order of the SPDY stream types).
+	const channelStdin = 0
+	const channelStdout = 1
+	const channelStderr = 2
+	const channelError = 3
+	const channelResize = 4
+	// v5.channel.k8s.io: a message on it closes the channel its byte
+	// names.
+	const channelClose = 255
+
+	// Inbound is what arrives on one stream, kept until it is read: a
+	// stream nobody reads holds what was sent to it rather than stall the
+	// others.
+	type Inbound {
+		internal chunks  byte[][]      = []
+		internal offset  int           = 0
+		internal ended   bool          = false
+		internal failure ?error        = none
+		internal signal  channel<none>
+
+		def new() {
+			signal = new channel<none>(1)
+		}
+
+		// Keeps what arrived.
+		atomic def push(data byte[]) {
+			return when ended || data.len() == 0
+			chunks.push(data)
+			signal.offer(none)
+		}
+
+		// Marks the end of the stream: clean, or with the failure a read
+		// returns once what is kept has been read.
+		atomic def end(failure ?error = none) {
+			return when ended
+			ended = true
+			self.failure = failure
+			signal.offer(none)
+		}
+
+		atomic def isEnded() bool {
+			return ended && chunks.len() == 0
+		}
+
+		// Copies what is kept into buf: the count, 0 at the end, -1 when
+		// nothing is there yet.
+		internal atomic def take(buf byte[]) (int, ?error) {
+			if chunks.len() > 0 {
+				let first = chunks[0]
+				let count = (first.len() - offset) < buf.len() ?? (first.len() - offset, buf.len())
+				first[offset:offset + count].copy(buf[0:count])
+				offset += count
+				if offset == first.len() {
+					chunks.remove(0)
+					offset = 0
+				}
+				return (count, none)
+			}
+			return (0, failure) when ended
+			return (-1, none)
+		}
+
+		// read waits for what arrives and copies it into buf, up to its
+		// length; 0 at the end of the stream. A timeout of 0s waits as
+		// long as it takes.
+		// Fails with ErrorKind.TimedOut when nothing arrives within the
+		// timeout, and with the failure that ended the stream.
+		def read(buf byte[], timeout duration = 0s) !int {
+			return 0 when buf.len() == 0
+			let deadline = timeout > 0s ?? (time.now() + timeout, time.now())
+			for {
+				let (count, broke) = take(buf)
+				fail broke unless broke is none
+				return count when count >= 0
+				if timeout <= 0s {
+					<-signal
+					continue
+				}
+				let left = deadline - time.now()
+				fail errorOf(ErrorKind.TimedOut, "kubernetes: nothing arrived within {timeout}") when left <= 0s
+				let timer = time.sleepChan(left)
+				select {
+					case signal:
+						<-signal
+					case timer:
+						<-timer
+				}
+			}
+			return 0
+		}
+
+		// Everything until the end of the stream.
+		// Fails as `read` does.
+		def readAll() !byte[] {
+			let out byte[] = []
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			for {
+				let got = try read(buf)
+				break when got == 0
+				out.push(...buf[0:got])
+			}
+			return out
+		}
+	}
+
+	// Link is the connection the streams of an exec, an attach or a
+	// port-forward travel on.
+	interface Link {
+		// Sends data on a stream.
+		def send(stream int, data byte[]) !none
+		// Ends what this side sends on a stream; false when the protocol
+		// spoken cannot.
+		def closeSend(stream int) !bool
+		// Drops the connection; every inbound stream ends.
+		def close()
+	}
+
+	// ChannelSocket carries numbered streams over a WebSocket, one byte of
+	// channel number before each message's data: exec and attach
+	// (`v5.channel.k8s.io` down to `channel.k8s.io`) and port-forward
+	// (`v4.channel.k8s.io`, two channels a port, each opening with the
+	// port number).
+	type ChannelSocket {
+		conn                  websocket.Conn
+		protocol              string
+		// The inbound streams by channel.
+		inbound               map<int, Inbound> = {}
+		// Port-forward: the first message of each channel opens with the
+		// port it is for, two bytes little-endian, which is not data.
+		internal portPrefixed bool
+		internal prefixSeen   map<int, bool>    = {}
+		internal reading      ?(async none)     = none
+
+		def new(conn websocket.Conn, protocol string, channels int[], portPrefixed bool) {
+			self.conn = conn
+			self.protocol = protocol
+			self.portPrefixed = portPrefixed
+			for let channel in channels {
+				inbound[channel] = new Inbound()
+			}
+		}
+
+		atomic def send(stream int, data byte[]) !none {
+			let message byte[] = [byte(stream)]
+			message.push(...data)
+			try conn.writeBinary(message)
+			return none
+		}
+
+		atomic def closeSend(stream int) !bool {
+			return false unless protocol == "v5.channel.k8s.io"
+			try conn.writeBinary([byte(channelClose), byte(stream)])
+			return true
+		}
+
+		// Starts reading messages in a task of its own.
+		def start() {
+			reading = async pump()
+		}
+
+		// Reads messages and hands each to its channel until the
+		// connection ends, which ends every channel.
+		def pump() {
+			let broke ?error = none
+			for {
+				let (_, data) = conn.readMessage() onerror (err error) {
+					broke = err
+					recover (websocket.MessageType.Binary, byte[])
+				}
+				break unless broke is none
+				continue when data.len() == 0
+				let channel = int(data[0])
+				let payload = data[1:]
+				if channel == channelClose && payload.len() > 0 {
+					let target = inbound.get(int(payload[0]))
+					target.end() unless target is none
+					continue
+				}
+				let target = inbound.get(channel)
+				continue when target is none
+				if portPrefixed && !prefixSeen.hasKey(channel) {
+					continue when payload.len() < 2
+					prefixSeen[channel] = true
+					payload = payload[2:]
+				}
+				target.push(payload)
+			}
+			let ending ?error = endOf(broke)
+			for let (_, stream) in inbound {
+				stream.end(ending)
+			}
+		}
+
+		def close() {
+			conn.close() onerror recover none
+			for let (_, stream) in inbound {
+				stream.end()
+			}
+		}
+	}
+
+	// The inbound stream of a channel; an ended one when the session has
+	// none (stderr under a terminal).
+	def inboundOf(streams map<int, Inbound>, channel int) Inbound {
+		let found = streams.get(channel)
+		if found is none {
+			let made = new Inbound()
+			made.end()
+			return made
+		}
+		return found
+	}
+
+	// What ends the inbound streams when a connection ends: nothing for a
+	// clean close, else the failure.
+	def endOf(failure ?error) ?error {
+		return none when failure is none
+		if failure is websocket.WebSocketError {
+			return none when failure.kind == websocket.ErrorKind.Closed
+		}
+		return transportError(failure, "stream")
+	}
+}

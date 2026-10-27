@@ -1,0 +1,375 @@
+// The HTTP side of the client: requests to the API server with the
+// credentials and impersonation of the Config, refused credentials
+// renewed, throttled requests waited for, and the server's Status read
+// into KubernetesErrors.
+internal partial module adm.dev.kubernetes.api {
+	use (
+		std.bytes
+		std.crypto::(rand)
+		std.crypto.x509::(CertPool)
+		std.data.encoding::(JSON, base64encode)
+		std.io
+		std.net
+		std.net.http
+		std.net.http.websocket
+		std.net.tls
+		std.net.url
+		std.time
+		adm.dev.kubernetes::*
+	)
+
+	// How often a throttled request (429) is sent again before its error
+	// is returned, and the longest wait between two.
+	const throttleRetries = 5
+	const longestThrottleWait = 30s
+
+	// Core is what a Cluster and its resources, watches and streams share:
+	// the server, the credentials and the connections.
+	type Core {
+		config               Config
+		credentials          Credentials
+		// The scheme, host and port of the server, and the path the
+		// server's URL puts before every request ("" or `/k8s/clusters/c1`).
+		origin               string
+		prefix               string
+		internal transport   http.Transport
+		internal client      http.Client
+		// The client certificate the transport presents, to notice an exec
+		// plugin issuing another.
+		internal presented   string         = ""
+		internal atomic shut bool           = false
+
+		def new(config Config, credentials Credentials, origin string, prefix string, transport http.Transport) {
+			self.config = config
+			self.credentials = credentials
+			self.origin = origin
+			self.prefix = prefix
+			self.transport = transport
+			client = clientOver(transport)
+		}
+
+		// The transport requests go through, made again with the client
+		// certificate an exec plugin issued when it changed.
+		// Fails as the credentials do.
+		atomic def wire() !http.Transport {
+			fail errorOf(ErrorKind.Closed, "kubernetes: the client is closed") when shut
+			let pair = try credentials.clientPair()
+			if !(pair is none) && config.clientCertificate == "" {
+				let (cert, _) = pair
+				if cert != presented {
+					transport.closeIdle()
+					transport = try transportFor(config, pair)
+					client = clientOver(transport)
+					presented = cert
+				}
+			}
+			return transport
+		}
+
+		atomic def httpClient() !http.Client {
+			try wire()
+			return client
+		}
+
+		// send makes one request and returns the response with its body
+		// unread. `bounded` gives it the Config's timeout to finish; a
+		// stream (a watch, logs that follow) is not bounded.
+		// Fails with a KubernetesError: ErrorKind.Closed after `close`,
+		// Connection or TimedOut as the request fails, and the server's
+		// Status for a status of 400 and above.
+		def send(method http.Method, path string, query ?url.Values = none, body ?byte[] = none, contentType string = "application/json", bounded bool = true, accept string = "application/json") !http.Response {
+			let renewed = false
+			let throttled = 0
+			for {
+				let sender = try httpClient()
+				let req = try requestFor(method, path, query, body, contentType, bounded, accept)
+				let res = sender.do(req) onerror (err error) {
+					fail transportError(err, "{method} {path}")
+				}
+				if res.status == 401 && !renewed && credentials.renewable() {
+					res.close() onerror recover none
+					credentials.invalidate()
+					renewed = true
+					continue
+				}
+				if res.status == 429 && throttled < throttleRetries {
+					res.close() onerror recover none
+					throttled += 1
+					time.sleep(retryAfter(res.header("Retry-After"), throttled))
+					continue
+				}
+				return try checked(res, "{method} {path}")
+			}
+		}
+
+		// The request `send` sends.
+		def requestFor(method http.Method, path string, query ?url.Values, body ?byte[], contentType string, bounded bool, accept string) !http.Request {
+			let full = "{origin}{prefix}{path}"
+			full = "{full}?{query.encode()}" when !(query is none) && query.len() > 0
+			let payload ?io.Reader = none
+			payload = new bytes.Reader(body) unless body is none
+			let req = http.newRequest(method, full, payload) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: {method} {path}: {err.message}", cause = err)
+			}
+			req.headers.set("Content-Type", contentType) unless body is none
+			req.headers.set("Accept", accept) unless accept == ""
+			try authorize(req.headers)
+			req.deadline = time.now() + config.timeout when bounded && config.timeout > 0s
+			return req
+		}
+
+		// Puts the credentials and the impersonation on request headers.
+		// Fails as the credentials do.
+		def authorize(headers http.Header) !none {
+			let authorization = try credentials.authorization()
+			headers.set("Authorization", authorization) unless authorization == ""
+			let acting = config.impersonate
+			if !(acting is none) {
+				headers.set("Impersonate-User", acting.user) unless acting.user == ""
+				headers.set("Impersonate-Uid", acting.uid) unless acting.uid == ""
+				for let group in acting.groups {
+					headers.add("Impersonate-Group", group)
+				}
+				for let (key, values) in acting.extra {
+					for let value in values {
+						headers.add("Impersonate-Extra-{url.pathEscape(key)}", value)
+					}
+				}
+			}
+			headers.set("User-Agent", config.userAgent) unless config.userAgent == ""
+			return none
+		}
+
+		// call sends a request with an optional JSON body and decodes the
+		// JSON answer onto `target` (none: the answer is read and dropped).
+		// Fails as `send` does, and with ErrorKind.Protocol when the answer
+		// does not decode.
+		def call(method http.Method, path string, query ?url.Values = none, body ?byte[] = none, target ?any = none, contentType string = "application/json") !none {
+			let res = try send(method, path, query, body, contentType)
+			let data = res.bytes() onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+			if !(target is none) {
+				new JSON().decode(data, target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "kubernetes: {method} {path}: the answer does not read as the API says: {err.message}", cause = err)
+				}
+			}
+			return none
+		}
+
+		// raw sends a request and returns the answer's bytes.
+		// Fails as `send` does.
+		def raw(method http.Method, path string, query ?url.Values = none, body ?byte[] = none, contentType string = "application/json", accept string = "application/json") !byte[] {
+			let res = try send(method, path, query, body, contentType, accept = accept)
+			return res.bytes() onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+		}
+
+		// openWebSocket opens a WebSocket to a path of the server, offering the
+		// subprotocols given, and returns it with the one the server chose.
+		// Fails as `send` does, with the server's Status when it refuses the
+		// upgrade, and with ErrorKind.Protocol when its answer is not a
+		// WebSocket handshake.
+		def openWebSocket(path string, query url.Values, subprotocols string[]) !(websocket.Conn, string) {
+			let wired = try wire()
+			let req = try requestFor(http.Method.GET, path, query, none, "", false, "")
+			let key = base64encode(try rand(16))
+			req.headers.set("Connection", "Upgrade")
+			req.headers.set("Upgrade", "websocket")
+			req.headers.set("Sec-WebSocket-Version", "13")
+			req.headers.set("Sec-WebSocket-Key", key)
+			req.headers.set("Sec-WebSocket-Protocol", subprotocols.join(", ")) when subprotocols.len() > 0
+			req.deadline = time.now() + config.timeout when config.timeout > 0s
+			let (res, stream, rest) = wired.upgrade(req) onerror (err error) {
+				fail transportError(err, "GET {path}")
+			}
+			if res.status != 101 || res.header("Sec-WebSocket-Accept") != websocket.acceptKey(key) {
+				stream.close() onerror recover none
+				try checked(res, "GET {path}")
+				fail errorOf(ErrorKind.Protocol, "kubernetes: GET {path}: the server answered {res.status} without a WebSocket handshake", res.status)
+			}
+			let conn = new websocket.Conn(stream, rest, true)
+			let chosen = res.header("Sec-WebSocket-Protocol")
+			conn.subprotocol = chosen
+			return (conn, chosen)
+		}
+
+		// upgrade sends a request that asks to switch the connection to
+		// another protocol (SPDY/3.1) and returns the connection, the bytes
+		// read past the answer's head, and the protocol the server chose.
+		// Fails as `send` does.
+		def upgrade(method http.Method, path string, query url.Values, protocol string, streamProtocols string[]) !(net.Stream, io.Reader, string) {
+			let wired = try wire()
+			let req = try requestFor(method, path, query, none, "", false, "")
+			req.headers.set("Connection", "Upgrade")
+			req.headers.set("Upgrade", protocol)
+			for let offered in streamProtocols {
+				req.headers.add("X-Stream-Protocol-Version", offered)
+			}
+			let (res, stream, rest) = wired.upgrade(req) onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+			if res.status != 101 {
+				stream.close() onerror recover none
+				try checked(res, "{method} {path}")
+				fail errorOf(ErrorKind.Protocol, "kubernetes: {method} {path}: the server answered {res.status} where it switches to {protocol}", res.status)
+			}
+			return (stream, rest, res.header("X-Stream-Protocol-Version"))
+		}
+
+		atomic def close() {
+			shut = true
+			transport.closeIdle()
+		}
+	}
+
+	// The error of a failure of this library.
+	def errorOf(kind ErrorKind, message string, status int = 0, reason string = "", details ?StatusDetails = none, cause ?error = none) KubernetesError {
+		return KubernetesError{message: message, code: kind.value, cause: cause, kind: kind, status: status, reason: reason, details: details}
+	}
+
+	// The client every request goes through: no redirects followed and
+	// none of the client's own retries, which `send` does itself.
+	def clientOver(transport http.Transport) http.Client {
+		let client = new http.Client()
+		client.transport = transport
+		return client
+	}
+
+	// The core of a Config: its server read, its transport made.
+	// Fails with ErrorKind.Argument when the server, the CA or the client
+	// certificate does not read.
+	def newCore(config Config, from Surroundings) !Core {
+		let server = config.server.trimSuffix("/")
+		fail errorOf(ErrorKind.Argument, "kubernetes: the Config names no server") when server == ""
+		server = "https://{server}" unless server.contains("://")
+		let parsed = url.parse(server) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the server {config.server} is not a URL: {err.message}", cause = err)
+		}
+		let scheme = parsed.scheme.lower()
+		fail errorOf(ErrorKind.Argument, "kubernetes: the server {config.server} is neither http nor https") unless scheme := "http" || "https"
+		fail errorOf(ErrorKind.Argument, "kubernetes: the server {config.server} has no host") when parsed.host == ""
+		let credentials = new Credentials(config, from)
+		let pair ?(string, Secret<string>) = none
+		let key = config.clientKey
+		if config.clientCertificate != "" {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the Config has a client certificate without its key") when key is none
+			pair = (config.clientCertificate, key)
+		}
+		let transport = try transportFor(config, pair)
+		return new Core(config, credentials, "{scheme}://{parsed.host}", parsed.path.trimSuffix("/"), transport)
+	}
+
+	// A transport that verifies the server as the Config says and presents
+	// the client certificate given.
+	def transportFor(config Config, pair ?(string, Secret<string>)) !http.Transport {
+		let transport = new http.Transport()
+		transport.maxIdlePerHost = 16
+		let settings = tls.Config{serverName: config.serverName, insecureSkipVerify: config.insecureSkipVerify}
+		if config.certificateAuthority != "" {
+			let pool = new CertPool()
+			fail errorOf(ErrorKind.Argument, "kubernetes: the certificate authority holds no PEM certificate") unless pool.appendCertsFromPEM(config.certificateAuthority)
+			settings.rootCAs = pool
+		}
+		if !(pair is none) {
+			let (cert, key) = pair
+			let made = tls.parseKeyPair(cert, key.reveal()) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: the client certificate and key do not read: {err.message}", cause = err)
+			}
+			settings.certificates = [made]
+		}
+		transport.tls = settings
+		if config.proxy != "" {
+			let proxy = url.parse(config.proxy) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: the proxy {config.proxy} is not a URL: {err.message}", cause = err)
+			}
+			fail errorOf(ErrorKind.Argument, "kubernetes: the proxy {config.proxy} has no host") when proxy.host == ""
+			transport.proxy = new http.StaticProxy(proxy)
+		}
+		return transport
+	}
+
+	// The wait before a throttled request goes again: the server's
+	// `Retry-After` seconds, else a second doubling with each try.
+	def retryAfter(header string, attempt int) duration {
+		let text = header.trim()
+		let wait = text != "" && text.isNumeric() ?? (1s * float(text.toInt<int>()), 1s * float(1 << (attempt - 1)))
+		return wait > longestThrottleWait ?? (longestThrottleWait, wait)
+	}
+
+	// The error of a failed request that did not get an answer.
+	def transportError(err error, about string) KubernetesError {
+		return err when err is KubernetesError
+		let message = err.message.lower()
+		let kind = message.contains("timeout") || message.contains("timed out") || message.contains("deadline") ?? (ErrorKind.TimedOut, ErrorKind.Connection)
+		return errorOf(kind, "kubernetes: {about}: {err.message}", cause = err)
+	}
+
+	// The response when its status is below 400; else the server's error,
+	// read from the Status the body holds, or the body as text.
+	def checked(res http.Response, about string) !http.Response {
+		return res when res.status < 400
+		let data = res.bytes() onerror recover byte[]
+		res.close() onerror recover none
+		fail statusError(data, res.status, about)
+	}
+
+	// The KubernetesError a Status (or a body that is not one) says.
+	def statusError(data byte[], code int, about string) KubernetesError {
+		let status = Status{}
+		let decoded = true
+		new JSON().decode(data, status) onerror (err error) {
+			decoded = false
+			recover none
+		}
+		let message = decoded && status.message != "" ?? (status.message, string(data).trim())
+		message = "{code} {http.statusText(code)}" when message == ""
+		let reason = decoded ?? (status.reason, "")
+		let details ?StatusDetails = decoded ?? (status.details, none)
+		return errorOf(kindOfStatus(code, reason), "kubernetes: {about}: {message}", code, reason, details)
+	}
+
+	// The ErrorKind of a status and the Status's reason.
+	def kindOfStatus(code int, reason string) ErrorKind {
+		switch reason {
+			case "NotFound":
+				return ErrorKind.NotFound
+			case "AlreadyExists":
+				return ErrorKind.AlreadyExists
+			case "Conflict":
+				return ErrorKind.Conflict
+			case "Invalid":
+				return ErrorKind.Invalid
+			case "Expired", "Gone":
+				return ErrorKind.Expired
+			case "Unauthorized", "Forbidden":
+				return ErrorKind.Denied
+			case "TooManyRequests":
+				return ErrorKind.Throttled
+			case "Timeout", "ServerTimeout":
+				return ErrorKind.TimedOut
+			case "BadRequest", "MethodNotAllowed", "UnsupportedMediaType", "NotAcceptable", "RequestEntityTooLarge":
+				return ErrorKind.Argument
+		}
+		switch {
+			case code == 401 || code == 403:
+				return ErrorKind.Denied
+			case code == 404:
+				return ErrorKind.NotFound
+			case code == 409:
+				return ErrorKind.Conflict
+			case code == 410:
+				return ErrorKind.Expired
+			case code == 422:
+				return ErrorKind.Invalid
+			case code == 429:
+				return ErrorKind.Throttled
+			case code == 504:
+				return ErrorKind.TimedOut
+			case code >= 400 && code < 500:
+				return ErrorKind.Argument
+		}
+		return ErrorKind.Server
+	}
+}

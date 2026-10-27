@@ -1,0 +1,604 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON)
+		std.io
+		std.net
+		std.net.http
+		std.net.tcp
+		std.net.url
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// What `Pods.run` returns: what the command printed and how it ended.
+	struct ExecResult {
+		stdout   string
+		stderr   string
+		exitCode int
+	}
+
+	// Pods' logs, exec, attach, port-forward and eviction.
+	partial type Resources<T: Object> {
+		where T is Pod {
+			// logs returns the log of a container of a pod (its only one
+			// when none is named): the last `tail` lines when it is 0 or
+			// more, since a time ago, with each line's time when
+			// `timestamps` is set, of the container's previous run when
+			// `previous` is set, at most `limitBytes` bytes when above 0.
+			// Fails with ErrorKind.NotFound when the pod is not there,
+			// ErrorKind.Argument when it has several containers and none is
+			// named, or its container has not started.
+			def logs(name string, container string = "", tail int = -1, since ?duration = none, timestamps bool = false, previous bool = false, limitBytes int = 0) !string {
+				let query = logQuery(container, tail, since, timestamps, previous, limitBytes, false)
+				let data = try core.raw(http.Method.GET, "{try objectPath(name, namespace)}/log", query, accept = "")
+				return string(data)
+			}
+
+			// follow streams the log of a container as it is written,
+			// line by line, from the last `tail` lines when it is 0 or more:
+			// `for let line in try pods.follow("web")`. The stream ends when
+			// the container stops or the stream is closed.
+			// Fails as `logs` does.
+			def follow(name string, container string = "", tail int = -1, since ?duration = none, timestamps bool = false) !LogStream {
+				let query = logQuery(container, tail, since, timestamps, previous = false, limitBytes = 0, follow = true)
+				let res = try core.send(http.Method.GET, "{try objectPath(name, namespace)}/log", query, bounded = false, accept = "")
+				let body = res.body
+				if body is none {
+					res.close() onerror recover none
+					fail errorOf(ErrorKind.Protocol, "kubernetes: the log of {name} has no body")
+				}
+				return new LogStream(res, body)
+			}
+
+			// exec runs a command in a container of a pod (its only one when
+			// none is named) and returns its streams while it runs. With
+			// `stdin` set what is written to the session's `stdin` reaches
+			// the command; with `tty` the command gets a terminal, whose
+			// output comes on `stdout` alone, and `resize` sets its size.
+			// The session goes over a WebSocket, or SPDY/3.1 for a server
+			// that does not take one.
+			// Fails as `logs` does, and with ErrorKind.Denied when the user
+			// may not exec into the pod.
+			def exec(name string, command string[], container string = "", stdin bool = false, tty bool = false) !ExecSession {
+				fail errorOf(ErrorKind.Argument, "kubernetes: exec needs a command") when command.len() == 0
+				let query = streamQuery(container, stdin, tty)
+				for let word in command {
+					query.add("command", word)
+				}
+				return try openSession(core, "{try objectPath(name, namespace)}/exec", query, stdin, tty)
+			}
+
+			// attach connects to the main process of a container of a
+			// pod, as `exec` connects to a command. Its standard input
+			// needs `stdin: true` in the container's spec, a terminal
+			// `tty: true`.
+			// Fails as `exec` does.
+			def attach(name string, container string = "", stdin bool = false, tty bool = false) !ExecSession {
+				return try openSession(core, "{try objectPath(name, namespace)}/attach", streamQuery(container, stdin, tty), stdin, tty)
+			}
+
+			// run runs a command in a container of a pod with `input` on
+			// its standard input, waits for it to end and returns what it
+			// printed and its exit code.
+			// Fails as `exec` does, and as the session's `wait` does.
+			def run(name string, command string[], container string = "", input string = "") !ExecResult {
+				let session = try exec(name, command, container, stdin = input != "")
+				defer session.close()
+				if input != "" {
+					try session.stdin.write(input.bytes())
+					try session.stdin.close()
+				}
+				let errors = async session.stderr.readAll()
+				let out = try session.stdout.readAll()
+				let printed = await errors onerror recover byte[]
+				let code = try session.wait()
+				return ExecResult{stdout: string(out), stderr: string(printed), exitCode: code}
+			}
+
+			// portForward reaches ports of a pod from this program: each
+			// `dial` is one connection to a port of the pod, and `listen`
+			// forwards a local port to one of the pod's.
+			// Fails as `logs` does, when the pod is not there.
+			def portForward(name string) !PortForward {
+				let path = "{try objectPath(name, namespace)}/portforward"
+				return new PortForward(core, name, path)
+			}
+
+			// evict asks for a pod to be deleted the way a node drain does,
+			// so its disruption budget is respected: the eviction is refused
+			// while the budget allows no disruption.
+			// Fails with ErrorKind.Throttled when a disruption budget allows
+			// no eviction now, ErrorKind.NotFound when the pod is not there.
+			def evict(name string, gracePeriod ?duration = none) !none {
+				let eviction = Eviction{}
+				eviction.metadata.name = name
+				eviction.metadata.namespace = namespace
+				eviction.deleteOptions = deleteOptions(Propagation.Background, gracePeriod, "", "", false) unless (gracePeriod is none)
+				try core.call(http.Method.POST, "{try objectPath(name, namespace)}/eviction", none, new JSON().encode(eviction))
+				return none
+			}
+		}
+
+		where T is Deployment | StatefulSet | ReplicaSet | ReplicationController {
+			// scale sets how many replicas an object runs, through its
+			// `scale` subresource, and returns the scale as stored.
+			// Fails with ErrorKind.NotFound when the object is not there.
+			def scale(name string, replicas int) !Scale {
+				let out = Scale{}
+				let change = map<string, any>{"spec": map<string, int>{"replicas": replicas}}
+				try core.call(http.Method.PATCH, "{try objectPath(name, namespace)}/scale", none, new JSON().encode(change), out, PatchKind.Merge.value)
+				return out
+			}
+
+			// scaleOf returns the scale of an object: the replicas asked
+			// for and running, and the selector of its pods.
+			// Fails with ErrorKind.NotFound when the object is not there.
+			def scaleOf(name string) !Scale {
+				let out = Scale{}
+				try core.call(http.Method.GET, "{try objectPath(name, namespace)}/scale", target = out)
+				return out
+			}
+		}
+
+		where T is ServiceAccount {
+			// token asks for a token of a service account (its `token`
+			// subresource), for the audiences given (the API server's when
+			// none), valid for the duration asked (the server may shorten
+			// it).
+			// Fails with ErrorKind.NotFound when the account is not there.
+			def token(name string, audiences string[] = [], expiration duration = 1h) !TokenRequest {
+				let request = TokenRequest{}
+				request.spec.audiences = audiences
+				request.spec.expirationSeconds = int(expiration.seconds())
+				let out = TokenRequest{}
+				try core.call(http.Method.POST, "{try objectPath(name, namespace)}/token", none, new JSON().encode(request), out)
+				return out
+			}
+		}
+	}
+
+	internal def logQuery(container string, tail int, since ?duration, timestamps bool, previous bool, limitBytes int, follow bool) url.Values {
+		let query = new url.Values()
+		query.set("container", container) unless container == ""
+		query.set("tailLines", "{tail}") when tail >= 0
+		query.set("sinceSeconds", "{int(since.seconds()).max(1)}") unless since is none
+		query.set("timestamps", "true") when timestamps
+		query.set("previous", "true") when previous
+		query.set("limitBytes", "{limitBytes}") when limitBytes > 0
+		query.set("follow", "true") when follow
+		return query
+	}
+
+	internal def streamQuery(container string, stdin bool, tty bool) url.Values {
+		let query = new url.Values()
+		query.set("container", container) unless container == ""
+		query.set("stdin", "true") when stdin
+		query.set("stdout", "true")
+		query.set("stderr", "true") unless tty
+		query.set("tty", "true") when tty
+		return query
+	}
+
+	// LogStream is a log as it is written, for `for` line by line or
+	// `read` as bytes; `Pods.follow` makes one.
+	type LogStream {
+		// The failure that ended the stream; none while it runs, at its
+		// end, or after `close`.
+		failure           ?error        = none
+		internal response http.Response
+		internal body     io.Reader
+		internal lines    LineReader
+
+		def new(response http.Response, body io.Reader) {
+			self.response = response
+			self.body = body
+			lines = new LineReader(body)
+		}
+
+		// Implements Iterator<string>: the next line; none at the end.
+		def iterate() ?string {
+			let line = lines.next() onerror (err error) {
+				failure = err
+				recover none
+			}
+			return none when line is none
+			return string(line)
+		}
+
+		// Implements io.Reader: the bytes of the log as they come, for a
+		// reader that does not take it line by line.
+		// Fails as the connection does.
+		def read(buf byte[]) !int {
+			return try body.read(buf)
+		}
+
+		// close ends the stream.
+		def close() {
+			response.close() onerror recover none
+		}
+	}
+
+	// ExecSession is a command running in a container, as `Pods.exec` or
+	// `Pods.attach` started it: its standard streams and, once it ends,
+	// its exit code.
+	type ExecSession {
+		// The command's standard input; writes fail unless the session was
+		// opened with `stdin`.
+		stdin           StreamInput
+		// What the command prints (and its terminal, with `tty`).
+		stdout          StreamOutput
+		// What the command prints on its standard error; nothing with
+		// `tty`.
+		stderr          StreamOutput
+		// The protocol the session speaks: `v5.channel.k8s.io` or another
+		// version, over a WebSocket or SPDY.
+		protocol        string
+		internal link   Link
+		internal status Inbound
+		internal tty    bool
+
+		def new(link Link, inbound map<int, Inbound>, protocol string, input bool, tty bool) {
+			self.link = link
+			self.protocol = protocol
+			self.tty = tty
+			stdin = new StreamInput(link, channelStdin, input)
+			stdout = new StreamOutput(inboundOf(inbound, channelStdout))
+			stderr = new StreamOutput(inboundOf(inbound, channelStderr))
+			status = inboundOf(inbound, channelError)
+		}
+
+		// resize sets the size of the command's terminal, in characters.
+		// Fails with ErrorKind.Argument for a session without a terminal,
+		// and as the connection does.
+		def resize(width int, height int) !none {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the session has no terminal to resize") unless tty
+			try link.send(channelResize, "\{\"Width\":{width},\"Height\":{height}\}".bytes())
+			return none
+		}
+
+		// wait waits for the command to end and returns its exit code. Read
+		// `stdout` and `stderr` meanwhile (or before), or what the command
+		// prints is kept until the session closes.
+		// Fails with the server's Status when the command could not be run
+		// (no such program, the container stopped), and as the connection
+		// does.
+		def wait() !int {
+			let data = try status.readAll()
+			return try exitCodeOf(data, protocol)
+		}
+
+		// close drops the connection; the command goes on in the container
+		// unless closing its input ends it.
+		def close() {
+			link.close()
+		}
+	}
+
+	// StreamInput is the standard input of a session, or the sending side
+	// of a forwarded port.
+	type StreamInput {
+		internal link   Link
+		internal stream int
+		internal open   bool
+
+		def new(link Link, stream int, open bool) {
+			self.link = link
+			self.stream = stream
+			self.open = open
+		}
+
+		// Implements io.Writer.
+		// Fails with ErrorKind.Closed when the stream was not opened for
+		// input or was closed, and as the connection does.
+		def write(data byte[]) !int {
+			fail errorOf(ErrorKind.Closed, "kubernetes: the input stream is not open") unless open
+			try link.send(stream, data)
+			return data.len()
+		}
+
+		// close ends the input, which the command reads as the end of its
+		// standard input. A server that speaks a protocol older than
+		// `v5.channel.k8s.io` over a WebSocket cannot be told; the input
+		// then ends when the session does.
+		// Fails as the connection does.
+		def close() !none {
+			return none unless open
+			open = false
+			try link.closeSend(stream)
+			return none
+		}
+	}
+
+	// StreamOutput is an output stream of a session, kept until it is
+	// read.
+	type StreamOutput {
+		internal inbound Inbound
+
+		def new(inbound Inbound) {
+			self.inbound = inbound
+		}
+
+		// Implements io.Reader: what arrived, up to the buffer's length; 0
+		// at the end.
+		// Fails as the connection does.
+		def read(buf byte[]) !int {
+			return try inbound.read(buf)
+		}
+
+		// read waits at most `timeout` for what arrives.
+		// Fails with ErrorKind.TimedOut when nothing does, and as the
+		// connection does.
+		def read(buf byte[], timeout duration) !int {
+			return try inbound.read(buf, timeout)
+		}
+
+		// Everything until the stream ends.
+		// Fails as the connection does.
+		def readAll() !byte[] {
+			return try inbound.readAll()
+		}
+	}
+
+	// The exit code a session's error stream says: 0 for Success, the
+	// code a NonZeroExitCode failure carries.
+	internal def exitCodeOf(data byte[], protocol string) !int {
+		let text = string(data).trim()
+		return 0 when text == ""
+		// Before v4 the stream carried the error as text, and nothing for
+		// success.
+		fail errorOf(ErrorKind.Server, "kubernetes: exec: {text}") unless protocol := "v4.channel.k8s.io" || "v5.channel.k8s.io"
+		let status = Status{}
+		new JSON().decode(data, status) onerror (err error) {
+			fail errorOf(ErrorKind.Protocol, "kubernetes: exec: the status does not read: {err.message}", cause = err)
+		}
+		return 0 when status.status == "Success"
+		if status.reason == "NonZeroExitCode" {
+			let details = status.details
+			if !(details is none) {
+				for let cause in details.causes {
+					return cause.message.toInt<int>() when cause.reason == "ExitCode" && cause.message.isNumeric()
+				}
+			}
+		}
+		fail errorOf(kindOfStatus(status.code, status.reason), "kubernetes: exec: {status.message}", status.code, status.reason, status.details)
+	}
+
+	// PortForward reaches the ports of one pod; `Pods.portForward` makes
+	// one.
+	type PortForward {
+		// The pod's name.
+		pod           string
+		internal core Core
+		internal path string
+		internal spdy ?SpdyForward = none
+
+		def new(core Core, pod string, path string) {
+			self.core = core
+			self.pod = pod
+			self.path = path
+		}
+
+		// dial opens one connection to a port of the pod.
+		// Fails as Cluster's calls do, and with the kubelet's error when
+		// nothing in the pod listens on the port.
+		def dial(port int) !ForwardedStream {
+			fail errorOf(ErrorKind.Argument, "kubernetes: port {port} is not a port") when port <= 0 || port > 65535
+			if spdy is none {
+				let query = new url.Values()
+				query.set("ports", "{port}")
+				let opened = try dialChannels(core, path, query, ["v4.channel.k8s.io"])
+				if !(opened is none) {
+					let (conn, protocol) = opened
+					let socket = new ChannelSocket(conn, protocol, [0, 1], true)
+					socket.start()
+					return new ForwardedStream(socket, inboundOf(socket.inbound, 0), inboundOf(socket.inbound, 1), port, true)
+				}
+			}
+			let known = spdy
+			let forwarding = known is none ?? (try openSpdyForward(core, path), known)
+			spdy = forwarding
+			let (data, errors) = try forwarding.stream(port)
+			return new ForwardedStream(forwarding.link, data.inbound, errors.inbound, port, false, data.id, errors.id)
+		}
+
+		// listen forwards a local port (one the system picks for 0) to a
+		// port of the pod until `close`: each connection made to it is a
+		// `dial` of its own.
+		// Fails as Cluster's calls do, and when the local port cannot be
+		// listened on.
+		def listen(port int, localPort int = 0, address string = "127.0.0.1") !PortListener {
+			let server = new tcp.Server("{address}:{localPort}")
+			server.start() onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: cannot listen on {address}:{localPort}: {err.message}", cause = err)
+			}
+			let listener = new PortListener(self, server, port)
+			listener.serving = async listener.serve()
+			return listener
+		}
+
+		// close drops the connection a server that speaks SPDY shares among
+		// the forwarded streams.
+		def close() {
+			let forwarding = spdy
+			spdy = none
+			forwarding.close() unless forwarding is none
+		}
+	}
+
+	// ForwardedStream is one connection to a port of a pod, as a
+	// `net.Stream`.
+	type ForwardedStream {
+		// The pod's port.
+		port             int
+		internal link    Link
+		internal data    Inbound
+		internal errors  Inbound
+		internal own     bool
+		internal dataId  int
+		internal errorId int
+		internal shut    bool    = false
+
+		def new(link Link, data Inbound, errors Inbound, port int, own bool, dataId int = 0, errorId int = 1) {
+			self.link = link
+			self.data = data
+			self.errors = errors
+			self.port = port
+			self.own = own
+			self.dataId = dataId
+			self.errorId = errorId
+		}
+
+		// Implements net.Stream: what the pod's port sent, 0 at its end.
+		// Fails with the kubelet's error when the forward broke, and with
+		// ErrorKind.TimedOut when nothing arrives within the timeout.
+		def read(buf byte[], timeout duration) !int {
+			let got = try data.read(buf, timeout)
+			return got unless got == 0
+			let reported = string(errors.readAll() onerror recover byte[]).trim()
+			fail errorOf(ErrorKind.Connection, "kubernetes: port {port}: {reported}") unless reported == ""
+			return 0
+		}
+
+		// Implements io.Reader: what the pod's port sent, 0 at its end.
+		// Fails as the read with a timeout does, without the timeout.
+		def read(buf byte[]) !int {
+			return try read(buf, 0s)
+		}
+
+		// Implements net.Stream.
+		// Fails with ErrorKind.Closed after `close`, and as the connection
+		// does.
+		def write(buf byte[], timeout duration) !int {
+			fail errorOf(ErrorKind.Closed, "kubernetes: the forwarded stream is closed") when shut
+			try link.send(dataId, buf)
+			return buf.len()
+		}
+
+		// Implements io.Writer.
+		// Fails as the write with a timeout does.
+		def write(buf byte[]) !int {
+			return try write(buf, 0s)
+		}
+
+		// Implements net.Stream: whether the stream is open both ways.
+		def isOpen() bool {
+			return !shut && !data.isEnded()
+		}
+
+		// Implements net.Stream: ends the connection to the pod's port.
+		// Never fails; a connection that broke is closed all the same.
+		def close() !none {
+			return none when shut
+			shut = true
+			if own {
+				link.close()
+			} else {
+				link.closeSend(dataId) onerror recover false
+				link.closeSend(errorId) onerror recover false
+			}
+			data.end()
+			return none
+		}
+	}
+
+	// PortListener forwards a local port to a port of a pod until it is
+	// closed; `PortForward.listen` makes one.
+	type PortListener {
+		// The local port connections are made to.
+		localPort            int
+		// The pod's port.
+		port                 int
+		// The failure that stopped the listener; none while it runs.
+		failure              ?error        = none
+		internal forward     PortForward
+		internal server      tcp.Server
+		internal serving     ?(async none) = none
+		internal atomic shut bool          = false
+
+		def new(forward PortForward, server tcp.Server, port int) {
+			self.forward = forward
+			self.server = server
+			self.port = port
+			localPort = server.address().port
+		}
+
+		// Takes connections until closed, each piped to a stream of its own.
+		def serve() {
+			for !shut {
+				let conn = acceptNext() onerror (err error) {
+					failure = err unless shut
+					recover none
+				}
+				break when conn is none
+				let accepted net.Connection = conn
+				async pipe(accepted)
+			}
+		}
+
+		internal def acceptNext() !?net.Connection {
+			return try server.accept()
+		}
+
+		internal def dialNext() !?ForwardedStream {
+			return try forward.dial(port)
+		}
+
+		internal def pipe(conn net.Connection) {
+			let stream = dialNext() onerror (err error) {
+				conn.close() onerror recover none
+				recover none
+			}
+			return when stream is none
+			let remote ForwardedStream = stream
+			let outbound = async copyTo(conn, remote)
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			for {
+				let got = remote.read(buf) onerror recover 0
+				break when got <= 0
+				net.writeAll(conn, buf[0:got]) onerror (err error) {
+					remote.close() onerror recover none
+					recover none
+				}
+			}
+			conn.close() onerror recover none
+			await outbound
+			remote.close() onerror recover none
+		}
+
+		internal def copyTo(conn net.Connection, remote ForwardedStream) {
+			let buf byte[] = []
+			buf.len(32 * 1024)
+			for {
+				let got = readWaiting(conn, buf) onerror recover 0
+				break when got <= 0
+				remote.write(buf[0:got]) onerror (err error) {
+					recover 0
+				}
+			}
+			remote.close() onerror recover none
+		}
+
+		// close stops taking connections; those taken go on until either
+		// end closes them.
+		def close() {
+			shut = true
+			server.close() onerror recover none
+		}
+	}
+
+	// Opens the streams of an exec or an attach: over a WebSocket, else
+	// SPDY when the server does not take one.
+	// Fails as Cluster's calls do.
+	internal def openSession(core Core, path string, query url.Values, stdin bool, tty bool) !ExecSession {
+		let opened = try dialChannels(core, path, query, ["v5.channel.k8s.io", "v4.channel.k8s.io"])
+		if !(opened is none) {
+			let (conn, protocol) = opened
+			let socket = new ChannelSocket(conn, protocol, [channelStdout, channelStderr, channelError], false)
+			socket.start()
+			return new ExecSession(socket, socket.inbound, protocol, stdin, tty)
+		}
+		let spdy = try openSpdyExec(core, path, query, stdin, tty)
+		return new ExecSession(spdy.link, spdy.inbound, spdy.protocol, stdin, tty)
+	}
+}

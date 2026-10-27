@@ -1,3 +1,160 @@
+// A Kubernetes API client: the API server reached with the credentials a
+// kubeconfig or a pod carries, its resources typed (the core, apps, batch,
+// networking, rbac, storage, autoscaling, policy and coordination groups)
+// or unstructured (custom resources), list and watch with an informer that
+// keeps a local copy in step, server-side apply, the logs, exec, attach and
+// port-forward streams of pods, leader election on a lease, and manifests
+// of several YAML or JSON documents.
+//
+// ```adm
+// let cluster = try kubernetes.connect()
+// for let pod in try cluster.pods("shop").list(labels = "app=web") {
+// 	print("{pod.name} {pod.status.phase}")
+// }
+// try cluster.deployments("shop").scale("web", 3)
+// ```
 partial module adm.dev.kubernetes {
-	// Kubernetes API over std.net.http: kubeconfig (contexts, tokens, client certificates, exec plugins), in-cluster configuration, typed core resources and unstructured objects for custom resources, list and watch with bookmarks, server-side apply, logs, exec and port-forward, leader election
+	use (
+		std.data.encoding::(JSON)
+		std.errors
+		std.time
+		adm.dev.kubernetes.api::(errorOf)
+	)
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is KubernetesError`.
+	enum ErrorKind {
+		// The API server cannot be reached, or the connection broke.
+		Connection    = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut      = "timeout",
+		// The client, a watch, an informer or a stream was closed.
+		Closed        = "closed",
+		// An argument the client or the server does not take (400), or a
+		// kubeconfig, a manifest or a credential the client cannot read.
+		Argument      = "argument",
+		// The server refused the credentials (401) or the request (403),
+		// or a credential plugin failed.
+		Denied        = "denied",
+		// No such object, namespace or kind (404).
+		NotFound      = "notfound",
+		// An object of that name is there already (409 AlreadyExists).
+		AlreadyExists = "exists",
+		// The object changed since it was read, or a field manager owns a
+		// field an apply sets (409 Conflict).
+		Conflict      = "conflict",
+		// The object does not pass the server's validation (422).
+		Invalid       = "invalid",
+		// The resource version asked for is older than the server keeps
+		// (410): list again and watch from there.
+		Expired       = "expired",
+		// The server asks for fewer requests (429).
+		Throttled     = "throttled",
+		// What the server sent is not what the API says it sends.
+		Protocol      = "protocol",
+		// The server failed (500 and the rest).
+		Server        = "server",
+	}
+
+	// KubernetesError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct KubernetesError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorKind
+		// The HTTP status the server answered with; 0 when the failure is
+		// not an answer of the server.
+		status  int
+		// The server's machine-readable reason (`NotFound`, `AlreadyExists`,
+		// `Conflict`, `Invalid`, `Expired`, ...); empty when it gave none.
+		reason  string
+		// What the server said about the object, the invalid fields
+		// among it; none when it said nothing.
+		details ?StatusDetails
+	}
+
+	// Object is what every kind of the API has: the metadata naming it.
+	// The typed kinds and Unstructured implement it.
+	interface Object {
+		def objectMeta() ObjectMeta
+	}
+
+	// IntOrString is a value the API takes as a number or as a name: a
+	// container port given as `8080` or `"http"`, a rollout bound as `1` or
+	// `"25%"`.
+	type IntOrString {
+		number int    = 0
+		text   string = ""
+		// Whether the value is `text`; else it is `number`.
+		isText bool   = false
+
+		def new() {}
+
+		def new(number int) {
+			self.number = number
+		}
+
+		def new(text string) {
+			self.text = text
+			isText = true
+		}
+
+		// The value as written in a manifest.
+		def str() string {
+			return isText ?? (text, "{number}")
+		}
+
+		// Implements JSONEncoder: a JSON number or string.
+		def json() byte[] {
+			return isText ?? (new JSON().encode(text), "{number}".bytes())
+		}
+
+		// Implements JSONDecoder.
+		// Fails when the JSON is neither a number nor a string.
+		def json(data byte[]) !none {
+			let value = try new JSON().parse(data)
+			if value is string {
+				text = value
+				isText = true
+				return none
+			}
+			fail errorOf(ErrorKind.Protocol, "kubernetes: {string(data)} is neither a number nor a string") unless value is int
+			number = value
+			isText = false
+			return none
+		}
+	}
+
+	// MicroTime is an instant the API keeps to the microsecond: a lease's
+	// renewal, an event's time. It travels as RFC 3339 with six digits of
+	// fraction, which is the only form the API server reads for it.
+	type MicroTime {
+		at time.Time = time.Time{}
+
+		def new() {}
+
+		def new(at time.Time) {
+			self.at = at
+		}
+
+		// RFC 3339 with six digits of fraction, in UTC:
+		// `2026-10-27T09:15:02.250000Z`.
+		def str() string {
+			return "%04d-%02d-%02dT%02d:%02d:%02d.%06dZ".format(at.year(), at.month(), at.day(), at.hour(), at.minute(), at.second(), at.nanosecond() / 1000)
+		}
+
+		// Implements JSONEncoder.
+		def json() byte[] {
+			return "\"{str()}\"".bytes()
+		}
+
+		// Implements JSONDecoder.
+		// Fails when the JSON is not an RFC 3339 string.
+		def json(data byte[]) !none {
+			try at.json(data)
+			return none
+		}
+	}
 }

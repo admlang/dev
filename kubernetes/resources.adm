@@ -1,0 +1,331 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON, json)
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// How many objects `list` asks for per page.
+	internal const listPageSize = 500
+
+	// The field manager writes name when the program names none.
+	internal const defaultFieldManager = "adm.dev.kubernetes"
+
+	// PatchKind is the form a patch is written in.
+	enum PatchKind {
+		// RFC 6902: a list of operations (`[{"op": "replace", ...}]`).
+		Json      = "application/json-patch+json",
+		// RFC 7386: the fields to set, `null` for those to remove; lists
+		// are replaced whole.
+		Merge     = "application/merge-patch+json",
+		// Like Merge, but lists the API marks as keyed by a field (the
+		// containers of a pod by name) are merged entry by entry. Typed
+		// kinds only: custom resources do not take it.
+		Strategic = "application/strategic-merge-patch+json",
+	}
+
+	// Propagation says what happens to the objects an object owns when it
+	// is deleted.
+	enum Propagation {
+		// They are left, without the owner reference.
+		Orphan     = "Orphan",
+		// The object goes at once; the garbage collector deletes them after.
+		Background = "Background",
+		// The object stays, marked deleted, until they are gone.
+		Foreground = "Foreground",
+	}
+
+	// ListOf is one page of a list: the objects and where the next page
+	// starts.
+	type ListOf<T> {
+		@json(omitempty = true)
+		apiVersion string = ""
+		@json(omitempty = true)
+		kind string = ""
+		metadata ListMeta = ListMeta{}
+		items T[] = []
+
+		// The token the next page starts from; "" on the last page.
+		def continueToken() string {
+			return metadata.continueToken
+		}
+	}
+
+	// Resources is the objects of one kind, in one namespace for a kind
+	// that lives in namespaces (`cluster.pods("shop")`), or of the whole
+	// cluster (`cluster.nodes()`). `inAllNamespaces` reads every namespace
+	// at once.
+	//
+	// Writes take the namespace of the object when it names one, else this
+	// view's. `dryRun` writes are checked and answered as the server would
+	// store them, without being stored. `fieldManager` names the writer in
+	// the object's managed fields; "" sends none for creates, updates and
+	// patches, and "adm.dev.kubernetes" for applies, which need one.
+	//
+	// Calls fail as Cluster's do.
+	partial type Resources<T: Object> {
+		kind          ResourceKind
+		// "" for a kind of the whole cluster, or a view of every namespace.
+		namespace     string
+		internal core Core
+
+		def new(core Core, kind ResourceKind, namespace string) {
+			self.core = core
+			self.kind = kind
+			self.namespace = namespace
+		}
+
+		// The same kind in another namespace.
+		def within(namespace string) Resources<T> {
+			return new Resources<T>(core, kind, namespace)
+		}
+
+		// The same kind across every namespace, for reading: lists and
+		// watches see all of them, and writes need objects that name their
+		// namespace.
+		def inAllNamespaces() Resources<T> {
+			return new Resources<T>(core, kind, "")
+		}
+
+		// get returns an object by name.
+		// Fails with ErrorKind.NotFound when there is none.
+		def get(name string) !T {
+			let out = new T()
+			try core.call(http.Method.GET, try objectPath(name, namespace), target = out)
+			return out
+		}
+
+		// find returns an object by name; none when there is none.
+		// Fails as Cluster's calls do, except for NotFound.
+		def find(name string) !?T {
+			let missing = false
+			let out = get(name) onerror (err error) {
+				fail err unless err is KubernetesError && err.kind == ErrorKind.NotFound
+				missing = true
+				recover new T()
+			}
+			return none when missing
+			return out
+		}
+
+		// list returns the objects that match the selectors, every page of
+		// them, or the first `limit` when it is above 0. `labels` is a label
+		// selector (`app=web,tier in (front, back),!canary`), `fields` a
+		// field selector (`status.phase=Running`, `spec.nodeName=n1`).
+		// Fails as Cluster's calls do, with ErrorKind.Expired when the list
+		// changed so much between two pages that the server dropped the
+		// first.
+		def list(labels string = "", fields string = "", limit int = 0) !T[] {
+			let out T[] = []
+			let token = ""
+			for {
+				let size = limit > 0 ?? ((limit - out.len()).min(listPageSize), listPageSize)
+				let found = try page(labels, fields, size, token)
+				out.push(...found.items)
+				token = found.continueToken()
+				break when token == "" || (limit > 0 && out.len() >= limit)
+			}
+			return out
+		}
+
+		// page returns one page of a list: at most `limit` objects (0: all
+		// of them), from where `continueToken` (the last page's) says.
+		// `resourceVersion` reads the list as it was at a version the
+		// server still holds ("" for the newest, "0" for whatever its cache
+		// has).
+		// Fails as `list` does.
+		def page(labels string = "", fields string = "", limit int = 0, continueToken string = "", resourceVersion string = "") !ListOf<T> {
+			let query = selectors(labels, fields)
+			query.set("limit", "{limit}") when limit > 0
+			query.set("continue", continueToken) unless continueToken == ""
+			query.set("resourceVersion", resourceVersion) unless resourceVersion == ""
+			let out = new ListOf<T>()
+			try core.call(http.Method.GET, try collectionPath(namespace), query, target = out)
+			return out
+		}
+
+		// create stores a new object and returns it as stored.
+		// Fails with ErrorKind.AlreadyExists when an object of its name is
+		// there, ErrorKind.Invalid when it does not pass validation.
+		def create(object T, dryRun bool = false, fieldManager string = "") !T {
+			let out = new T()
+			let path = try collectionPath(namespaceOf(object))
+			try core.call(http.Method.POST, path, writeQuery(dryRun, fieldManager), new JSON().encode(object), out)
+			return out
+		}
+
+		// update replaces an object with the one given and returns it as
+		// stored. The object's `resourceVersion` (from a `get`) makes the
+		// update fail when the object changed since; none overwrites.
+		// Fails with ErrorKind.Conflict when the object changed since it was
+		// read, ErrorKind.NotFound when it is not there, ErrorKind.Invalid.
+		def update(object T, dryRun bool = false, fieldManager string = "") !T {
+			return try put(object, "", dryRun, fieldManager)
+		}
+
+		// updateStatus replaces the status of an object (its `status`
+		// subresource): what a controller reports. The rest of the object
+		// is ignored.
+		// Fails as `update` does, with ErrorKind.NotFound for a kind
+		// without a status subresource.
+		def updateStatus(object T, dryRun bool = false, fieldManager string = "") !T {
+			return try put(object, "/status", dryRun, fieldManager)
+		}
+
+		internal def put(object T, subresource string, dryRun bool, fieldManager string) !T {
+			let out = new T()
+			let path = try objectPath(object.objectMeta().name, namespaceOf(object))
+			try core.call(http.Method.PUT, path + subresource, writeQuery(dryRun, fieldManager), new JSON().encode(object), out)
+			return out
+		}
+
+		// patch changes an object by a patch and returns it as stored. The
+		// patch is JSON text or bytes, or a value written as JSON (a map, a
+		// struct).
+		// Fails with ErrorKind.NotFound when the object is not there,
+		// ErrorKind.Argument when the patch does not apply, ErrorKind.Invalid
+		// when the result does not pass validation.
+		def patch(name string, change any, kind PatchKind = PatchKind.Merge, dryRun bool = false, fieldManager string = "") !T {
+			return try patchAt(name, "", change, kind, dryRun, fieldManager)
+		}
+
+		// patchStatus patches the status subresource of an object.
+		// Fails as `patch` does.
+		def patchStatus(name string, change any, kind PatchKind = PatchKind.Merge, dryRun bool = false, fieldManager string = "") !T {
+			return try patchAt(name, "/status", change, kind, dryRun, fieldManager)
+		}
+
+		internal def patchAt(name string, subresource string, change any, kind PatchKind, dryRun bool, fieldManager string) !T {
+			let out = new T()
+			let path = try objectPath(name, namespace)
+			try core.call(http.Method.PATCH, path + subresource, writeQuery(dryRun, fieldManager), patchBody(change), out, kind.value)
+			return out
+		}
+
+		// apply hands the object to server-side apply: the fields it sets
+		// become the field manager's, the server merges them with what other
+		// managers own, and creates the object when it is not there. Set
+		// only the fields the program means to own. `force` takes fields
+		// another manager owns instead of failing.
+		// Fails with ErrorKind.Conflict when another manager owns a field
+		// the object sets to another value and `force` is off,
+		// ErrorKind.Invalid when the result does not pass validation.
+		def apply(object T, fieldManager string = defaultFieldManager, force bool = false, dryRun bool = false) !T {
+			return try applyAt(object, "", fieldManager, force, dryRun)
+		}
+
+		// applyStatus applies the status of an object (its `status`
+		// subresource).
+		// Fails as `apply` does.
+		def applyStatus(object T, fieldManager string = defaultFieldManager, force bool = false, dryRun bool = false) !T {
+			return try applyAt(object, "/status", fieldManager, force, dryRun)
+		}
+
+		internal def applyAt(object T, subresource string, fieldManager string, force bool, dryRun bool) !T {
+			fail errorOf(ErrorKind.Argument, "kubernetes: apply needs a field manager") when fieldManager == ""
+			let out = new T()
+			let metadata = object.objectMeta()
+			let path = try objectPath(metadata.name, namespaceOf(object))
+			let query = writeQuery(dryRun, fieldManager)
+			query.set("force", "true") when force
+			try core.call(http.Method.PATCH, path + subresource, query, try applyBody(object), out, "application/apply-patch+yaml")
+			return out
+		}
+
+		// delete removes an object. `propagation` says what happens to the
+		// objects it owns; `gracePeriod` how long a pod has to stop (none:
+		// its own setting; 0s: at once). `uid` and `resourceVersion`, when
+		// given, make the delete fail unless the object is still that one.
+		// Fails with ErrorKind.NotFound when the object is not there,
+		// ErrorKind.Conflict when a precondition does not hold.
+		def delete(name string, propagation Propagation = Propagation.Background, gracePeriod ?duration = none, uid string = "", resourceVersion string = "", dryRun bool = false) !none {
+			let path = try objectPath(name, namespace)
+			let body = deleteOptions(propagation, gracePeriod, uid, resourceVersion, dryRun)
+			try core.call(http.Method.DELETE, path, none, new JSON().encode(body))
+			return none
+		}
+
+		// deleteAll removes every object that matches the selectors (all of
+		// them when none is given) in this view's namespace.
+		// Fails as Cluster's calls do.
+		def deleteAll(labels string = "", fields string = "", propagation Propagation = Propagation.Background, gracePeriod ?duration = none, dryRun bool = false) !none {
+			let body = deleteOptions(propagation, gracePeriod, "", "", dryRun)
+			try core.call(http.Method.DELETE, try collectionPath(namespace), selectors(labels, fields), new JSON().encode(body))
+			return none
+		}
+
+		// The path of the objects in a namespace (all namespaces for "").
+		internal def collectionPath(within string) !string {
+			let base = groupVersionPath(kind.apiVersion())
+			return "{base}/{kind.plural}" unless kind.namespaced && within != ""
+			return "{base}/namespaces/{url.pathEscape(within)}/{kind.plural}"
+		}
+
+		// The path of one object.
+		// Fails with ErrorKind.Argument for an empty name, or a namespaced
+		// kind with no namespace.
+		internal def objectPath(name string, within string) !string {
+			fail errorOf(ErrorKind.Argument, "kubernetes: a {kind.kind} needs a name") when name == ""
+			fail errorOf(ErrorKind.Argument, "kubernetes: {kind.kind} {name} needs a namespace; the view reads every namespace") when kind.namespaced && within == ""
+			return "{try collectionPath(within)}/{url.pathEscape(name)}"
+		}
+
+		// The namespace a write of an object goes to.
+		internal def namespaceOf(object T) string {
+			let named = object.objectMeta().namespace
+			return named == "" ?? (namespace, named)
+		}
+	}
+
+	internal def selectors(labels string, fields string) url.Values {
+		let query = new url.Values()
+		query.set("labelSelector", labels) unless labels == ""
+		query.set("fieldSelector", fields) unless fields == ""
+		return query
+	}
+
+	internal def writeQuery(dryRun bool, fieldManager string) url.Values {
+		let query = new url.Values()
+		query.set("dryRun", "All") when dryRun
+		query.set("fieldManager", fieldManager) unless fieldManager == ""
+		return query
+	}
+
+	internal def deleteOptions(propagation Propagation, gracePeriod ?duration, uid string, resourceVersion string, dryRun bool) DeleteOptions {
+		let out = DeleteOptions{propagationPolicy: propagation.value}
+		out.gracePeriodSeconds = int(gracePeriod.seconds()) unless gracePeriod is none
+		out.preconditions = Preconditions{uid: uid, resourceVersion: resourceVersion} when uid != "" || resourceVersion != ""
+		out.dryRun = ["All"] when dryRun
+		return out
+	}
+
+	// A patch as the request sends it: text and bytes as they are, other
+	// values as JSON.
+	internal def patchBody(change any) byte[] {
+		return change.bytes() when change is string
+		return change when change is byte[]
+		return new JSON().encode(change)
+	}
+
+	// The body of an apply: the object as JSON (which the server reads as
+	// YAML), without the managed fields a read object carries, which an
+	// apply may not send.
+	// Fails with ErrorKind.Argument when the object does not encode.
+	internal def applyBody(object any) !byte[] {
+		let codec = new JSON()
+		let data = codec.encode(object)
+		let tree = codec.parse(data) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the object does not encode as JSON: {err.message}", cause = err)
+		}
+		if tree is map<string, any> {
+			let metadata = tree.get("metadata")
+			if metadata is map<string, any> && metadata.hasKey("managedFields") {
+				metadata.delete("managedFields")
+				return codec.encode(tree)
+			}
+		}
+		return data
+	}
+}

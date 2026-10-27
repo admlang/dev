@@ -1,0 +1,215 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON, json)
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// How long a watch that lost its connection waits before it asks
+	// again, doubling up to the longest wait, and how many times in a row
+	// it asks before it gives up.
+	internal const watchRetryWait = 1s
+	internal const longestWatchRetryWait = 30s
+	internal const watchRetries = 6
+
+	// EventKind is what happened to the object of a WatchEvent.
+	enum EventKind {
+		Added    = "ADDED",
+		Modified = "MODIFIED",
+		Deleted  = "DELETED",
+		// No change: the server's note of how far the watch has come,
+		// whose object carries only the resource version.
+		Bookmark = "BOOKMARK",
+	}
+
+	// WatchEvent is one change a watch reports: the object as it is after
+	// it (as it was last, for Deleted).
+	struct WatchEvent<T> {
+		kind   EventKind
+		object T
+	}
+
+	// What a watch line holds.
+	internal struct WatchLine<T> {
+		@json("type")
+		typeName string = ""
+		object T
+	}
+
+	internal struct WatchStatusLine {
+		@json("type")
+		typeName string = ""
+		object Status = Status{}
+	}
+
+	// Resources' watches.
+	partial type Resources<T: Object> {
+		// watch reports the changes to the objects that match the
+		// selectors, as they happen, for `for`. Without a `resourceVersion`
+		// it starts with an Added event for every object there now; with
+		// one (a list's, an object's), it starts after that version. When
+		// the connection drops or the server ends the watch, it asks again
+		// from the last version it saw, so no change is missed; when the
+		// server no longer holds that version the watch ends with
+		// ErrorKind.Expired in its `failure`, and a list is needed to start
+		// again (an Informer does this). `bookmarks` hands out the server's
+		// Bookmark events, which the watch uses to keep its version fresh
+		// either way.
+		// Fails as Cluster's calls do, when the first request does.
+		def watch(labels string = "", fields string = "", resourceVersion string = "", bookmarks bool = false) !Watch<T> {
+			let made = new Watch<T>(core, try collectionPath(namespace), selectors(labels, fields), resourceVersion, bookmarks)
+			try made.restart()
+			return made
+		}
+	}
+
+	// Watch is a watch of the objects of one kind; `Resources.watch`
+	// makes one. Iterating it with `for` yields its events and ends when
+	// it fails (`failure` says why) or is closed.
+	type Watch<T: Object> {
+		// The failure that ended the watch; none while it runs or after
+		// `close`.
+		failure              ?error         = none
+		// The resource version of the last event, which a watch started
+		// again would start after.
+		resourceVersion      string         = ""
+		internal core        Core
+		internal path        string
+		internal query       url.Values
+		internal bookmarks   bool
+		internal response    ?http.Response = none
+		internal lines       ?LineReader    = none
+		internal atomic shut bool           = false
+
+		def new(core Core, path string, query url.Values, resourceVersion string, bookmarks bool) {
+			self.core = core
+			self.path = path
+			self.query = query
+			self.resourceVersion = resourceVersion
+			self.bookmarks = bookmarks
+		}
+
+		// Implements Iterator<WatchEvent<T>>: the next event; none when the
+		// watch fails or is closed.
+		def iterate() ?WatchEvent<T> {
+			let event = next() onerror (err error) {
+				failure = err unless shut
+				drop()
+				return none
+			}
+			return event
+		}
+
+		// next returns the next event; none once the watch is closed.
+		// Fails with ErrorKind.Expired when the server no longer holds the
+		// version the watch would go on from, and as Cluster's calls do when
+		// asking again fails `watchRetries` times in a row.
+		def next() !?WatchEvent<T> {
+			let failures = 0
+			for {
+				return none when shut
+				let reader = lines
+				if reader is none {
+					restart() onerror (err error) {
+						fail err when shut
+						fail err when err is KubernetesError && err.kind != ErrorKind.Connection && err.kind != ErrorKind.TimedOut && err.kind != ErrorKind.Server
+						failures += 1
+						fail err when failures >= watchRetries
+						let wait = watchRetryWait * float(1 << (failures - 1))
+						time.sleep(wait > longestWatchRetryWait ?? (longestWatchRetryWait, wait))
+						recover none
+					}
+					continue
+				}
+				let line = reader.next() onerror (err error) {
+					drop()
+					recover none
+				}
+				if line is none {
+					// The server ended the watch, or the connection dropped:
+					// ask again from the last version.
+					drop()
+					continue
+				}
+				continue when line.len() == 0
+				let event = try decodeEvent(line)
+				failures = 0
+				continue when event is none
+				return event
+			}
+		}
+
+		// One line of the stream as an event; none for a Bookmark the
+		// program did not ask for.
+		internal def decodeEvent(line byte[]) !?WatchEvent<T> {
+			let codec = new JSON()
+			let decoded = new WatchLine<T>()
+			codec.decode(line, decoded) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "kubernetes: watch {path}: a line does not read as an event: {err.message}", cause = err)
+			}
+			if decoded.typeName == "ERROR" {
+				let status = WatchStatusLine{}
+				codec.decode(line, status) onerror recover none
+				let code = status.object.code == 0 ?? (500, status.object.code)
+				fail statusError(codec.encode(status.object), code, "watch {path}")
+			}
+			let found = eventKindOf(decoded.typeName)
+			fail errorOf(ErrorKind.Protocol, "kubernetes: watch {path}: an event of type {decoded.typeName}") when found is none
+			let kind EventKind = found
+			let version = decoded.object.objectMeta().resourceVersion
+			resourceVersion = version unless version == ""
+			return none when kind == EventKind.Bookmark && !bookmarks
+			return WatchEvent<T>{kind: kind, object: decoded.object}
+		}
+
+		// restart asks the server for the stream again, from the last version
+		// seen, dropping the connection the watch had. A watch does this
+		// itself when its connection drops.
+		// Fails as Cluster's calls do.
+		def restart() !none {
+			drop()
+			let ask = new url.Values()
+			for let name in query.keys() {
+				for let value in query.all(name) {
+					ask.add(name, value)
+				}
+			}
+			ask.set("watch", "true")
+			ask.set("allowWatchBookmarks", "true")
+			ask.set("resourceVersion", resourceVersion) unless resourceVersion == ""
+			let res = try core.send(http.Method.GET, path, ask, bounded = false)
+			let body = res.body
+			if body is none {
+				res.close() onerror recover none
+				fail errorOf(ErrorKind.Protocol, "kubernetes: watch {path}: the answer has no body")
+			}
+			response = res
+			lines = new LineReader(body)
+			return none
+		}
+
+		internal def drop() {
+			let res = response
+			response = none
+			lines = none
+			return when res is none
+			res.close() onerror recover none
+		}
+
+		// close ends the watch; an iteration in another task ends too.
+		def close() {
+			shut = true
+			drop()
+		}
+	}
+
+	// The EventKind a watch line names; none for another type.
+	internal def eventKindOf(text string) ?EventKind {
+		for let kind in [EventKind.Added, EventKind.Modified, EventKind.Deleted, EventKind.Bookmark] {
+			return kind when kind.value == text
+		}
+		return none
+	}
+}

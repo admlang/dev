@@ -1,0 +1,80 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON, YAML)
+		adm.dev.kubernetes.api::*
+	)
+
+	// readManifests reads the objects of a manifest: YAML documents
+	// separated by `---`, or JSON (an object, an array of them). A `List`
+	// (`kind: List`, or any `...List` with `items`) gives its items; empty
+	// documents are skipped. Each object is an Unstructured, which
+	// `decode` turns into its type.
+	// Fails with ErrorKind.Argument when the text does not read, or a
+	// document is not an object with `apiVersion` and `kind`.
+	def readManifests(text string) !Unstructured[] {
+		let documents = new YAML().parseAll(text) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "kubernetes: the manifest does not read as YAML or JSON: {err.message}", cause = err)
+		}
+		let out Unstructured[] = []
+		for let (at, document) in documents {
+			try collect(document, out, "document {at + 1}")
+		}
+		return out
+	}
+
+	internal def collect(document any, out Unstructured[], about string) !none {
+		return none when document is none
+		if document is any[] {
+			for let (at, item) in document {
+				try collect(item, out, "{about}, item {at + 1}")
+			}
+			return none
+		}
+		fail errorOf(ErrorKind.Argument, "kubernetes: {about} of the manifest is not an object") unless document is map<string, any>
+		let object = new Unstructured(document)
+		let items = document.get("items")
+		if object.kind.endsWith("List") && items is any[] {
+			for let (at, item) in items {
+				try collect(item, out, "{about}, item {at + 1}")
+			}
+			return none
+		}
+		fail errorOf(ErrorKind.Argument, "kubernetes: {about} of the manifest has no apiVersion or kind") when object.apiVersion == "" || object.kind == ""
+		out.push(object)
+		return none
+	}
+
+	// writeManifests writes objects (typed ones, Unstructured, or values
+	// that write as JSON objects) as YAML documents separated by `---`, the
+	// way kubectl reads them.
+	def writeManifests(objects any[]) string {
+		let codec = new JSON()
+		let yaml = new YAML()
+		let parts string[] = []
+		for let object in objects {
+			let tree = codec.parse(codec.encode(object)) onerror recover none
+			parts.push(string(yaml.encode(tree)))
+		}
+		return parts.join("---\n")
+	}
+
+	// Cluster's manifests.
+	partial type Cluster {
+		// apply hands every object of a manifest to server-side apply, in
+		// its order, objects of a namespaced kind that name no namespace
+		// going to the namespace given (the default one when none), and
+		// returns them as stored. Each kind is looked up on the server, so
+		// custom resources apply as any other.
+		// Fails as `readManifests` does, and as `Resources.apply` does for
+		// the first object that fails; the objects before it are applied.
+		def apply(manifest string, fieldManager string = defaultFieldManager, force bool = false, namespace string = "", dryRun bool = false) !Unstructured[] {
+			let out Unstructured[] = []
+			for let object in try readManifests(manifest) {
+				let kind = try self.kind(object.apiVersion, object.kind)
+				let target = objects(kind, kind.namespaced && object.namespace != "" ?? (object.namespace, namespace))
+				out.push(try target.apply(object, fieldManager, force, dryRun))
+			}
+			return out
+		}
+	}
+}

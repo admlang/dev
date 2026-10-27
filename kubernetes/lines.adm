@@ -1,0 +1,96 @@
+internal partial module adm.dev.kubernetes.api {
+	use (
+		std.io
+		std.net
+	)
+
+	// How long one read of a socket that stays open waits; a read that
+	// times out is made again, so a quiet stream (an idle exec, a port
+	// nobody sends on) stays open.
+	const idleRead = 24h
+
+	// readWaiting reads what a stream sends, waiting as long as it takes.
+	// Fails as the stream's reads do, except for timing out.
+	def readWaiting(stream net.Stream, buf byte[]) !int {
+		for {
+			let timedOut = false
+			let got = stream.read(buf, idleRead) onerror (err error) {
+				fail err unless err is net.NetError && err.kind == net.ErrorCode.TimedOut
+				timedOut = true
+				recover 0
+			}
+			return got unless timedOut
+		}
+		return 0
+	}
+
+	// PrefixedReader reads the bytes an HTTP upgrade read past the
+	// response's head, then the connection.
+	type PrefixedReader {
+		internal prefix  io.Reader
+		internal stream  net.Stream
+		internal drained bool       = false
+
+		def new(prefix io.Reader, stream net.Stream) {
+			self.prefix = prefix
+			self.stream = stream
+		}
+
+		// Implements io.Reader.
+		// Fails as the connection's reads do.
+		def read(buf byte[]) !int {
+			if !drained {
+				let got = try prefix.read(buf)
+				return got when got > 0
+				drained = true
+			}
+			return try readWaiting(stream, buf)
+		}
+	}
+
+	// The longest line a stream may hold, an object of a watch: what an
+	// API server holds in one object is far below it.
+	const longestLine = 64 * 1024 * 1024
+
+	// LineReader splits a stream into lines (a watch, logs that follow),
+	// without their `\n` or `\r\n`.
+	type LineReader {
+		internal source  io.Reader
+		internal pending byte[]    = []
+		internal chunk   byte[]    = []
+		internal ended   bool      = false
+
+		def new(source io.Reader) {
+			self.source = source
+			chunk.len(32 * 1024)
+		}
+
+		// The next line; none at the end of the stream. A last line
+		// without `\n` is returned too.
+		// Fails as the stream's reads do, and when a line is longer than
+		// 64 MiB.
+		def next() !?byte[] {
+			for {
+				let at = pending.indexOf(byte('\n'))
+				if at >= 0 {
+					let line = pending[0:at]
+					pending = pending[at + 1:]
+					return line.len() > 0 && line[line.len() - 1] == byte('\r') ?? (line[0:line.len() - 1], line)
+				}
+				if ended {
+					return none when pending.len() == 0
+					let rest = pending
+					pending = []
+					return rest
+				}
+				fail "line longer than {longestLine} bytes" when pending.len() > longestLine
+				let got = try source.read(chunk)
+				if got <= 0 {
+					ended = true
+					continue
+				}
+				pending.push(...chunk[0:got])
+			}
+		}
+	}
+}

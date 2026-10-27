@@ -1,0 +1,243 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// How long an informer whose list or watch failed waits before it
+	// lists again, doubling up to the longest wait.
+	internal const informerRetryWait = 1s
+	internal const longestInformerRetryWait = 1min
+
+	// Resources' informers.
+	partial type Resources<T: Object> {
+		// informer keeps a local copy of the objects that match the
+		// selectors in step with the cluster, and reports each change to
+		// the callbacks given. It does nothing until `start` or `run`.
+		def informer(labels string = "", fields string = "") Informer<T> {
+			return new Informer<T>(self, labels, fields)
+		}
+	}
+
+	// Informer keeps a local copy of the objects of a kind in step with
+	// the cluster: it lists them, then watches from the list's version,
+	// and lists again when the watch can go on no longer (the server no
+	// longer holds its version, or the connection stays down). Each change
+	// to the copy is reported to the callbacks: an object added, changed
+	// (old and new) or removed, a list again included, which reports what
+	// changed while the watch was down.
+	//
+	// ```
+	// let pods = cluster.pods("shop").informer(labels = "app=web")
+	// pods.onAdd = def (pod Pod) { print("up: {pod.name}") }
+	// pods.onDelete = def (pod Pod) { print("gone: {pod.name}") }
+	// pods.start()
+	// try pods.waitForSync()
+	// print("{pods.list().len()} pods")
+	// ```
+	//
+	// The callbacks run in the informer's task, one at a time, in the
+	// order of the changes.
+	type Informer<T: Object> {
+		onAdd                   ?def (T) none    = none
+		onUpdate                ?def (T, T) none = none
+		onDelete                ?def (T) none    = none
+		// The last failure of a list or a watch, which the informer
+		// recovers from by listing again; none while all goes well.
+		failure                 ?error           = none
+		internal resources      Resources<T>
+		internal labels         string
+		internal fields         string
+		internal cache          map<string, T>   = {}
+		internal synced         bool             = false
+		internal atomic current ?Watch<T>        = none
+		internal running        ?(async none)    = none
+		internal syncSignal     channel<none>
+		internal atomic shut    bool             = false
+
+		def new(resources Resources<T>, labels string, fields string) {
+			self.resources = resources
+			self.labels = labels
+			self.fields = fields
+			syncSignal = new channel<none>(1)
+		}
+
+		// start runs the informer in a task of its own until `close`.
+		def start() {
+			running = async run()
+		}
+
+		// run keeps the copy in step until `close`, in the task that calls
+		// it.
+		def run() {
+			let failures = 0
+			for !shut {
+				let version = relist() onerror (err error) {
+					failure = err
+					recover ""
+				}
+				if version == "" {
+					break when shut
+					failures += 1
+					time.sleep(backoff(failures))
+					continue
+				}
+				failures = 0
+				let watch = startWatch(version) onerror (err error) {
+					failure = err
+					recover none
+				}
+				continue when watch is none
+				current = watch
+				for let event in watch {
+					apply(event)
+				}
+				current = none
+				break when shut
+				failure = watch.failure
+			}
+		}
+
+		internal def startWatch(version string) !?Watch<T> {
+			return try resources.watch(labels, fields, version)
+		}
+
+		// Lists the objects and makes the copy what the list says,
+		// reporting the difference; returns the list's version.
+		internal def relist() !string {
+			let token = ""
+			let found T[] = []
+			let version = ""
+			for {
+				let page = try resources.page(labels, fields, listPageSize, token)
+				found.push(...page.items)
+				version = page.metadata.resourceVersion when version == ""
+				token = page.continueToken()
+				break when token == ""
+			}
+			let seen map<string, bool> = {}
+			for let object in found {
+				let key = keyOf(object)
+				seen[key] = true
+				let old = replace(key, object)
+				if old is none {
+					report(EventKind.Added, object, none)
+				} else if old.objectMeta().resourceVersion != object.objectMeta().resourceVersion {
+					report(EventKind.Modified, object, old)
+				}
+			}
+			for let (key, object) in snapshot() {
+				continue when seen.hasKey(key)
+				remove(key)
+				report(EventKind.Deleted, object, none)
+			}
+			markSynced()
+			return version
+		}
+
+		// Brings the copy in step with one event of the watch.
+		internal def apply(event WatchEvent<T>) {
+			let key = keyOf(event.object)
+			switch event.kind {
+				case EventKind.Added, EventKind.Modified:
+					let old = replace(key, event.object)
+					report(old is none ?? (EventKind.Added, EventKind.Modified), event.object, old)
+				case EventKind.Deleted:
+					let old = remove(key)
+					report(EventKind.Deleted, old is none ?? (event.object, old), none)
+			}
+		}
+
+		internal def report(kind EventKind, object T, old ?T) {
+			switch kind {
+				case EventKind.Added:
+					let call = onAdd
+					call(object) unless call is none
+				case EventKind.Modified:
+					let call = onUpdate
+					call(old is none ?? (object, old), object) unless (call is none)
+				case EventKind.Deleted:
+					let call = onDelete
+					call(object) unless call is none
+			}
+		}
+
+		internal atomic def replace(key string, object T) ?T {
+			let old = cache.get(key)
+			cache[key] = object
+			return old
+		}
+
+		internal atomic def remove(key string) ?T {
+			let old = cache.get(key)
+			cache.delete(key)
+			return old
+		}
+
+		internal atomic def snapshot() map<string, T> {
+			return cache.clone()
+		}
+
+		internal atomic def markSynced() {
+			return when synced
+			synced = true
+			syncSignal.offer(none)
+		}
+
+		// The objects of the copy.
+		atomic def list() T[] {
+			return cache.values()
+		}
+
+		// An object of the copy by name (and namespace, for a view of every
+		// namespace); none when the copy has none.
+		atomic def get(name string, namespace string = "") ?T {
+			let within = namespace == "" ?? (resources.namespace, namespace)
+			return cache.get(within == "" ?? (name, "{within}/{name}"))
+		}
+
+		// Whether the first list has filled the copy.
+		atomic def hasSynced() bool {
+			return synced
+		}
+
+		// waitForSync waits until the first list has filled the copy.
+		// Fails with ErrorKind.TimedOut when it has not within the timeout,
+		// ErrorKind.Closed when the informer is closed first.
+		def waitForSync(timeout duration = 1min) !none {
+			return none when hasSynced()
+			let timer = time.sleepChan(timeout)
+			select {
+				case syncSignal:
+					<-syncSignal
+					syncSignal.offer(none)
+				case timer:
+					<-timer
+			}
+			fail errorOf(ErrorKind.Closed, "kubernetes: the informer was closed") when shut
+			fail errorOf(ErrorKind.TimedOut, "kubernetes: the informer did not list within {timeout}") unless hasSynced()
+			return none
+		}
+
+		// close stops the informer; the copy stays as it was.
+		def close() {
+			shut = true
+			syncSignal.offer(none)
+			let watch = current
+			watch.close() unless watch is none
+		}
+	}
+
+	// The key of an object in an informer's copy: `namespace/name`, or the
+	// name of an object of the whole cluster.
+	internal def keyOf(object Object) string {
+		let metadata = object.objectMeta()
+		return metadata.namespace == "" ?? (metadata.name, "{metadata.namespace}/{metadata.name}")
+	}
+
+	internal def backoff(failures int) duration {
+		let shift = failures > 10 ?? (10, failures - 1)
+		let wait = informerRetryWait * float(1 << shift)
+		return wait > longestInformerRetryWait ?? (longestInformerRetryWait, wait)
+	}
+}

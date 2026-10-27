@@ -1,0 +1,39 @@
+// The renewal of an OIDC id token with its refresh token, as a kubeconfig
+// `oidc` auth provider needs it.
+internal module adm.dev.kubernetes.oidc {
+	use (
+		std.crypto.x509::(CertPool)
+		std.net.http
+		std.net.tls
+		std.proto.auth.oauth2
+	)
+
+	// renew asks the issuer's token endpoint (found through its discovery
+	// document) for a new id token, and returns it with the refresh token
+	// to use next time (the old one when the provider issues none). `ca`
+	// is the PEM of the certificates the provider's chain leads to; ""
+	// takes the system's roots.
+	// Fails when the provider cannot be reached or read, refuses the
+	// refresh token, or answers without an id token.
+	def renew(issuer string, clientId string, clientSecret string, idToken string, refreshToken string, scopes string[], ca string) !(string, string) {
+		let client = new http.Client()
+		if ca != "" {
+			let pool = new CertPool()
+			fail "the provider's certificate authority holds no PEM certificate" unless pool.appendCertsFromPEM(ca)
+			let transport = new http.Transport()
+			transport.tls = tls.Config{rootCAs: pool}
+			client.transport = transport
+		}
+		let metadata = try oauth2.discover(issuer, client)
+		let oauth = new oauth2.Client(clientId, metadata)
+		oauth.httpClient = client
+		oauth.secret = new Secret<string>(clientSecret) unless clientSecret == ""
+		let old = new oauth2.Token(new Secret<string>(idToken))
+		old.refreshToken = new Secret<string>(refreshToken)
+		let renewed = try oauth.refresh(old, scopes)
+		let id = renewed.idToken
+		fail "the provider renewed the token without an id_token" when id is none
+		let next = renewed.refreshToken
+		return (id, next is none ?? (refreshToken, next.reveal()))
+	}
+}

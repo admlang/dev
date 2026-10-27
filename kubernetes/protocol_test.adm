@@ -1,0 +1,789 @@
+// Tests that need no cluster: kubeconfig files and credentials read from
+// a made-up machine, and a loopback server that answers as an API server
+// does.
+partial module adm.dev.kubernetes {
+	use (
+		std.bytes
+		std.data.compress.zlib
+		std.data.encoding::(JSON, base64encode)
+		std.net.http
+		std.net.http.httptest
+		std.net.http.websocket
+		std.testing
+		std.time
+		adm.dev.kubernetes.api::*
+	)
+
+	// What a made-up machine's credential plugin answers, and what it was
+	// asked.
+	internal type PluginScript {
+		answers  string[]            = []
+		codes    int[]               = []
+		calls    int                 = 0
+		programs string[]            = []
+		lastEnv  map<string, string> = {}
+
+		def new() {}
+
+		def run(program string, args string[], env map<string, string>) !(string, int) {
+			let at = calls < answers.len() ?? (calls, answers.len() - 1)
+			calls += 1
+			programs.push("{program} {args.join(" ")}")
+			lastEnv = env
+			return (answers[at], codes.len() > at ?? (codes[at], 0))
+		}
+	}
+
+	// A machine with the environment, files and plugin given.
+	internal def machine(env map<string, string>, files map<string, string>, script ?PluginScript = none) Surroundings {
+		let runner = script is none ?? (new PluginScript(), script)
+		return Surroundings{env: def (name string) ?string {
+			return env.get(name)
+		}, home: "/home/ana", readFile: def (path string) !byte[] {
+			let found = files.get(path)
+			fail "no such file {path}" when found is none
+			return found.bytes()
+		}, exists: def (path string) bool {
+			return files.hasKey(path)
+		}, runPlugin: def (program string, args string[], vars map<string, string>) !(string, int) {
+			return try runner.run(program, args, vars)
+		}}
+	}
+
+	// A Cluster of a Config on a made-up machine.
+	internal def clusterOf(config Config, from Surroundings) !Cluster {
+		let made = new Cluster()
+		made.core = try newCore(config, from)
+		return made
+	}
+
+	// A JWT whose `exp` is the time given; the signature is not checked
+	// by the client.
+	internal def jwtUntil(at time.Time) string {
+		let encode = def (text string) string {
+			return base64encode(text.bytes()).replace("+", "-").replace("/", "_").replace("=", "")
+		}
+		return "{encode(`{"alg":"none"}`)}.{encode("\{\"exp\":{at.unixNs() / 1000000000}\}")}.c2ln"
+	}
+
+	internal def kindOf(err error) ErrorKind {
+		return err.kind when err is KubernetesError
+		return ErrorKind.Server
+	}
+
+	internal const firstKubeconfig = `
+apiVersion: v1
+kind: Config
+current-context: dev
+contexts:
+- name: dev
+  context:
+    cluster: dev-cluster
+    user: ana
+    namespace: shop
+- name: prod
+  context:
+    cluster: prod-cluster
+    user: robot
+users:
+- name: ana
+  user:
+    token: first-token
+    as: admin
+    as-groups: [ops, dev]
+    as-user-extra:
+      scopes: [view]
+`
+
+	internal const secondKubeconfig = `
+current-context: prod
+clusters:
+- name: dev-cluster
+  cluster:
+    server: https://dev.example.com:6443
+    certificate-authority: certs/ca.pem
+    tls-server-name: api.dev
+- name: prod-cluster
+  cluster:
+    server: https://prod.example.com/k8s/clusters/c1
+    certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCg==
+    insecure-skip-tls-verify: true
+    proxy-url: socks5://proxy:1080
+    extensions:
+    - name: client.authentication.k8s.io/exec
+      extension:
+        audience: prod
+users:
+- name: ana
+  user:
+    token: shadowed
+- name: robot
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: ./bin/get-token
+      args: [--cluster, prod]
+      env:
+      - name: REGION
+        value: eu
+      provideClusterInfo: true
+      interactiveMode: Never
+`
+
+	check "Kubeconfig" {
+		@test()
+		def TestMerge() !none {
+			let files = {"/a/config": firstKubeconfig, "/b/config": secondKubeconfig, "/b/certs/ca.pem": "CA PEM"}
+			let from = machine({"KUBECONFIG": "/a/config:/missing:/b/config"}, files)
+			let merged = try readKubeconfigs([], from)
+			assert merged.currentContext == "dev"
+			let names = merged.contexts()
+			assert names.len() == 2 && names[0] == "dev" && names[1] == "prod"
+			let dev = try merged.config()
+			assert dev.server == "https://dev.example.com:6443" && dev.namespace == "shop"
+			assert dev.certificateAuthority == "CA PEM" && dev.serverName == "api.dev"
+			let token = dev.token
+			assert !(token is none) && token.reveal() == "first-token"
+			let acting = dev.impersonate
+			assert !(acting is none) && acting.user == "admin" && acting.groups.len() == 2 && acting.extra["scopes"][0] == "view"
+			let prod = try merged.config("prod")
+			assert prod.namespace == "default" && prod.insecureSkipVerify && prod.proxy == "socks5://proxy:1080"
+			assert prod.certificateAuthority == "-----BEGIN CERTIFICATE-----\n"
+			let program = prod.exec
+			fail "no exec plugin" when program is none
+			assert program.command == "/b/bin/get-token" && program.args[1] == "prod" && program.env["REGION"] == "eu"
+			assert program.provideClusterInfo && program.interactiveMode == "Never" && !(program.clusterConfig is none)
+			return none
+		}
+
+		@test()
+		def TestErrors() !none {
+			let files = {"/a/config": firstKubeconfig}
+			let from = machine({}, files)
+			let merged = try readKubeconfigs(["/a/config"], from)
+			let missingCluster = merged.config("dev") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument && err.message.contains("dev-cluster")
+				recover Config{}
+			}
+			assert missingCluster.server == ""
+			let noContext = merged.config("staging") onerror (err error) {
+				assert err.message.contains("no context staging")
+				recover Config{}
+			}
+			assert noContext.server == ""
+			let unreadable = readKubeconfigs(["/nowhere"], from) onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover new Kubeconfig()
+			}
+			assert unreadable.contexts().len() == 0
+			let bad = parseKubeconfig("clusters: 5") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover new Kubeconfig()
+			}
+			assert bad.contexts().len() == 0
+			let parsed = try parseKubeconfig(secondKubeconfig, "/etc/kube")
+			assert parsed.currentContext == "prod"
+			return none
+		}
+
+		@test()
+		def TestInCluster() !none {
+			let files = {
+				"/var/run/secrets/kubernetes.io/serviceaccount/token":     "pod-token\n",
+				"/var/run/secrets/kubernetes.io/serviceaccount/ca.crt":    "POD CA",
+				"/var/run/secrets/kubernetes.io/serviceaccount/namespace": "shop\n",
+			}
+			let inside = try inClusterConfig(machine({"KUBERNETES_SERVICE_HOST": "10.43.0.1", "KUBERNETES_SERVICE_PORT": "443"}, files))
+			assert inside.server == "https://10.43.0.1:443" && inside.namespace == "shop" && inside.certificateAuthority == "POD CA"
+			assert inside.tokenFile.endsWith("/serviceaccount/token")
+			let six = try inClusterConfig(machine({"KUBERNETES_SERVICE_HOST": "fd00::1", "KUBERNETES_SERVICE_PORT": "443"}, files))
+			assert six.server == "https://[fd00::1]:443"
+			let outside = inClusterConfig(machine({}, files)) onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument && err.message.contains("not in a cluster")
+				recover Config{}
+			}
+			assert outside.server == ""
+			// No kubeconfig anywhere: connect takes the pod's.
+			let chosen = try chooseConfig("", "", machine({"KUBERNETES_SERVICE_HOST": "10.43.0.1", "KUBERNETES_SERVICE_PORT": "443"}, files))
+			assert chosen.namespace == "shop"
+			let fromHome = try chooseConfig("", "", machine({}, {"/home/ana/.kube/config": firstKubeconfig.replace("cluster: dev-cluster", "cluster: home") + "clusters:\n- name: home\n  cluster:\n    server: https://home:6443\n"}))
+			assert fromHome.server == "https://home:6443"
+			return none
+		}
+	}
+
+	check "Credentials" {
+		@test()
+		def TestExecPlugin() !none {
+			let script = new PluginScript()
+			let later = time.now() + 1h
+			script.answers = [
+				"\{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":\{\"token\":\"t1\",\"expirationTimestamp\":\"{later.str()}\"\}\}",
+				"\{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":\{\"token\":\"t2\"\}\}",
+			]
+			let config = Config{server: "https://api:6443", certificateAuthority: "", exec: ExecPlugin{command: "get-token", args: ["-x"], env: {"A": "1"}, provideClusterInfo: true}}
+			let credentials = new Credentials(config, machine({}, {}, script))
+			assert try credentials.authorization() == "Bearer t1"
+			assert try credentials.authorization() == "Bearer t1"
+			assert script.calls == 1 && script.programs[0] == "get-token -x" && script.lastEnv["A"] == "1"
+			let info = script.lastEnv["KUBERNETES_EXEC_INFO"]
+			assert info.contains(`"kind":"ExecCredential"`) && info.contains(`"interactive":false`) && info.contains(`"server":"https://api:6443"`)
+			credentials.invalidate()
+			assert try credentials.authorization() == "Bearer t2"
+			assert script.calls == 2
+			return none
+		}
+
+		@test()
+		def TestExecPluginFailures() !none {
+			let failing = new PluginScript()
+			failing.answers = [""]
+			failing.codes = [1]
+			let config = Config{server: "https://api", exec: ExecPlugin{command: "broken", installHint: "install broken"}}
+			let failed = new Credentials(config, machine({}, {}, failing)).authorization() onerror (err error) {
+				assert kindOf(err) == ErrorKind.Denied && err.message.contains("exited with 1")
+				recover ""
+			}
+			assert failed == ""
+			let garbage = new PluginScript()
+			garbage.answers = ["not json"]
+			let unread = new Credentials(config, machine({}, {}, garbage)).authorization() onerror (err error) {
+				assert kindOf(err) == ErrorKind.Denied && err.message.contains("not an ExecCredential")
+				recover ""
+			}
+			assert unread == ""
+			let terminal = Config{server: "https://api", exec: ExecPlugin{command: "ask", interactiveMode: "Always"}}
+			let refused = new Credentials(terminal, machine({}, {})).authorization() onerror (err error) {
+				assert err.message.contains("needs a terminal")
+				recover ""
+			}
+			assert refused == ""
+			let certificate = new PluginScript()
+			certificate.answers = [`{"kind":"ExecCredential","status":{"clientCertificateData":"CERT","clientKeyData":"KEY"}}`]
+			let issued = try new Credentials(config, machine({}, {}, certificate)).clientPair()
+			fail "no client certificate" when issued is none
+			let (cert, key) = issued
+			assert cert == "CERT" && key.reveal() == "KEY"
+			return none
+		}
+
+		@test()
+		def TestTokenFileAndBasic() !none {
+			let files = {"/run/token": "first\n"}
+			let credentials = new Credentials(Config{server: "https://api", tokenFile: "/run/token"}, machine({}, files))
+			assert try credentials.authorization() == "Bearer first"
+			files["/run/token"] = "second"
+			assert try credentials.authorization() == "Bearer first"
+			credentials.invalidate()
+			assert try credentials.authorization() == "Bearer second"
+			let basic = new Credentials(Config{server: "https://api", username: "ana", password: new Secret<string>("pw")}, machine({}, {}))
+			assert try basic.authorization() == "Basic YW5hOnB3"
+			let anonymous = new Credentials(Config{server: "https://api"}, machine({}, {}))
+			assert try anonymous.authorization() == ""
+			return none
+		}
+
+		@test()
+		def TestJwtExpiry() !none {
+			assert !jwtExpired(jwtUntil(time.now() + 1h))
+			assert jwtExpired(jwtUntil(time.now() - 1min))
+			assert jwtExpired("not-a-jwt")
+			return none
+		}
+
+		@test()
+		def TestOidcRefresh() !none {
+			let seen string[] = []
+			let fresh = jwtUntil(time.now() + 1h)
+			let mux = new http.ServeMux()
+			let issuer = ""
+			try mux.handle("/", def (ctx http.Context) !none {
+				let path = ctx.path()
+				return ctx.text(200, "\{\"issuer\":\"{issuer}\",\"token_endpoint\":\"{issuer}/token\"\}") when path == "/.well-known/openid-configuration"
+				if path == "/token" {
+					seen.push(try ctx.text())
+					return ctx.json(200, {"access_token": "access", "id_token": fresh, "refresh_token": "r2", "token_type": "Bearer", "expires_in": 3600})
+				}
+				return ctx.text(404, "no")
+			})
+			let server = try httptest.Server.start(mux)
+			defer server.close()
+			issuer = "http://{server.address().str()}"
+			let provider = AuthProvider{name: "oidc", config: {"client-id": "kubectl", "client-secret": "s", "id-token": jwtUntil(time.now() - 1h), "refresh-token": "r1", "idp-issuer-url": issuer}}
+			let credentials = new Credentials(Config{server: "https://api", authProvider: provider}, machine({}, {}))
+			assert try credentials.authorization() == "Bearer {fresh}"
+			assert seen.len() == 1 && seen[0].contains("grant_type=refresh_token") && seen[0].contains("refresh_token=r1")
+			// Still fresh: no second refresh.
+			assert try credentials.authorization() == "Bearer {fresh}"
+			assert seen.len() == 1
+			let removed = new Credentials(Config{server: "https://api", authProvider: AuthProvider{name: "gcp"}}, machine({}, {})).authorization() onerror (err error) {
+				assert err.message.contains("exec plugin")
+				recover ""
+			}
+			assert removed == ""
+			return none
+		}
+	}
+
+	// A loopback API server: what it answers by method and path, each
+	// request it saw recorded as `METHOD path?query` with the headers
+	// named.
+	internal type FakeServer {
+		seen             string[]                     = []
+		bodies           string[]                     = []
+		types            string[]                     = []
+		headers          map<string, string>          = {}
+		internal answers map<string, (int, string)[]> = {}
+
+		def new() {}
+
+		// Answers a method and path with a status and body; several
+		// answers are given in turn, the last one again.
+		def answer(key string, status int, body string) {
+			let list = answers.get(key)
+			if list is none {
+				answers[key] = [(status, body)]
+				return
+			}
+			list.push((status, body))
+		}
+
+		def handle(ctx http.Context) !none {
+			let path = ctx.path()
+			let query = ctx.request.url.rawQuery
+			seen.push("{ctx.method().value} {path}{query == "" ?? ("", "?" + query)}")
+			types.push(ctx.header("Content-Type"))
+			for let name in ["Authorization", "Impersonate-User", "Impersonate-Group", "Impersonate-Extra-scopes", "User-Agent"] {
+				headers[name] = ctx.request.headers.values(name).join(",") unless ctx.header(name) == ""
+			}
+			bodies.push(try ctx.text())
+			let key = "{ctx.method().value} {path}"
+			let list = answers.get(key)
+			if list is none {
+				return ctx.text(200, `{"kind":"List","metadata":{"resourceVersion":"1"},"items":[]}`) when ctx.method() == http.Method.GET && ctx.query("watch") is none
+				return ctx.text(404, `{"kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"nothing here"}`)
+			}
+			let (status, body) = list[0]
+			list.remove(0) when list.len() > 1
+			ctx.setHeader("Content-Type", "application/json")
+			ctx.setHeader("Retry-After", "0") when status == 429
+			return ctx.text(status, body)
+		}
+	}
+
+	internal def fakeServer(fake FakeServer) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			return try fake.handle(ctx)
+		})
+		return try httptest.Server.start(mux)
+	}
+
+	internal def fakeCluster(server httptest.Server, config Config = Config{}) !Cluster {
+		config.server = "http://{server.address().str()}"
+		config.namespace = "shop" when config.namespace == "default"
+		return try clusterOf(config, machine({}, {}))
+	}
+
+	internal const configMapJson = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"one","namespace":"shop","resourceVersion":"5","managedFields":[{"manager":"kubectl","operation":"Apply"}]},"data":{"a":"1"}}`
+
+	check "Loopback API server" {
+		@test()
+		def TestPagingAndPaths() !none {
+			let fake = new FakeServer()
+			fake.answer("GET /api/v1/namespaces/shop/configmaps", 200, `{"metadata":{"continue":"c1","resourceVersion":"9"},"items":[{"metadata":{"name":"a"}},{"metadata":{"name":"b"}}]}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps", 200, `{"metadata":{"resourceVersion":"9"},"items":[{"metadata":{"name":"c"}}]}`)
+			let server = try fakeServer(fake)
+			defer server.close()
+			let cluster = try fakeCluster(server)
+			assert cluster.namespace == "shop"
+			let all = try cluster.configMaps().list(labels = "app=web", fields = "metadata.name!=x")
+			assert all.len() == 3 && all[2].name == "c"
+			assert fake.seen[0] == "GET /api/v1/namespaces/shop/configmaps?fieldSelector=metadata.name%21%3Dx&labelSelector=app%3Dweb&limit=500"
+			assert fake.seen[1].contains("continue=c1")
+			assert fake.headers["User-Agent"] == "adm.dev.kubernetes"
+			// Every kind's list goes to its path.
+			for let kind in knownKinds() {
+				try cluster.objects(kind).page()
+			}
+			let joined = fake.seen.join("\n")
+			assert joined.contains("GET /api/v1/nodes\n") && joined.contains("GET /apis/apps/v1/namespaces/shop/deployments\n")
+			assert joined.contains("GET /apis/rbac.authorization.k8s.io/v1/clusterroles\n") && joined.contains("GET /apis/autoscaling/v2/namespaces/shop/horizontalpodautoscalers\n")
+			assert joined.contains("GET /api/v1/namespaces/shop/endpoints\n") && joined.contains("GET /apis/coordination.k8s.io/v1/namespaces/shop/leases\n")
+			try cluster.pods().inAllNamespaces().page()
+			assert fake.seen[fake.seen.len() - 1] == "GET /api/v1/pods"
+			// A server URL with a path puts it before every request.
+			let prefixed = try clusterOf(Config{server: "http://{server.address().str()}/k8s/clusters/c1"}, machine({}, {}))
+			try prefixed.nodes().page()
+			assert fake.seen[fake.seen.len() - 1] == "GET /k8s/clusters/c1/api/v1/nodes"
+			return none
+		}
+
+		@test()
+		def TestStatusErrors() !none {
+			let fake = new FakeServer()
+			fake.answer("POST /api/v1/namespaces/shop/configmaps", 409, `{"kind":"Status","status":"Failure","reason":"AlreadyExists","code":409,"message":"configmaps \"one\" already exists","details":{"name":"one","kind":"configmaps"}}`)
+			fake.answer("PUT /api/v1/namespaces/shop/configmaps/one", 409, `{"kind":"Status","status":"Failure","reason":"Conflict","code":409,"message":"the object has been modified"}`)
+			fake.answer("PATCH /api/v1/namespaces/shop/configmaps/one", 422, `{"kind":"Status","status":"Failure","reason":"Invalid","code":422,"message":"invalid","details":{"causes":[{"reason":"FieldValueInvalid","field":"data.x","message":"bad"}]}}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/gone", 410, `{"kind":"Status","status":"Failure","reason":"Expired","code":410,"message":"too old"}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/plain", 500, "not json at all")
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/missing", 404, `{"kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"configmaps \"missing\" not found"}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/denied", 403, `{"kind":"Status","status":"Failure","reason":"Forbidden","code":403,"message":"forbidden"}`)
+			let server = try fakeServer(fake)
+			defer server.close()
+			let maps = (try fakeCluster(server)).configMaps()
+			let made = new ConfigMap()
+			made.name = "one"
+			let kinds ErrorKind[] = []
+			let details ?StatusDetails = none
+			maps.create(made) onerror (err error) {
+				kinds.push(kindOf(err))
+				recover new ConfigMap()
+			}
+			maps.update(made) onerror (err error) {
+				kinds.push(kindOf(err))
+				recover new ConfigMap()
+			}
+			maps.patch("one", {"data": {"x": "y"}}) onerror (err error) {
+				kinds.push(kindOf(err))
+				details = err.details when err is KubernetesError
+				recover new ConfigMap()
+			}
+			for let name in ["gone", "missing", "plain", "denied"] {
+				maps.get(name) onerror (err error) {
+					kinds.push(kindOf(err))
+					recover new ConfigMap()
+				}
+			}
+			assert kinds.len() == 7
+			assert kinds[0] == ErrorKind.AlreadyExists && kinds[1] == ErrorKind.Conflict && kinds[2] == ErrorKind.Invalid
+			assert kinds[3] == ErrorKind.Expired && kinds[4] == ErrorKind.NotFound && kinds[5] == ErrorKind.Server && kinds[6] == ErrorKind.Denied
+			assert !(details is none) && details.causes[0].field == "data.x"
+			assert try maps.find("missing") is none
+			return none
+		}
+
+		@test()
+		def TestRenewThrottleImpersonate() !none {
+			let fake = new FakeServer()
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/one", 401, `{"kind":"Status","status":"Failure","reason":"Unauthorized","code":401,"message":"Unauthorized"}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/one", 429, `{"kind":"Status","status":"Failure","reason":"TooManyRequests","code":429,"message":"slow down"}`)
+			fake.answer("GET /api/v1/namespaces/shop/configmaps/one", 200, configMapJson)
+			let server = try fakeServer(fake)
+			defer server.close()
+			let script = new PluginScript()
+			script.answers = [`{"kind":"ExecCredential","status":{"token":"old"}}`, `{"kind":"ExecCredential","status":{"token":"new"}}`]
+			let config = Config{server: "http://{server.address().str()}", namespace: "shop", exec: ExecPlugin{command: "token"}, impersonate: Impersonation{user: "admin", groups: ["a", "b"], extra: {"scopes": ["view"]}}}
+			let cluster = try clusterOf(config, machine({}, {}, script))
+			let read = try cluster.configMaps().get("one")
+			assert read.data["a"] == "1"
+			assert script.calls == 2 && fake.seen.len() == 3
+			assert fake.headers["Authorization"] == "Bearer new" && fake.headers["Impersonate-User"] == "admin"
+			assert fake.headers["Impersonate-Group"] == "a,b" && fake.headers["Impersonate-Extra-scopes"] == "view"
+			return none
+		}
+
+		@test()
+		def TestWriteBodies() !none {
+			let fake = new FakeServer()
+			fake.answer("PATCH /api/v1/namespaces/shop/configmaps/one", 200, configMapJson)
+			fake.answer("DELETE /api/v1/namespaces/shop/configmaps/one", 200, `{"kind":"Status","status":"Success"}`)
+			fake.answer("DELETE /api/v1/namespaces/shop/configmaps", 200, `{"kind":"Status","status":"Success"}`)
+			let server = try fakeServer(fake)
+			defer server.close()
+			let maps = (try fakeCluster(server)).configMaps()
+			let object = ConfigMap{}
+			try new JSON().decode(configMapJson, object)
+			assert object.metadata.managedFields.len() == 1
+			try maps.apply(object, fieldManager = "ctl", force = true)
+			assert fake.seen[0] == "PATCH /api/v1/namespaces/shop/configmaps/one?fieldManager=ctl&force=true"
+			assert fake.types[0] == "application/apply-patch+yaml"
+			assert !fake.bodies[0].contains("managedFields") && fake.bodies[0].contains(`"kind":"ConfigMap"`)
+			try maps.patch("one", `{"data":null}`, PatchKind.Strategic, dryRun = true)
+			assert fake.types[1] == "application/strategic-merge-patch+json" && fake.seen[1].contains("dryRun=All") && fake.bodies[1] == `{"data":null}`
+			try maps.delete("one", Propagation.Foreground, 5s, uid = "u1")
+			assert fake.bodies[2].contains(`"propagationPolicy":"Foreground"`) && fake.bodies[2].contains(`"gracePeriodSeconds":5`) && fake.bodies[2].contains(`"uid":"u1"`)
+			try maps.deleteAll(labels = "tier=cache")
+			assert fake.seen[3] == "DELETE /api/v1/namespaces/shop/configmaps?labelSelector=tier%3Dcache"
+			let pods = (try fakeCluster(server)).pods()
+			try pods.logs("web", container = "app", tail = 10, since = 90s, timestamps = true)
+			assert fake.seen[4] == "GET /api/v1/namespaces/shop/pods/web/log?container=app&sinceSeconds=90&tailLines=10&timestamps=true"
+			return none
+		}
+
+		@test()
+		def TestWatchResumes() !none {
+			let fake = new FakeServer()
+			fake.answer("GET /api/v1/namespaces/shop/configmaps", 200, `{"type":"ADDED","object":{"metadata":{"name":"a","resourceVersion":"5"}}}` + "\n" + `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}` + "\n")
+			fake.answer("GET /api/v1/namespaces/shop/configmaps", 200, `{"type":"MODIFIED","object":{"metadata":{"name":"a","resourceVersion":"8"}}}` + "\n" + `{"type":"ERROR","object":{"kind":"Status","status":"Failure","reason":"Expired","code":410,"message":"too old resource version: 8 (9)"}}` + "\n")
+			let server = try fakeServer(fake)
+			defer server.close()
+			let watch = try (try fakeCluster(server)).configMaps().watch(labels = "app=web")
+			let kinds EventKind[] = []
+			for let event in watch {
+				kinds.push(event.kind)
+			}
+			assert kinds.len() == 2 && kinds[0] == EventKind.Added && kinds[1] == EventKind.Modified
+			let failure = watch.failure
+			assert !(failure is none) && kindOf(failure) == ErrorKind.Expired
+			assert fake.seen[0] == "GET /api/v1/namespaces/shop/configmaps?allowWatchBookmarks=true&labelSelector=app%3Dweb&watch=true"
+			// Asked again from the bookmark's version.
+			assert fake.seen[1].endsWith("&resourceVersion=7&watch=true")
+			return none
+		}
+
+		@test()
+		def TestInformerRelists() !none {
+			let fake = new FakeServer()
+			let list = "GET /api/v1/namespaces/shop/configmaps"
+			fake.answer(list, 200, `{"metadata":{"resourceVersion":"10"},"items":[{"metadata":{"name":"a","namespace":"shop","resourceVersion":"3"}},{"metadata":{"name":"b","namespace":"shop","resourceVersion":"4"}}]}`)
+			fake.answer(list, 200, `{"type":"ERROR","object":{"kind":"Status","status":"Failure","reason":"Expired","code":410}}` + "\n")
+			fake.answer(list, 200, `{"metadata":{"resourceVersion":"20"},"items":[{"metadata":{"name":"a","namespace":"shop","resourceVersion":"12"}}]}`)
+			fake.answer(list, 200, `{"type":"ADDED","object":{"metadata":{"name":"c","namespace":"shop","resourceVersion":"21"}}}` + "\n")
+			let server = try fakeServer(fake)
+			defer server.close()
+			let informer = (try fakeCluster(server)).configMaps().informer()
+			let changes = new channel<string>(16)
+			informer.onAdd = def (map ConfigMap) none {
+				changes <- "add {map.name}"
+			}
+			informer.onUpdate = def (old ConfigMap, map ConfigMap) none {
+				changes <- "update {map.name} {old.metadata.resourceVersion}->{map.metadata.resourceVersion}"
+			}
+			informer.onDelete = def (map ConfigMap) none {
+				changes <- "delete {map.name}"
+			}
+			informer.start()
+			defer informer.close()
+			try informer.waitForSync()
+			let got string[] = []
+			for let _ in 0..5 {
+				got.push(<-changes)
+			}
+			assert got[0] == "add a" && got[1] == "add b" && got[2] == "update a 3->12" && got[3] == "delete b" && got[4] == "add c"
+			return none
+		}
+
+		@test()
+		def TestViewsAndStreams() !none {
+			let fake = new FakeServer()
+			fake.answer("GET /api/v1/namespaces/shop/pods/web/log", 200, "one\ntwo\r\nthree")
+			fake.answer("PATCH /apis/apps/v1/namespaces/other/deployments/web/status", 200, `{"metadata":{"name":"web"}}`)
+			fake.answer("GET /api/v1/namespaces/other/configmaps", 200, `{"metadata":{"continue":"next"},"items":[]}`)
+			fake.answer("GET /openapi/v3/apis/apps/v1", 200, `{"components":{"schemas":{"io.k8s.api.apps.v1.Deployment":{"type":"object","x-kubernetes-group-version-kind":[{"group":"apps","kind":"Deployment","version":"v1"}]}}}}`)
+			let server = try fakeServer(fake)
+			defer server.close()
+			let cluster = try fakeCluster(server)
+			let lines string[] = []
+			for let line in try cluster.pods().follow("web", tail = 3) {
+				lines.push(line)
+			}
+			assert lines.len() == 3 && lines[1] == "two" && lines[2] == "three"
+			assert fake.seen[0] == "GET /api/v1/namespaces/shop/pods/web/log?follow=true&tailLines=3"
+			let web = new Deployment()
+			web.name = "web"
+			try cluster.deployments().within("other").applyStatus(web, fieldManager = "ctl")
+			assert fake.seen[1] == "PATCH /apis/apps/v1/namespaces/other/deployments/web/status?fieldManager=ctl"
+			let page = try cluster.configMaps("other").page(limit = 1)
+			assert page.continueToken() == "next"
+			let schema = try cluster.schema("apps/v1", "Deployment")
+			assert textOf(schema.get("type")) == "object"
+			let informer = cluster.configMaps().informer()
+			assert !informer.hasSynced()
+			informer.waitForSync(timeout = 50ms) onerror (err error) {
+				assert kindOf(err) == ErrorKind.TimedOut
+				recover none
+			}
+			return none
+		}
+
+		@test()
+		def TestExecOverWebSocket() !none {
+			let mux = new http.ServeMux()
+			let asked = ""
+			try mux.handle("/", def (ctx http.Context) !none {
+				asked = "{ctx.path()}?{ctx.request.url.rawQuery}"
+				let upgrader = new websocket.Upgrader()
+				upgrader.subprotocols = ["v5.channel.k8s.io"]
+				let conn = try upgrader.upgrade(ctx)
+				let input byte[] = []
+				for {
+					let (_, data) = try conn.readMessage()
+					// Standard input closed: answer and end.
+					break when data.len() == 2 && data[0] == byte(255) && data[1] == byte(0)
+					input.push(...data[1:])
+				}
+				let out byte[] = [byte(1)]
+				out.push(...input)
+				try conn.writeBinary(out)
+				let err byte[] = [byte(2)]
+				err.push(..."warn".bytes())
+				try conn.writeBinary(err)
+				let status byte[] = [byte(3)]
+				status.push(...`{"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"7"}]}}`.bytes())
+				try conn.writeBinary(status)
+				try conn.close()
+				return none
+			})
+			let server = try httptest.Server.start(mux)
+			defer server.close()
+			let pods = (try fakeCluster(server)).pods()
+			let result = try pods.run("web", ["sh", "-c", "cat"], container = "app", input = "hello")
+			assert result.stdout == "hello" && result.stderr == "warn" && result.exitCode == 7
+			assert asked == "/api/v1/namespaces/shop/pods/web/exec?command=sh&command=-c&command=cat&container=app&stderr=true&stdin=true&stdout=true"
+			return none
+		}
+	}
+
+	// A stream that keeps what is written and reads nothing.
+	internal type MemoryStream {
+		written byte[] = []
+
+		def new() {}
+
+		def read(data byte[], timeout duration) !int {
+			return 0
+		}
+
+		def write(data byte[], timeout duration) !int {
+			written.push(...data)
+			return data.len()
+		}
+
+		def close() !none {
+			return none
+		}
+
+		def isOpen() bool {
+			return true
+		}
+	}
+
+	// The frames of a SPDY byte stream.
+	internal def splitFrames(data byte[]) byte[][] {
+		let out byte[][] = []
+		let at = 0
+		for at + 8 <= data.len() {
+			let length = int(data[at + 5]) << 16 | int(data[at + 6]) << 8 | int(data[at + 7])
+			out.push(data[at:at + 8 + length])
+			at += 8 + length
+		}
+		return out
+	}
+
+	// The pairs of an uncompressed SPDY header block.
+	internal def headerPairs(block byte[]) map<string, string> {
+		let out map<string, string> = {}
+		let count = uint32Of(block, 0)
+		let at = 4
+		for let _ in 0..count {
+			let nameLength = uint32Of(block, at)
+			let name = string(block[at + 4:at + 4 + nameLength])
+			at += 4 + nameLength
+			let valueLength = uint32Of(block, at)
+			out[name] = string(block[at + 4:at + 4 + valueLength])
+			at += 4 + valueLength
+		}
+		return out
+	}
+
+	check "Values" {
+		@test()
+		def TestIntOrStringAndMicroTime() !none {
+			let codec = new JSON()
+			let port = ServicePort{port: 80, targetPort: new IntOrString("http")}
+			assert string(codec.encode(port)).contains(`"targetPort":"http"`)
+			let numbered = ServicePort{}
+			try codec.decode(`{"port":443,"targetPort":8443}`, numbered)
+			assert !numbered.targetPort.isText && numbered.targetPort.number == 8443 && numbered.targetPort.str() == "8443"
+			let at = time.fromUnixNs(int64(1793038707) * 1000000000 + 250000999)
+			let micro = new MicroTime(at)
+			assert micro.str() == "2026-10-26T18:18:27.250000Z"
+			let back = new MicroTime()
+			try back.json(micro.json())
+			assert back.at.unixNs() == int64(1793038707) * 1000000000 + 250000000
+			return none
+		}
+
+		@test()
+		def TestUnstructured() !none {
+			let object = new Unstructured("adm.example.com/v1", "CronTab", "nightly", "shop")
+			object.set("spec.schedule.cron", "0 3 * * *")
+			object.set("spec.replicas", 2)
+			assert object.text("spec.schedule.cron") == "0 3 * * *" && object.get("spec.replicas") is int
+			assert object.get("spec.missing.deeper") is none
+			object.remove("spec.schedule")
+			assert object.get("spec.schedule") is none
+			assert object.objectMeta().name == "nightly" && object.objectMeta().namespace == "shop"
+			let typed = try unstructured(ConfigMap{data: {"k": "v"}})
+			assert typed.kind == "ConfigMap" && typed.text("data.k") == "v"
+			let map = ConfigMap{}
+			try typed.decode(map)
+			assert map.data["k"] == "v"
+			return none
+		}
+
+		@test()
+		def TestManifests() !none {
+			let text = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\n\n---\napiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: Secret\n  metadata:\n    name: b\n- apiVersion: apps/v1\n  kind: Deployment\n  metadata:\n    name: c\n"
+			let objects = try readManifests(text)
+			assert objects.len() == 3 && objects[0].name == "a" && objects[1].kind == "Secret" && objects[2].apiVersion == "apps/v1"
+			let fromJson = try readManifests(`[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"n"}}]`)
+			assert fromJson.len() == 1 && fromJson[0].kind == "Namespace"
+			let incomplete = readManifests("metadata:\n  name: x\n") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument && err.message.contains("no apiVersion or kind")
+				recover []
+			}
+			assert incomplete.len() == 0
+			let deployment = new Deployment()
+			deployment.name = "web"
+			deployment.spec.replicas = 0
+			let written = writeManifests([deployment, objects[0]])
+			assert written.contains("kind: Deployment") && written.contains("replicas: 0") && written.contains("---\n")
+			let again = try readManifests(written)
+			assert again.len() == 2 && again[0].get("spec.replicas") is int
+			return none
+		}
+
+		@test()
+		def TestExitCodes() !none {
+			assert try exitCodeOf([], "v5.channel.k8s.io") == 0
+			assert try exitCodeOf(`{"status":"Success"}`.bytes(), "v4.channel.k8s.io") == 0
+			assert try exitCodeOf(`{"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"42"}]}}`.bytes(), "v4.channel.k8s.io") == 42
+			let failed = exitCodeOf(`{"status":"Failure","reason":"InternalError","code":500,"message":"exec: \"nope\": not found"}`.bytes(), "v4.channel.k8s.io") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Server && err.message.contains("not found")
+				recover -1
+			}
+			assert failed == -1
+			assert retryAfter("3", 1) == 3s && retryAfter("", 3) == 4s && retryAfter("600", 1) == 30s
+			assert kindOfStatus(409, "") == ErrorKind.Conflict && kindOfStatus(500, "NotFound") == ErrorKind.NotFound
+			return none
+		}
+
+		@test()
+		def TestSpdyFrames() !none {
+			let wire = new MemoryStream()
+			let conn = new SpdyConn(wire, new bytes.Reader([]))
+			let first = try conn.open({"streamtype": "error", "port": "80"})
+			let second = try conn.open({"streamtype": "data", "port": "80"})
+			assert first.id == 1 && second.id == 3
+			try conn.send(3, "ping".bytes())
+			try conn.closeSend(3)
+			// Both SYN_STREAMs share one zlib stream, compressed against the
+			// dictionary.
+			let inflater = new zlib.Inflater(spdyDictionary())
+			let frames = splitFrames(wire.written)
+			assert frames.len() == 4
+			for let (at, frame) in frames[0:2] {
+				assert frame[0] == byte(0x80) && frame[1] == byte(3) && frame[3] == byte(spdySynStream)
+				assert uint32Of(frame, 8) == at * 2 + 1
+				let block = try inflater.feed(frame[18:])
+				let headers = headerPairs(block)
+				assert headers["port"] == "80" && headers["streamtype"] == (at == 0 ?? ("error", "data"))
+			}
+			assert uint32Of(frames[2], 0) == 3 && string(frames[2][8:]) == "ping"
+			assert frames[3][4] == byte(spdyFin) && frames[3].len() == 8
+			return none
+		}
+	}
+}

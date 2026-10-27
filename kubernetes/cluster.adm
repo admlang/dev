@@ -1,0 +1,203 @@
+partial module adm.dev.kubernetes {
+	use (
+		std.data.encoding::(JSON)
+		std.net.http
+		std.net.url
+		adm.dev.kubernetes.api::*
+	)
+
+	// Cluster is a client of one API server, as one user. Any number of
+	// tasks may share it. `connect` makes one; each kind has an accessor
+	// for its objects (`pods`, `deployments`, `configMaps`, ...), and
+	// `objects` reaches any other kind, custom resources among them.
+	//
+	// ```
+	// let cluster = try kubernetes.connect()
+	// let web = try cluster.deployments("shop").get("web")
+	// print("{web.name}: {web.status.readyReplicas} ready")
+	// ```
+	//
+	// Calls fail with a KubernetesError: ErrorKind.Connection when the
+	// server cannot be reached, ErrorKind.TimedOut when a call that does not
+	// stream takes longer than the Config's timeout, ErrorKind.Closed after
+	// `close`, and the server's answer otherwise (NotFound, AlreadyExists,
+	// Conflict, Invalid, Denied, Expired, Argument, Server), with its
+	// message.
+	partial type Cluster {
+		internal core Core
+
+		def new() {}
+
+		// The namespace accessors take when they are given none: the
+		// context's, or the pod's service account's.
+		namespace string {
+			def get() string {
+				return core.config.namespace
+			}
+		}
+
+		// The Config the client was made with.
+		def config() Config {
+			return core.config
+		}
+
+		// The namespace given, else the default one.
+		internal def namespaceOr(given string) string {
+			return given == "" ?? (core.config.namespace, given)
+		}
+
+		// version returns the server's version: `v1.34.1`, the commit, the
+		// platform.
+		// Fails as the type says.
+		def version() !Info {
+			let out = Info{}
+			try core.call(http.Method.GET, "/version", target = out)
+			return out
+		}
+
+		// groups returns the API groups the server serves, each with its
+		// versions and the one it prefers; the core group comes first,
+		// named "".
+		// Fails as the type says.
+		def groups() !APIGroup[] {
+			let served = APIVersions{}
+			try core.call(http.Method.GET, "/api", target = served)
+			let out APIGroup[] = []
+			let legacy = APIGroup{name: ""}
+			for let version in served.versions {
+				legacy.versions.push(GroupVersionForDiscovery{groupVersion: version, version: version})
+			}
+			legacy.preferredVersion = legacy.versions[0] when legacy.versions.len() > 0
+			out.push(legacy)
+			let rest = APIGroupList{}
+			try core.call(http.Method.GET, "/apis", target = rest)
+			out.push(...rest.groups)
+			return out
+		}
+
+		// resources returns the kinds one group version serves
+		// (`apps/v1`, `v1` for the core group), subresources among them as
+		// `pods/log`.
+		// Fails as the type says, with ErrorKind.NotFound when the server
+		// does not serve the group version.
+		def resources(groupVersion string) !APIResource[] {
+			let out = APIResourceList{}
+			try core.call(http.Method.GET, groupVersionPath(groupVersion), target = out)
+			return out.resources
+		}
+
+		// kind finds how the server serves a kind of a group version: its
+		// plural name and whether it lives in namespaces.
+		// Fails as `resources` does, with ErrorKind.NotFound when the group
+		// version has no such kind.
+		def kind(apiVersion string, kind string) !ResourceKind {
+			for let known in knownKinds() {
+				return known when known.kind == kind && known.apiVersion() == apiVersion
+			}
+			let (group, version) = splitApiVersion(apiVersion)
+			for let resource in try resources(apiVersion) {
+				return ResourceKind{group: group, version: version, kind: kind, plural: resource.name, namespaced: resource.namespaced} when resource.kind == kind && !resource.name.contains("/")
+			}
+			fail errorOf(ErrorKind.NotFound, "kubernetes: the server serves no kind {kind} in {apiVersion}", 404)
+		}
+
+		// objects reaches the objects of any kind as Unstructured: a custom
+		// resource, or a kind of a group the library has no type for. The
+		// kind is looked up with `kind`; a namespaced kind takes the default
+		// namespace when none is named.
+		// Fails as `kind` does.
+		def objects(apiVersion string, kind string, namespace string = "") !Resources<Unstructured> {
+			let found = try self.kind(apiVersion, kind)
+			return new Resources<Unstructured>(core, found, found.namespaced ?? (namespaceOr(namespace), ""))
+		}
+
+		// objects reaches the objects of a kind already described, without
+		// asking the server.
+		def objects(kind ResourceKind, namespace string = "") Resources<Unstructured> {
+			return new Resources<Unstructured>(core, kind, kind.namespaced ?? (namespaceOr(namespace), ""))
+		}
+
+		// schema returns the OpenAPI v3 schema of a kind, the way the
+		// server validates it: a JSON Schema object (`type`, `properties`,
+		// `required`, `x-kubernetes-*` extensions), its `$ref`s left as the
+		// server wrote them, pointing into `components.schemas` of the group
+		// version's document, which `openapi` returns whole.
+		// Fails as `openapi` does, with ErrorKind.NotFound when the
+		// document has no schema for the kind.
+		def schema(apiVersion string, kind string) !map<string, any> {
+			let document = try openapi(apiVersion)
+			let components = document.get("components")
+			if components is map<string, any> {
+				let schemas = components.get("schemas")
+				if schemas is map<string, any> {
+					let (group, version) = splitApiVersion(apiVersion)
+					for let (_, schema) in schemas {
+						continue unless schema is map<string, any>
+						let kinds = schema.get("x-kubernetes-group-version-kind")
+						continue unless kinds is any[]
+						for let entry in kinds {
+							continue unless entry is map<string, any>
+							return schema when textOf(entry.get("group")) == group && textOf(entry.get("version")) == version && textOf(entry.get("kind")) == kind
+						}
+					}
+				}
+			}
+			fail errorOf(ErrorKind.NotFound, "kubernetes: the OpenAPI document of {apiVersion} has no schema for {kind}", 404)
+		}
+
+		// openapi returns the OpenAPI v3 document of a group version
+		// (`/openapi/v3/apis/apps/v1`, `/openapi/v3/api/v1`).
+		// Fails as the type says, with ErrorKind.NotFound when the server
+		// publishes none for it.
+		def openapi(apiVersion string) !map<string, any> {
+			let path = "/openapi/v3{groupVersionPath(apiVersion)}"
+			let data = try core.raw(http.Method.GET, path)
+			let parsed = new JSON().parse(data) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "kubernetes: GET {path}: the answer is not JSON: {err.message}", cause = err)
+			}
+			fail errorOf(ErrorKind.Protocol, "kubernetes: GET {path}: the answer is not an object") unless parsed is map<string, any>
+			return parsed
+		}
+
+		// close drops the connections; calls after it fail with
+		// ErrorKind.Closed.
+		def close() {
+			core.close()
+		}
+	}
+
+	// ResourceKind is how the server serves a kind: its group and version,
+	// the plural name in its paths, and whether its objects live in
+	// namespaces.
+	type ResourceKind {
+		// "" for the core group.
+		group      string
+		version    string
+		kind       string
+		plural     string
+		namespaced bool
+
+		// `apps/v1`, or `v1` for the core group.
+		def apiVersion() string {
+			return group == "" ?? (version, "{group}/{version}")
+		}
+	}
+
+	// A JSON value as text; "" when it is not a string.
+	internal def textOf(value ?any) string {
+		return value is string ?? (value, "")
+	}
+
+	// The path of a group version: `/api/v1` for the core group,
+	// `/apis/apps/v1` for the others.
+	internal def groupVersionPath(apiVersion string) string {
+		return apiVersion.contains("/") ?? ("/apis/{apiVersion}", "/api/{apiVersion}")
+	}
+
+	// The group and version of an `apiVersion`; the core group is "".
+	internal def splitApiVersion(apiVersion string) (string, string) {
+		let slash = apiVersion.indexOf("/")
+		return ("", apiVersion) when slash < 0
+		return (apiVersion.slice(0, slash), apiVersion.slice(slash + 1))
+	}
+}

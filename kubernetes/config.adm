@@ -1,0 +1,218 @@
+// Where the API server is and how to prove who the client is: kubeconfig
+// files with their contexts, and the service account a pod carries.
+partial module adm.dev.kubernetes {
+	use (
+		std.os
+		adm.dev.kubernetes.api::*
+	)
+
+	// Config is everything the client needs to reach one API server as
+	// one user: what a kubeconfig context or a pod's service account comes
+	// down to. Certificates and keys are PEM text; files a kubeconfig
+	// names are read into it, except `tokenFile`, which is read again as
+	// it changes (a pod's token is renewed in place).
+	struct Config {
+		// The API server, `https://10.0.0.1:6443`; a path after the host
+		// prefixes every request (a proxy that serves several clusters).
+		server               string                  = ""
+		// The namespace calls take when they name none.
+		namespace            string                  = "default"
+		// The CA certificates the server's chain must lead to; "" checks it
+		// against the system's roots.
+		certificateAuthority string                  = ""
+		// Take any server certificate: only for a test cluster.
+		insecureSkipVerify   bool                    = false
+		// The name the server's certificate must carry; "" takes the
+		// server's host.
+		serverName           string                  = ""
+		// A client certificate chain and its key, for clusters that take
+		// certificates.
+		clientCertificate    string                  = ""
+		clientKey            ?Secret<string> = none
+		// A bearer token, or a file holding one.
+		token                ?Secret<string> = none
+		tokenFile            string                  = ""
+		// HTTP basic credentials, for clusters that still take them.
+		username             string                  = ""
+		password             ?Secret<string> = none
+		// A program that hands out credentials (a cloud CLI).
+		exec                 ?ExecPlugin             = none
+		// A kubeconfig `auth-provider`; `oidc` is refreshed by the client.
+		authProvider         ?AuthProvider           = none
+		// Act as another user, with the groups and extra fields given.
+		impersonate          ?Impersonation          = none
+		// A proxy all requests go through: `http://`, `https://` or
+		// `socks5://`; "" takes the environment's `HTTPS_PROXY`.
+		proxy                string                  = ""
+		// How long a call that does not stream may take.
+		timeout              duration                = 30s
+		// The `User-Agent` requests carry.
+		userAgent            string                  = "adm.dev.kubernetes"
+	}
+
+	// ExecPlugin is a program that prints credentials as an `ExecCredential`
+	// (client.authentication.k8s.io v1 or v1beta1): `aws eks get-token`,
+	// `gke-gcloud-auth-plugin`, `kubelogin`. The client runs it, without a
+	// shell, when it has no credential or the last one expired, and again
+	// when the server refuses one.
+	struct ExecPlugin {
+		command            string
+		args               string[]            = []
+		// Variables set for the program on top of this program's.
+		env                map<string, string> = {}
+		apiVersion         string              = "client.authentication.k8s.io/v1"
+		// Printed with the failure when the program is not installed.
+		installHint        string              = ""
+		// Whether the program is told the cluster it is for
+		// (`spec.cluster` of `KUBERNETES_EXEC_INFO`).
+		provideClusterInfo bool                = false
+		// `Never`, `IfAvailable` or `Always`. The program runs without a
+		// terminal here, so it is told it cannot ask, and `Always` fails.
+		interactiveMode    string              = "IfAvailable"
+		// What the kubeconfig's `extensions` gave the cluster, handed to
+		// the program with the cluster when `provideClusterInfo` is set.
+		clusterConfig      any                 = none
+	}
+
+	// AuthProvider is a kubeconfig `auth-provider`. The `oidc` provider's
+	// `id-token` is sent and, once it expires, renewed with its
+	// `refresh-token` at the `idp-issuer-url`'s token endpoint; the new
+	// tokens stay in the client (the kubeconfig file is not rewritten).
+	// Other providers (`gcp`, `azure`) were removed from Kubernetes and
+	// fail with the advice to use their exec plugin.
+	struct AuthProvider {
+		name   string
+		config map<string, string> = {}
+	}
+
+	// Impersonation makes requests act as another user, which the
+	// credentials must be allowed to (`impersonate` in RBAC).
+	struct Impersonation {
+		user   string                = ""
+		uid    string                = ""
+		groups string[]              = []
+		extra  map<string, string[]> = {}
+	}
+
+	// Kubeconfig is what kubeconfig files say, several merged as kubectl
+	// merges them: the first file to name a context, cluster or user, or a
+	// current context, wins.
+	type Kubeconfig {
+		// The context `config` takes when it is given none.
+		currentContext  string           = ""
+		internal merged MergedKubeconfig = MergedKubeconfig{}
+		// What the files were read from, which reads the files a context
+		// names; none for the real machine.
+		internal from   ?Surroundings    = none
+
+		def new() {}
+
+		// The names of the contexts, in the order the files give them.
+		def contexts() string[] {
+			let out string[] = []
+			for let entry in merged.contexts {
+				out.push(entry.name)
+			}
+			return out
+		}
+
+		// config returns the Config of a context: its cluster, its user and
+		// its namespace, the files they name read.
+		// Fails with ErrorKind.Argument when the context, its cluster or its
+		// user is not there or a file it names cannot be read.
+		def config(context string = "") !Config {
+			let machine = from
+			return try configOf(merged, context == "" ?? (currentContext, context), machine is none ?? (realSurroundings(), machine))
+		}
+	}
+
+	// loadKubeconfig reads kubeconfig files: the paths given, else those
+	// `KUBECONFIG` lists, else `~/.kube/config`. Files a `KUBECONFIG` list
+	// names that do not exist are skipped, as kubectl skips them.
+	// Fails with ErrorKind.Argument when no file can be read or one does
+	// not read as a kubeconfig.
+	def loadKubeconfig(paths string[] = []) !Kubeconfig {
+		return try readKubeconfigs(paths, realSurroundings())
+	}
+
+	// parseKubeconfig reads a kubeconfig from its text; relative file names
+	// in it are taken from `dir`.
+	// Fails with ErrorKind.Argument when the text does not read as a
+	// kubeconfig.
+	def parseKubeconfig(text string, dir string = "") !Kubeconfig {
+		let out = new Kubeconfig()
+		let file = try decodeKubeconfig(text, "kubeconfig")
+		mergeInto(out.merged, file, dir)
+		out.currentContext = out.merged.currentContext
+		return out
+	}
+
+	// inCluster returns the Config of the pod the program runs in: the API
+	// server from `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`,
+	// the service account's token (read again as it is renewed), its CA
+	// and its namespace.
+	// Fails with ErrorKind.Argument when the program does not run in a pod.
+	def inCluster() !Config {
+		return try inClusterConfig(realSurroundings())
+	}
+
+	// connect reaches the API server of a kubeconfig context (the current
+	// one when none is named), from `kubeconfig` or the files
+	// `loadKubeconfig` reads; with no kubeconfig at all, the cluster the
+	// program runs in.
+	// Fails as `loadKubeconfig`, `Kubeconfig.config` and `inCluster` do;
+	// nothing is sent to the server until the first call.
+	def connect(context string = "", kubeconfig string = "") !Cluster {
+		return try connect(try chooseConfig(context, kubeconfig, realSurroundings()))
+	}
+
+	// connect makes a Cluster that reaches the server of a Config.
+	// Fails with ErrorKind.Argument when the server, a certificate or a
+	// key does not read.
+	def connect(config Config) !Cluster {
+		let made = new Cluster()
+		made.core = try newCore(config, realSurroundings())
+		return made
+	}
+
+	// The files of `paths`, else of `KUBECONFIG`, else `~/.kube/config`,
+	// merged.
+	internal def readKubeconfigs(paths string[], from Surroundings) !Kubeconfig {
+		let files = paths
+		let listed = false
+		if files.len() == 0 {
+			for let part in envOf(from, "KUBECONFIG").split(listSeparator) {
+				files.push(part) unless part.trim() == ""
+			}
+			listed = files.len() > 0
+		}
+		files.push(os.join(from.home, ".kube", "config")) when files.len() == 0
+		let out = new Kubeconfig()
+		let read = 0
+		let present = from.exists
+		let load = from.readFile
+		for let path in files {
+			continue when listed && !present(path)
+			let data = load(path) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "kubernetes: cannot read the kubeconfig {path}: {err.message}", cause = err)
+			}
+			mergeInto(out.merged, try decodeKubeconfig(string(data), path), os.dir(path))
+			read += 1
+		}
+		fail errorOf(ErrorKind.Argument, "kubernetes: no kubeconfig among {files.join(listSeparator)}") when read == 0
+		out.currentContext = out.merged.currentContext
+		out.from = from
+		return out
+	}
+
+	// The Config `connect` takes: the context of the kubeconfig named or
+	// found, else the pod's.
+	internal def chooseConfig(context string, kubeconfig string, from Surroundings) !Config {
+		return try (try readKubeconfigs([kubeconfig], from)).config(context) when kubeconfig != ""
+		let listed = envOf(from, "KUBECONFIG") != ""
+		let present = from.exists
+		let home = os.join(from.home, ".kube", "config")
+		return try (try readKubeconfigs([], from)).config(context) when listed || present(home) || context != ""
+		return try inClusterConfig(from)
+	}
+}
