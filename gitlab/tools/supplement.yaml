@@ -1,0 +1,414 @@
+# Endpoints of GitLab's REST API that its OpenAPI document (doc/api/openapi/openapi_v2.yaml)
+# does not describe yet, or describes otherwise than the API answers, written from the API
+# documentation (docs.gitlab.com/api/users, /api/notes, /api/discussions, /api/search,
+# /api/repository_files, /api/project_level_variables) in the document's own form;
+# tools/generate.py takes an operation from here over the document's. Entities named
+# API_Entities_* are the document's.
+paths:
+  /api/v4/users:
+    get:
+      summary: List users
+      tags: [users]
+      parameters:
+        - {name: username, in: query, type: string, description: The username of a user to find.}
+        - {name: search, in: query, type: string, description: Users whose name, username or public email contains this.}
+        - {name: active, in: query, type: boolean, description: Only active users.}
+        - {name: blocked, in: query, type: boolean, description: Only blocked users.}
+        - {name: external, in: query, type: boolean, description: Only external users.}
+        - {name: exclude_internal, in: query, type: boolean, description: Leave internal users out.}
+        - {name: order_by, in: query, type: string, description: "Order by id, name, username, created_at or updated_at."}
+        - {name: sort, in: query, type: string, description: asc or desc.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The users, schema: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}}
+  /api/v4/users/{id}:
+    get:
+      summary: Get a single user
+      tags: [users]
+      parameters:
+        - {name: id, in: path, required: true, type: integer, description: The user's ID.}
+      responses:
+        "200": {description: The user, schema: {$ref: "#/definitions/API_Entities_UserPublic"}}
+  /api/v4/user:
+    get:
+      summary: Get the current user
+      tags: [users]
+      parameters: []
+      responses:
+        "200": {description: The user the credentials belong to, schema: {$ref: "#/definitions/API_Entities_UserPublic"}}
+  /api/v4/projects/{id}/issues/{issue_iid}/notes:
+    get:
+      summary: List the notes of an issue
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: sort, in: query, type: string, description: asc or desc.}
+        - {name: order_by, in: query, type: string, description: created_at or updated_at.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The notes, schema: {type: array, items: {$ref: "#/definitions/API_Entities_Note"}}}
+    post:
+      summary: Create a note on an issue
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The note's text, Markdown.}
+              internal: {type: boolean, description: Whether only project members see it.}
+              created_at: {type: string, format: date-time, description: When it was written; administrators and owners only.}
+      responses:
+        "201": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+  /api/v4/projects/{id}/issues/{issue_iid}/notes/{note_id}:
+    get:
+      summary: Get a note of an issue
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+      responses:
+        "200": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+    put:
+      summary: Change a note of an issue
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The note's new text.}
+      responses:
+        "200": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+    delete:
+      summary: Delete a note of an issue
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+      responses:
+        "204": {description: Deleted}
+  /api/v4/projects/{id}/merge_requests/{merge_request_iid}/notes:
+    get:
+      summary: List the notes of a merge request
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: sort, in: query, type: string, description: asc or desc.}
+        - {name: order_by, in: query, type: string, description: created_at or updated_at.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The notes, schema: {type: array, items: {$ref: "#/definitions/API_Entities_Note"}}}
+    post:
+      summary: Create a note on a merge request
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The note's text, Markdown.}
+              internal: {type: boolean, description: Whether only project members see it.}
+              merge_request_diff_head_sha: {type: string, description: The head commit the note is about, for /merge quick actions.}
+      responses:
+        "201": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+  /api/v4/projects/{id}/merge_requests/{merge_request_iid}/notes/{note_id}:
+    get:
+      summary: Get a note of a merge request
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+      responses:
+        "200": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+    put:
+      summary: Change a note of a merge request
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The note's new text.}
+      responses:
+        "200": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+    delete:
+      summary: Delete a note of a merge request
+      tags: [notes]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: note_id, in: path, required: true, type: integer, description: The note's ID.}
+      responses:
+        "204": {description: Deleted}
+  /api/v4/projects/{id}/merge_requests/{merge_request_iid}/discussions:
+    get:
+      summary: List the discussions of a merge request
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The discussions, schema: {type: array, items: {$ref: "#/definitions/Discussion"}}}
+    post:
+      summary: Start a discussion on a merge request
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The first note's text.}
+              commit_id: {type: string, description: The commit the discussion is about.}
+              position: {type: object, description: "Where in the diff the discussion is: base_sha, head_sha, start_sha, position_type, new_path, new_line, old_path, old_line."}
+      responses:
+        "201": {description: The discussion, schema: {$ref: "#/definitions/Discussion"}}
+  /api/v4/projects/{id}/merge_requests/{merge_request_iid}/discussions/{discussion_id}:
+    get:
+      summary: Get a discussion of a merge request
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: discussion_id, in: path, required: true, type: string, description: The discussion's ID.}
+      responses:
+        "200": {description: The discussion, schema: {$ref: "#/definitions/Discussion"}}
+    put:
+      summary: Resolve or reopen a discussion of a merge request
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: discussion_id, in: path, required: true, type: string, description: The discussion's ID.}
+        - {name: resolved, in: query, required: true, type: boolean, description: Whether it is resolved.}
+      responses:
+        "200": {description: The discussion, schema: {$ref: "#/definitions/Discussion"}}
+  /api/v4/projects/{id}/merge_requests/{merge_request_iid}/discussions/{discussion_id}/notes:
+    post:
+      summary: Reply to a discussion of a merge request
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: merge_request_iid, in: path, required: true, type: integer, description: The merge request's IID.}
+        - {name: discussion_id, in: path, required: true, type: string, description: The discussion's ID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The reply's text.}
+      responses:
+        "201": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+  /api/v4/projects/{id}/issues/{issue_iid}/discussions:
+    get:
+      summary: List the discussions of an issue
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The discussions, schema: {type: array, items: {$ref: "#/definitions/Discussion"}}}
+    post:
+      summary: Start a discussion on an issue
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The first note's text.}
+      responses:
+        "201": {description: The discussion, schema: {$ref: "#/definitions/Discussion"}}
+  /api/v4/projects/{id}/issues/{issue_iid}/discussions/{discussion_id}/notes:
+    post:
+      summary: Reply to a discussion of an issue
+      tags: [discussions]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: issue_iid, in: path, required: true, type: integer, description: The issue's IID.}
+        - {name: discussion_id, in: path, required: true, type: string, description: The discussion's ID.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [body]
+            properties:
+              body: {type: string, description: The reply's text.}
+      responses:
+        "201": {description: The note, schema: {$ref: "#/definitions/API_Entities_Note"}}
+  /api/v4/projects/{id}/search:
+    get:
+      summary: Search a project
+      tags: [search]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: scope, in: query, required: true, type: string, description: "issues, merge_requests, milestones, notes, wiki_blobs, commits, blobs or users."}
+        - {name: search, in: query, required: true, type: string, description: What to search for.}
+        - {name: ref, in: query, type: string, description: The branch or tag of a blobs or commits search.}
+        - {name: state, in: query, type: string, description: The state of issues or merge requests found.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: What matched, schema: {type: array, items: {type: object}}}
+  /api/v4/groups/{id}/search:
+    get:
+      summary: Search a group
+      tags: [search]
+      parameters:
+        - {name: id, in: path, required: true, type: string, description: The group's ID or path.}
+        - {name: scope, in: query, required: true, type: string, description: "projects, issues, merge_requests, milestones, wiki_blobs, commits, blobs, notes or users."}
+        - {name: search, in: query, required: true, type: string, description: What to search for.}
+        - {name: state, in: query, type: string, description: The state of issues or merge requests found.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: What matched, schema: {type: array, items: {type: object}}}
+  /api/v4/projects/{id}/repository/files/{file_path}:
+    post:
+      summary: Create a file in a repository
+      tags: [repository_files]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: file_path, in: path, required: true, type: string, description: The file's path in the repository.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [branch, content, commit_message]
+            properties:
+              branch: {type: string, description: The branch to commit to.}
+              content: {type: string, description: The file's content.}
+              commit_message: {type: string, description: The commit's message.}
+              start_branch: {type: string, description: The branch to start the new branch from.}
+              encoding: {type: string, description: text (the default) or base64.}
+              author_email: {type: string, description: The commit author's email.}
+              author_name: {type: string, description: The commit author's name.}
+              execute_filemode: {type: boolean, description: Whether the file is executable.}
+      responses:
+        "201": {description: The file made, schema: {$ref: "#/definitions/FileCommit"}}
+    put:
+      summary: Update a file in a repository
+      tags: [repository_files]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: file_path, in: path, required: true, type: string, description: The file's path in the repository.}
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [branch, content, commit_message]
+            properties:
+              branch: {type: string, description: The branch to commit to.}
+              content: {type: string, description: The file's new content.}
+              commit_message: {type: string, description: The commit's message.}
+              start_branch: {type: string, description: The branch to start the new branch from.}
+              encoding: {type: string, description: text (the default) or base64.}
+              author_email: {type: string, description: The commit author's email.}
+              author_name: {type: string, description: The commit author's name.}
+              last_commit_id: {type: string, description: The file's last commit, which must still be its last.}
+              execute_filemode: {type: boolean, description: Whether the file is executable.}
+      responses:
+        "200": {description: The file changed, schema: {$ref: "#/definitions/FileCommit"}}
+  /api/v4/projects/{id}/variables:
+    get:
+      summary: List the CI/CD variables of a project
+      tags: [ci_variables]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The variables, schema: {type: array, items: {$ref: "#/definitions/API_Entities_Ci_Variable"}}}
+parameters:
+  ProjectId: {name: id, in: path, required: true, type: string, description: The project's ID or path (group/project).}
+definitions:
+  FileCommit:
+    type: object
+    description: A file a commit made or changed.
+    properties:
+      file_path: {type: string, description: The file's path.}
+      branch: {type: string, description: The branch the commit is on.}
+  Discussion:
+    type: object
+    description: A thread of notes on an issue, a merge request, a commit or a snippet.
+    properties:
+      id: {type: string, description: The discussion's ID.}
+      individual_note: {type: boolean, description: Whether it is a single note rather than a thread.}
+      notes: {type: array, items: {$ref: "#/definitions/API_Entities_Note"}, description: Its notes in order.}
+# Fields whose type the document gives otherwise than GitLab sends them, as
+# a live instance (18.5) answered: by entity, the field's schema.
+corrections:
+  API_Entities_ContainerExpirationPolicy:
+    enabled: {type: boolean}
+    keep_n: {type: integer}
+  API_Entities_Issue:
+    assignees: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}
+  API_Entities_MergeRequest:
+    assignees: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}
+    reviewers: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}
+  API_Entities_MergeRequestBasic:
+    assignees: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}
+    reviewers: {type: array, items: {$ref: "#/definitions/API_Entities_UserBasic"}}
+  API_Entities_MergeRequestApprovals:
+    approved_by: {type: array, items: {$ref: "#/definitions/API_Entities_Approvals"}}
+  API_Entities_Release:
+    assets.links: {type: array, items: {$ref: "#/definitions/API_Entities_Releases_Link"}}
+    assets.sources: {type: array, items: {$ref: "#/definitions/API_Entities_Releases_Source"}}
+    evidences: {type: array, items: {$ref: "#/definitions/API_Entities_Releases_Evidence"}}
+  API_Entities_Member:
+    access_level: {type: integer, description: "10 guest, 15 planner, 20 reporter, 30 developer, 40 maintainer, 50 owner."}
+  API_Entities_ProjectAccess:
+    access_level: {type: integer}
+    notification_level: {type: integer}
+  API_Entities_UserPublic:
+    identities: {type: array, items: {$ref: "#/definitions/API_Entities_Identity"}}
+    last_activity_on: {type: string, description: The day the user was last active (YYYY-MM-DD).}

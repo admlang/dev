@@ -1,0 +1,131 @@
+partial module adm.dev.gitlab {
+	use (
+		std.data.encoding::(JSON)
+		std.net.http
+		adm.dev.gitlab.api::*
+	)
+
+	// Pages is a list GitLab hands out a page at a time: `all` walks every
+	// page (by offset, or by keyset where the list was asked for with
+	// `pagination = "keyset"`), `page` reads one. Nothing is sent until one
+	// of them is called.
+	//
+	// ```
+	// for let mr in try project.mergeRequests.list(state = gitlab.State.Opened).all() {
+	// 	print("!{mr.iid} {mr.title}")
+	// }
+	// let newest = try project.releases.list().page(1, size = 5)
+	// ```
+	type Pages<T> {
+		// Objects per page `all` asks for: GitLab's largest is 100.
+		pageSize       int    = 100
+		internal link  Link
+		internal path  string
+		internal query Params
+
+		def new(link Link, path string, query Params) {
+			self.link = link
+			self.path = path
+			self.query = query
+		}
+
+		// page returns one page of the list: the `number`th (from 1) of
+		// `size` objects.
+		// Fails as Client's calls do.
+		def page(number int = 1, size int = 20) !T[] {
+			let (items, _, _) = try fetch(urlOf(number, size))
+			return items
+		}
+
+		// all walks every page, fetching the next as the iteration reaches
+		// it (the answer's `Link: rel="next"`); at most `limit` objects when
+		// above 0. The first page is read at once.
+		// Fails as Client's calls do, for the first page; a later page that
+		// fails ends the iteration with its error in `failure`.
+		def all(limit int = 0) !PageStream<T> {
+			let size = limit > 0 && limit < pageSize ?? (limit, pageSize)
+			let (items, next, total) = try fetch(urlOf(1, size))
+			return new PageStream<T>(self, items, next, total, limit)
+		}
+
+		internal def urlOf(number int, size int) string {
+			let ask = query.clone()
+			ask.put("per_page", size)
+			ask.put("page", number) unless ask.has("pagination")
+			return "{link.base}{path}?{ask.encode()}"
+		}
+
+		// One page from its URL: its objects, the next page's URL ("" for
+		// the last) and the total GitLab counts (-1 when it does not say).
+		// Fails as Client's calls do.
+		def fetch(target string) !(T[], string, int) {
+			let (data, res) = try link.exchange(http.Method.GET, target, none)
+			let items T[] = []
+			new JSON().decode(data, items) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "gitlab: GET {target}: the page is not a list: {err.message}", cause = err)
+			}
+			let total = res.header("X-Total")
+			return (items, nextLink(res.header("Link")), total.isNumeric() ?? (total.toInt<int>(), -1))
+		}
+	}
+
+	// PageStream is every object of a list, fetched a page at a time as
+	// the iteration needs it; `Pages.all` makes one.
+	type PageStream<T> {
+		// The failure that ended the iteration; none while it runs or when
+		// it reached the end.
+		failure         ?error   = none
+		// The number of objects GitLab says the list has (`X-Total`); -1
+		// when it does not say (keyset pagination, large lists).
+		total           int
+		internal pages  Pages<T>
+		internal items  T[]
+		internal taken  int      = 0
+		internal next   string
+		internal limit  int
+		internal handed int      = 0
+
+		def new(pages Pages<T>, items T[], next string, total int, limit int) {
+			self.pages = pages
+			self.items = items
+			self.next = next
+			self.total = total
+			self.limit = limit
+		}
+
+		// Implements Iterator<T>: the next object; none at the end, at the
+		// limit, or when a page fails (`failure` says why).
+		def iterate() ?T {
+			return none when limit > 0 && handed >= limit
+			if taken >= items.len() {
+				return none when next == ""
+				let (more, after, _) = pages.fetch(next) onerror (err error) {
+					failure = err
+					next    = ""
+					recover (T[], "", 0)
+				}
+				items = more
+				taken = 0
+				next = after
+				return none when items.len() == 0
+			}
+			let item = items[taken]
+			taken += 1
+			handed += 1
+			return item
+		}
+	}
+
+	// The `next` URL of a `Link` header; "" when there is none.
+	internal def nextLink(header string) string {
+		for let part in header.split(",") {
+			let pieces = part.split(";")
+			continue when pieces.len() < 2
+			let target = pieces[0].trim().trimPrefix("<").trimSuffix(">")
+			for let piece in pieces[1:] {
+				return target when piece.trim() == "rel=\"next\""
+			}
+		}
+		return ""
+	}
+}

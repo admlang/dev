@@ -1,0 +1,307 @@
+// Tests that need no GitLab: a loopback server that answers as the API
+// does, and webhook deliveries made here.
+partial module adm.dev.gitlab {
+	use (
+		std.bytes
+		std.net.http
+		std.net.http.httptest
+		std.testing
+		std.time
+		adm.dev.gitlab.api::*
+	)
+
+	// An answer the loopback server gives a method and path.
+	internal struct FakeAnswer {
+		status  int
+		body    string
+		headers map<string, string> = {}
+	}
+
+	// A loopback server that answers as GitLab does: the answers given for
+	// a method and path in turn (the last one again), else `body`.
+	internal type FakeGitLab {
+		// What an unanswered request gets: 200 with it, 204 when "".
+		body             string                    = "{}"
+		seen             string[]                  = []
+		paths            string[]                  = []
+		bodies           string[]                  = []
+		headers          map<string, string>[]     = []
+		internal answers map<string, FakeAnswer[]> = {}
+
+		def new() {}
+
+		def answer(key string, status int, body string, headers map<string, string> = {}) {
+			let list = answers.get(key)
+			if list is none {
+				answers[key] = [FakeAnswer{status: status, body: body, headers: headers}]
+				return
+			}
+			list.push(FakeAnswer{status: status, body: body, headers: headers})
+		}
+
+		def handle(ctx http.Context) !none {
+			let path = ctx.url().rawPath == "" ?? (ctx.path(), ctx.url().rawPath)
+			let query = ctx.request.url.rawQuery
+			let method = ctx.method().value
+			seen.push("{method} {path}{query == "" ?? ("", "?" + query)}")
+			paths.push("{method} {path}")
+			bodies.push(try ctx.text())
+			let picked map<string, string> = {}
+			for let name in ["PRIVATE-TOKEN", "JOB-TOKEN", "Authorization", "Content-Type", "User-Agent"] {
+				picked[name] = ctx.header(name) unless ctx.header(name) == ""
+			}
+			headers.push(picked)
+			let list = answers.get("{method} {path}")
+			if list is none {
+				return ctx.noContent() when body == ""
+				ctx.setHeader("Content-Type", "application/json")
+				return ctx.text(200, body)
+			}
+			let next = list[0]
+			list.remove(0) when list.len() > 1
+			for let (name, value) in next.headers {
+				ctx.setHeader(name, value)
+			}
+			ctx.setHeader("Content-Type", "application/json")
+			return ctx.noContent(next.status) when next.status == 204
+			return ctx.text(next.status, next.body)
+		}
+
+		// Whether the last request had the method and a path that matches
+		// the pattern, `*` standing for one parameter.
+		def last(method string, pattern string) bool {
+			return false when paths.len() == 0
+			let line = paths[paths.len() - 1]
+			let space = line.indexOf(" ")
+			return false unless line.slice(0, space) == method
+			let got = line.slice(space + 1).split("/")
+			let want = pattern.split("/")
+			return false unless got.len() == want.len()
+			for let (at, part) in want {
+				continue when part == "*"
+				return false unless part == got[at]
+			}
+			return true
+		}
+	}
+
+	internal def fakeGitLab(fake FakeGitLab) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			return try fake.handle(ctx)
+		})
+		return try httptest.Server.start(mux)
+	}
+
+	internal def fakeClient(server httptest.Server, kind TokenKind = TokenKind.Private) !Client {
+		return try connect("glpat-test", url = "http://{server.address().str()}", kind = kind)
+	}
+
+	internal def kindOf(err error) ErrorKind {
+		return err.kind when err is GitLabError
+		return ErrorKind.Server
+	}
+
+	check "Client" {
+		@test()
+		def TestRequestsAndErrors() !none {
+			let fake = new FakeGitLab()
+			fake.answer("GET /api/v4/projects/group%2Fapp", 200, `{"id":7,"name":"app","path_with_namespace":"group/app","default_branch":"main"}`)
+			fake.answer("GET /api/v4/projects/group%2Fmissing", 404, `{"message":"404 Project Not Found"}`, {"X-Request-Id": "req-1"})
+			fake.answer("POST /api/v4/projects/7/repository/branches", 400, `{"message":{"branch":["is invalid"],"ref":["can't be blank"]}}`)
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
+			let project = try gl.project("group/app").get()
+			assert project.pathWithNamespace == "group/app" && project.defaultBranch == "main"
+			assert fake.headers[0]["PRIVATE-TOKEN"] == "glpat-test"
+			let missing = gl.project("group/missing").get() onerror (err error) {
+				assert kindOf(err) == ErrorKind.NotFound && err.message.contains("404 Project Not Found")
+				assert err is GitLabError && err.requestId == "req-1"
+				recover ProjectDetails{}
+			}
+			assert missing.name == ""
+			let refused = gl.project(7).branches.create("bad name", "") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				assert err is GitLabError && err.problems["branch"][0] == "is invalid"
+				recover Branch{}
+			}
+			assert refused.name == ""
+			let job = try fakeClient(server, TokenKind.Job)
+			try job.project(7).get()
+			assert fake.headers[fake.headers.len() - 1]["JOB-TOKEN"] == "glpat-test"
+			let oauth = try fakeClient(server, TokenKind.OAuth)
+			try oauth.project(7).get()
+			assert fake.headers[fake.headers.len() - 1]["Authorization"] == "Bearer glpat-test"
+			let refusedUrl = connect("t", url = "ftp://x") onerror (err error) {
+				assert kindOf(err) == ErrorKind.Argument
+				recover gl
+			}
+			assert refusedUrl.limits().limit == 0
+			return none
+		}
+
+		@test()
+		def TestMergeRequestsAndPipelines() !none {
+			let fake = new FakeGitLab()
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let root = "http://{server.address().str()}"
+			fake.answer("GET /api/v4/projects/group%2Fapp/merge_requests", 200, `[{"id":1,"iid":3,"title":"Fix","state":"opened"}]`, {"Link": "<{root}/api/v4/projects/group%2Fapp/merge_requests?page=2&per_page=100&state=opened>; rel=\"next\"", "X-Total": "2"})
+			fake.answer("GET /api/v4/projects/group%2Fapp/merge_requests", 200, `[{"id":2,"iid":4,"title":"Feature","state":"opened"}]`)
+			fake.answer("POST /api/v4/projects/group%2Fapp/pipeline", 201, `{"id":99,"iid":12,"ref":"main","status":"created"}`)
+			fake.answer("PUT /api/v4/projects/group%2Fapp/merge_requests/3/merge", 200, `{"id":1,"iid":3,"state":"merged"}`)
+			let gl = try fakeClient(server)
+			let project = gl.project("group/app")
+			let titles string[] = []
+			let stream = try project.mergeRequests.list(state = State.Opened).all()
+			for let mr in stream {
+				titles.push("!{mr.iid} {mr.title}")
+			}
+			assert titles.len() == 2 && titles[1] == "!4 Feature" && stream.total == 2 && stream.failure is none
+			assert fake.seen[0] == "GET /api/v4/projects/group%2Fapp/merge_requests?page=1&per_page=100&state=opened"
+			let pipeline = try project.pipelines.create("main", variables = {"DEPLOY": "staging"})
+			assert pipeline.id == 99
+			assert fake.bodies[2] == `{"ref":"main","variables":[{"key":"DEPLOY","value":"staging"}]}`
+			let merged = try project.mergeRequests.merge(3, squash = true)
+			assert merged.state == "merged" && fake.bodies[3].contains(`"squash":true`)
+			let keyset = try project.mergeRequests.list().page(1, size = 5)
+			assert keyset.len() == 1
+			return none
+		}
+
+		@test()
+		def TestRateLimit() !none {
+			let fake = new FakeGitLab()
+			fake.answer("GET /api/v4/projects/1", 429, `{"message":"Retry later"}`, {"Retry-After": "1", "RateLimit-Limit": "600", "RateLimit-Remaining": "0"})
+			fake.answer("GET /api/v4/projects/1", 200, `{"id":1}`, {"RateLimit-Limit": "600", "RateLimit-Remaining": "599"})
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
+			let started = time.now()
+			let project = try gl.project(1).get()
+			assert project.id == 1 && time.now() - started >= 1s && fake.seen.len() == 2
+			assert gl.limits().limit == 600 && gl.limits().remaining == 599
+			let strict = try fakeClient(server)
+			strict.rateLimitWait = 0s
+			fake.answer("GET /api/v4/projects/2", 429, `{"message":"Retry later"}`, {"Retry-After": "30"})
+			let limited = strict.project(2).get() onerror (err error) {
+				assert kindOf(err) == ErrorKind.RateLimited
+				recover ProjectDetails{}
+			}
+			assert limited.id == 0
+			return none
+		}
+
+		@test()
+		def TestUsersNotesAndFiles() !none {
+			let fake = new FakeGitLab()
+			fake.answer("GET /api/v4/user", 200, `{"id":5,"username":"ana","name":"Ana"}`)
+			fake.answer("POST /api/v4/projects/7/issues/2/notes", 201, `{"id":44,"body":"Looks good"}`)
+			fake.answer("GET /api/v4/projects/7/repository/files/docs%2Freadme.md/raw", 200, "# Read me")
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
+			let me = try gl.me.get()
+			assert me.username == "ana"
+			let note = try gl.project(7).issues.createNote(2, "Looks good")
+			assert note.id == 44 && fake.bodies[1] == `{"body":"Looks good"}`
+			let raw = try gl.project(7).files.raw("docs/readme.md", "main")
+			assert raw is string && raw == "# Read me"
+			assert fake.seen[2].startsWith("GET /api/v4/projects/7/repository/files/docs%2Freadme.md/raw?")
+			return none
+		}
+
+		@test()
+		def TestConnectFromCi() !none {
+			let fake = new FakeGitLab()
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try connect("job-token", url = "http://{server.address().str()}/api/v4/", kind = TokenKind.Job)
+			try gl.project(3).get()
+			assert fake.seen[0] == "GET /api/v4/projects/3" && fake.headers[0]["JOB-TOKEN"] == "job-token"
+			return none
+		}
+	}
+
+	check "GraphQL" {
+		@test()
+		def TestQueriesAndPages() !none {
+			let fake = new FakeGitLab()
+			fake.answer("POST /api/graphql", 200, `{"data":{"currentUser":{"username":"ana"}}}`)
+			fake.answer("POST /api/graphql", 200, `{"errors":[{"message":"Field 'nope' doesn't exist on type 'Query'"}]}`)
+			fake.answer("POST /api/graphql", 200, `{"data":{"project":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"c1"},"nodes":[{"iid":"1","title":"a"}]}}}}`)
+			fake.answer("POST /api/graphql", 200, `{"data":{"project":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"iid":"2","title":"b"}]}}}}`)
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
+			let out = CurrentUserData{}
+			try gl.graphql(`query { currentUser { username } }`, target = out)
+			assert out.currentUser.username == "ana" && fake.headers[0]["PRIVATE-TOKEN"] == "glpat-test"
+			gl.graphql(`query { nope }`) onerror (err error) {
+				assert kindOf(err) == ErrorKind.Query && err.message.contains("doesn't exist")
+				recover none
+			}
+			let titles string[] = []
+			for let node in try gl.graphqlPages<IssueNode>(`query($cursor: String) { x }`, "project.issues").all() {
+				titles.push(node.title)
+			}
+			assert titles.len() == 2 && titles[1] == "b" && fake.bodies[3].contains(`"cursor":"c1"`)
+			return none
+		}
+	}
+
+	internal struct CurrentUserData {
+		currentUser CurrentUserNode = CurrentUserNode{}
+	}
+
+	internal struct CurrentUserNode {
+		username string = ""
+	}
+
+	internal struct IssueNode {
+		iid   string = ""
+		title string = ""
+	}
+
+	check "Webhooks" {
+		@test()
+		def TestDeliveries() !none {
+			let events WebhookEvent[] = []
+			let hooks = new Webhooks("s3cret")
+			let mux = new http.ServeMux()
+			try mux.handle("/gitlab", hooks.handler((event WebhookEvent) => events.push(event)))
+			let server = try httptest.Server.start(mux)
+			defer server.close()
+			let client = server.client()
+			let target = "http://{server.address().str()}/gitlab"
+			let payload = `{"object_kind":"merge_request","event_type":"merge_request","user":{"id":1,"username":"ana"},"project":{"id":7,"path_with_namespace":"group/app"},"object_attributes":{"id":1,"iid":3,"title":"Fix","state":"opened","action":"open","source_branch":"fix","target_branch":"main"},"labels":[{"id":2,"title":"bug"}]}`
+			let delivered = try client.do(try delivery(target, "Merge Request Hook", payload, "s3cret"))
+			assert delivered.status == 204 && events.len() == 1
+			let event = events[0]
+			assert event.name == "Merge Request Hook" && event.kind == "merge_request" && event.delivery == "uuid-1"
+			let opened = try event.mergeRequest()
+			fail "no payload" when opened is none
+			assert opened.objectAttributes.iid == 3 && opened.objectAttributes.action == "open" && opened.project.pathWithNamespace == "group/app" && opened.labels[0].title == "bug"
+			assert try event.push() is none
+			let forged = try client.do(try delivery(target, "Push Hook", payload, "wrong"))
+			assert forged.status == 401 && events.len() == 1
+			let push = `{"object_kind":"push","before":"a","after":"b","ref":"refs/heads/main","user_username":"ana","project":{"id":7},"commits":[{"id":"b","message":"Fix","added":["x.adm"],"author":{"name":"Ana"}}],"total_commits_count":1}`
+			try client.do(try delivery(target, "Push Hook", push, "s3cret"))
+			let pushed = try events[1].push()
+			fail "no push" when pushed is none
+			assert pushed.ref == "refs/heads/main" && pushed.commits[0].added[0] == "x.adm" && pushed.commits[0].author.name == "Ana"
+			return none
+		}
+	}
+
+	// A webhook delivery as GitLab sends it.
+	internal def delivery(target string, name string, payload string, token string) !http.Request {
+		let req = try http.newRequest(http.Method.POST, target, new bytes.Reader(payload.bytes()))
+		req.headers.set("Content-Type", "application/json")
+		req.headers.set("X-Gitlab-Event", name)
+		req.headers.set("X-Gitlab-Event-UUID", "uuid-1")
+		req.headers.set("X-Gitlab-Token", token)
+		return req
+	}
+}

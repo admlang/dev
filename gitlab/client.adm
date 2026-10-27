@@ -1,0 +1,188 @@
+partial module adm.dev.gitlab {
+	use (
+		std.proto.auth.oauth2
+		std.services.runtime::(Runtime)
+		adm.dev.gitlab.api::*
+	)
+
+	// Where gitlab.com is.
+	internal const publicServer = "https://gitlab.com"
+
+	// Client is a client of a GitLab instance's API as one identity. Any
+	// number of tasks may share it. `connect` makes one.
+	//
+	// ```
+	// let gl = try gitlab.connect(token, url = "https://gitlab.example.com")
+	// let project = gl.project("group/app")
+	// let pipeline = try project.pipelines.create("main", variables = {"DEPLOY": "staging"})
+	// ```
+	//
+	// Calls fail with a GitLabError: ErrorKind.Connection when GitLab
+	// cannot be reached, ErrorKind.TimedOut when a call takes longer than
+	// `timeout`, ErrorKind.RateLimited when the rate limit stays exhausted
+	// longer than `rateLimitWait`, and GitLab's answer otherwise (NotFound,
+	// Denied, Invalid, Conflict, Argument, Server), with its message.
+	partial type Client {
+		internal wire Link
+
+		def new(wire Link) {
+			self.wire = wire
+		}
+
+		// How long a call waits for an exhausted rate limit to reset before
+		// it fails; 0s fails at once.
+		rateLimitWait duration {
+			def get() duration {
+				return wire.rateLimitWait
+			}
+
+			def set(given duration) {
+				wire.rateLimitWait = given
+			}
+		}
+
+		// How long a call may take.
+		timeout duration {
+			def get() duration {
+				return wire.timeout
+			}
+
+			def set(given duration) {
+				wire.timeout = given
+			}
+		}
+
+		// The rate limit as the last answer said.
+		def limits() RateLimit {
+			return wire.rateLimit()
+		}
+
+		// A project, by its path (`group/subgroup/app`). Nothing is sent
+		// until a call is made on it.
+		def project(path string) Project {
+			return new Project(wire, path)
+		}
+
+		// A project, by its numeric ID.
+		def project(id int) Project {
+			return new Project(wire, "{id}")
+		}
+
+		// A group, by its path or numeric ID.
+		def group(path string) Group {
+			return new Group(wire, path)
+		}
+
+		// A group, by its numeric ID.
+		def group(id int) Group {
+			return new Group(wire, "{id}")
+		}
+
+		// A user, by numeric ID; `users.list(username = ...)` finds one by
+		// name.
+		def user(id int) User {
+			return new User(wire, "{id}")
+		}
+
+		// The user the token belongs to.
+		me Me {
+			def get() Me {
+				return new Me(wire)
+			}
+		}
+	}
+
+	// connect makes a Client of a GitLab instance (`url`, gitlab.com when
+	// none) with a token. With no token given it takes `GITLAB_TOKEN`; in a
+	// CI job without one, the job's `CI_JOB_TOKEN` (as a job token) and
+	// `CI_SERVER_URL`. `kind` says how the token is sent: a personal,
+	// project or group access token, a job token, or an OAuth token.
+	// Fails with ErrorKind.Argument when the URL is not http or https.
+	def connect(token string = "", url string = "", kind TokenKind = TokenKind.Private) !Client {
+		let given = token
+		let sent = kind
+		let server = url
+		if given == "" {
+			given = envText("GITLAB_TOKEN")
+			if given == "" && envText("CI_JOB_TOKEN") != "" {
+				given = envText("CI_JOB_TOKEN")
+				sent = TokenKind.Job
+			}
+		}
+		server = envText("CI_SERVER_URL") when server == ""
+		server = publicServer when server == ""
+		server = server.trimSuffix("/").trimSuffix("/api/v4")
+		fail errorOf(ErrorKind.Argument, "gitlab: {server} is neither http nor https") unless server.startsWith("https://") || server.startsWith("http://")
+		let secret ?Secret<string> = none
+		secret = new Secret<string>(given) unless given == ""
+		return new Client(new Link("{server}/api/v4", "{server}/api/graphql", secret, sent))
+	}
+
+	internal def envText(name string) string {
+		let value = Runtime.getEnv(name)
+		return value is none ?? ("", value)
+	}
+
+	// oauthClient is the OAuth client of an application on a GitLab
+	// instance (gitlab.com when none): `authorize` makes the address to
+	// send the user to, `exchange` turns the code GitLab sends back into a
+	// token, which `connect(token, kind = TokenKind.OAuth)` uses, and
+	// `refresh` renews it.
+	def oauthClient(clientId string, clientSecret string = "", url string = "") oauth2.Client {
+		let server = url == "" ?? (publicServer, url.trimSuffix("/"))
+		let metadata = new oauth2.ServerMetadata(server)
+		metadata.authorizationEndpoint = "{server}/oauth/authorize"
+		metadata.tokenEndpoint = "{server}/oauth/token"
+		metadata.revocationEndpoint = "{server}/oauth/revoke"
+		metadata.deviceAuthorizationEndpoint = "{server}/oauth/authorize_device"
+		let oauth = new oauth2.Client(clientId, metadata)
+		oauth.secret = new Secret<string>(clientSecret) unless clientSecret == ""
+		return oauth
+	}
+
+	// Project is a project, by path or ID: its own calls (`get`, `update`,
+	// `delete`, `fork`, ...) and its collections (`mergeRequests`,
+	// `issues`, `pipelines`, `jobs`, `commits`, `branches`, `tags`,
+	// `files`, `releases`, `variables`, ...).
+	partial type Project {
+		// The path or ID the project was named by.
+		id            string
+		internal wire Link
+
+		def new(wire Link, id string) {
+			self.wire = wire
+			self.id = id
+		}
+	}
+
+	// Group is a group, by path or ID.
+	partial type Group {
+		id            string
+		internal wire Link
+
+		def new(wire Link, id string) {
+			self.wire = wire
+			self.id = id
+		}
+	}
+
+	// User is a user, by ID.
+	partial type User {
+		id            string
+		internal wire Link
+
+		def new(wire Link, id string) {
+			self.wire = wire
+			self.id = id
+		}
+	}
+
+	// Me is the user the token belongs to.
+	partial type Me {
+		internal wire Link
+
+		def new(wire Link) {
+			self.wire = wire
+		}
+	}
+}

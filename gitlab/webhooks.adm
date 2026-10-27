@@ -1,0 +1,622 @@
+partial module adm.dev.gitlab {
+	use (
+		std.crypto::(constantTimeEqual)
+		std.data.encoding::(JSON, json)
+		std.net.http
+		std.time
+		adm.dev.gitlab.api::*
+	)
+
+	// The longest webhook body taken: GitLab caps payloads at 25 MB.
+	internal const longestPayload = 25 * 1024 * 1024
+
+	// WebhookEvent is one webhook delivery: what happened (`name`, `kind`),
+	// and its payload, which the accessor of its kind decodes
+	// (`event.push()`, `event.mergeRequest()`, ...); `decode` reads it into
+	// a type of the program's for the kinds without one.
+	type WebhookEvent {
+		// The `X-Gitlab-Event` header: `Push Hook`, `Merge Request Hook`.
+		name     string
+		// The payload's `object_kind`: `push`, `tag_push`, `merge_request`,
+		// `issue`, `note`, `pipeline`, `build` (a job), `deployment`,
+		// `release`, `wiki_page`, ...
+		kind     string = ""
+		// The delivery's id (`X-Gitlab-Event-UUID`).
+		delivery string = ""
+		// The instance that sent it (`X-Gitlab-Instance`).
+		instance string = ""
+		// The payload as GitLab sent it.
+		payload  byte[] = []
+
+		def new(name string, payload byte[]) {
+			self.name = name
+			self.payload = payload
+		}
+
+		// decode reads the payload into a value of the program's.
+		// Fails with ErrorKind.Protocol when it does not read as one.
+		def decode(target any) !none {
+			new JSON().decode(payload, target) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "gitlab: the {kind} payload does not read as the type: {err.message}", cause = err)
+			}
+			return none
+		}
+
+		// A push to a branch; none for another kind.
+		// Fails when the payload does not read as one.
+		def push() !?PushEvent {
+			return none unless kind == "push"
+			let out = PushEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A tag pushed or deleted; none for another kind.
+		// Fails when the payload does not read as one.
+		def tagPush() !?PushEvent {
+			return none unless kind == "tag_push"
+			let out = PushEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A merge request opened, changed, merged, closed, approved, ...;
+		// none for another kind.
+		// Fails when the payload does not read as one.
+		def mergeRequest() !?MergeRequestEvent {
+			return none unless kind == "merge_request"
+			let out = MergeRequestEvent{}
+			try decode(out)
+			return out
+		}
+
+		// An issue (or work item) opened, changed or closed; none for
+		// another kind.
+		// Fails when the payload does not read as one.
+		def issue() !?IssueEvent {
+			return none unless kind := "issue" || "work_item"
+			let out = IssueEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A comment on a commit, merge request, issue or snippet; none for
+		// another kind.
+		// Fails when the payload does not read as one.
+		def note() !?NoteEvent {
+			return none unless kind == "note"
+			let out = NoteEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A pipeline's status changed; none for another kind.
+		// Fails when the payload does not read as one.
+		def pipeline() !?PipelineEvent {
+			return none unless kind == "pipeline"
+			let out = PipelineEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A job's status changed; none for another kind.
+		// Fails when the payload does not read as one.
+		def job() !?JobEvent {
+			return none unless kind == "build"
+			let out = JobEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A deployment started, succeeded, failed or was canceled; none for
+		// another kind.
+		// Fails when the payload does not read as one.
+		def deployment() !?DeploymentEvent {
+			return none unless kind == "deployment"
+			let out = DeploymentEvent{}
+			try decode(out)
+			return out
+		}
+
+		// A release created, changed or deleted; none for another kind.
+		// Fails when the payload does not read as one.
+		def release() !?ReleaseEvent {
+			return none unless kind == "release"
+			let out = ReleaseEvent{}
+			try decode(out)
+			return out
+		}
+	}
+
+	internal struct EventHead {
+		@json("object_kind", omitempty = true)
+		objectKind string = ""
+	}
+
+	// HookUser is a user as webhooks name them.
+	struct HookUser {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		name string = ""
+		@json(omitempty = true)
+		username string = ""
+		@json(omitempty = true)
+		email string = ""
+		@json("avatar_url", omitempty = true)
+		avatarUrl string = ""
+	}
+
+	// HookProject is a project as webhooks name it.
+	struct HookProject {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		name string = ""
+		@json(omitempty = true)
+		namespace string = ""
+		@json("path_with_namespace", omitempty = true)
+		pathWithNamespace string = ""
+		@json("web_url", omitempty = true)
+		webUrl string = ""
+		@json("default_branch", omitempty = true)
+		defaultBranch string = ""
+		@json("git_http_url", omitempty = true)
+		gitHttpUrl string = ""
+		@json("git_ssh_url", omitempty = true)
+		gitSshUrl string = ""
+		// 0 private, 10 internal, 20 public.
+		@json("visibility_level", omitempty = true)
+		visibilityLevel int = 0
+	}
+
+	// HookCommitAuthor is who wrote a commit.
+	struct HookCommitAuthor {
+		@json(omitempty = true)
+		name string = ""
+		@json(omitempty = true)
+		email string = ""
+	}
+
+	// HookCommit is a commit as webhooks name it.
+	struct HookCommit {
+		@json(omitempty = true)
+		id string = ""
+		@json(omitempty = true)
+		message string = ""
+		@json(omitempty = true)
+		title string = ""
+		@json(omitempty = true)
+		timestamp ?time.Time = none
+		@json(omitempty = true)
+		url string = ""
+		@json(omitempty = true)
+		author HookCommitAuthor = HookCommitAuthor{}
+		// The files the commit added, changed and removed (a push's
+		// commits only).
+		@json(omitempty = true)
+		added string[] = []
+		@json(omitempty = true)
+		modified string[] = []
+		@json(omitempty = true)
+		removed string[] = []
+	}
+
+	// HookLabel is a label as webhooks name it.
+	struct HookLabel {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		title string = ""
+		@json(omitempty = true)
+		color string = ""
+	}
+
+	// PushEvent is a push to a branch, or of a tag (`tagPush`).
+	struct PushEvent {
+		// The commit before and after the push; all zeros when the branch
+		// or tag was made or deleted.
+		@json(omitempty = true)
+		before string = ""
+		@json(omitempty = true)
+		after string = ""
+		// `refs/heads/main`, `refs/tags/v1.0`.
+		@json(omitempty = true)
+		ref string = ""
+		@json("checkout_sha", omitempty = true)
+		checkoutSha string = ""
+		@json("user_id", omitempty = true)
+		userId int = 0
+		@json("user_name", omitempty = true)
+		userName string = ""
+		@json("user_username", omitempty = true)
+		userUsername string = ""
+		@json("user_email", omitempty = true)
+		userEmail string = ""
+		@json("project_id", omitempty = true)
+		projectId int = 0
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		// The commits pushed, at most 20 (`totalCommitsCount` says how
+		// many there were).
+		@json(omitempty = true)
+		commits HookCommit[] = []
+		@json("total_commits_count", omitempty = true)
+		totalCommitsCount int = 0
+	}
+
+	// MergeRequestAttributes is the merge request of a MergeRequestEvent.
+	struct MergeRequestAttributes {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		iid int = 0
+		@json(omitempty = true)
+		title string = ""
+		@json(omitempty = true)
+		description string = ""
+		// `opened`, `closed`, `locked`, `merged`.
+		@json(omitempty = true)
+		state string = ""
+		// `open`, `close`, `reopen`, `update`, `approval`, `approved`,
+		// `unapproval`, `unapproved`, `merge`.
+		@json(omitempty = true)
+		action string = ""
+		@json("source_branch", omitempty = true)
+		sourceBranch string = ""
+		@json("target_branch", omitempty = true)
+		targetBranch string = ""
+		@json(omitempty = true)
+		url string = ""
+		@json("detailed_merge_status", omitempty = true)
+		detailedMergeStatus string = ""
+		@json("author_id", omitempty = true)
+		authorId int = 0
+		@json(omitempty = true)
+		draft bool = false
+		@json("last_commit", omitempty = true)
+		lastCommit HookCommit = HookCommit{}
+		@json("created_at", omitempty = true)
+		createdAt string = ""
+		@json("updated_at", omitempty = true)
+		updatedAt string = ""
+	}
+
+	// MergeRequestEvent is a merge request opened, changed, approved or
+	// merged.
+	struct MergeRequestEvent {
+		@json("event_type", omitempty = true)
+		eventType string = ""
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json("object_attributes", omitempty = true)
+		objectAttributes MergeRequestAttributes = MergeRequestAttributes{}
+		@json(omitempty = true)
+		labels HookLabel[] = []
+		@json(omitempty = true)
+		assignees HookUser[] = []
+		@json(omitempty = true)
+		reviewers HookUser[] = []
+		// What changed, by field: `previous` and `current` of each.
+		@json(omitempty = true)
+		changes map<string, any> = {}
+	}
+
+	// IssueAttributes is the issue of an IssueEvent.
+	struct IssueAttributes {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		iid int = 0
+		@json(omitempty = true)
+		title string = ""
+		@json(omitempty = true)
+		description string = ""
+		// `opened`, `closed`.
+		@json(omitempty = true)
+		state string = ""
+		// `open`, `close`, `reopen`, `update`.
+		@json(omitempty = true)
+		action string = ""
+		@json(omitempty = true)
+		url string = ""
+		@json(omitempty = true)
+		confidential bool = false
+		@json("created_at", omitempty = true)
+		createdAt string = ""
+		@json("updated_at", omitempty = true)
+		updatedAt string = ""
+	}
+
+	// IssueEvent is an issue opened, changed or closed.
+	struct IssueEvent {
+		@json("event_type", omitempty = true)
+		eventType string = ""
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json("object_attributes", omitempty = true)
+		objectAttributes IssueAttributes = IssueAttributes{}
+		@json(omitempty = true)
+		labels HookLabel[] = []
+		@json(omitempty = true)
+		assignees HookUser[] = []
+		@json(omitempty = true)
+		changes map<string, any> = {}
+	}
+
+	// NoteAttributes is the comment of a NoteEvent.
+	struct NoteAttributes {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		note string = ""
+		// `Commit`, `MergeRequest`, `Issue`, `Snippet`.
+		@json("noteable_type", omitempty = true)
+		noteableType string = ""
+		@json(omitempty = true)
+		url string = ""
+		@json("author_id", omitempty = true)
+		authorId int = 0
+		@json("created_at", omitempty = true)
+		createdAt string = ""
+	}
+
+	// NoteEvent is a comment on a commit, a merge request, an issue or a
+	// snippet; the one of them it is on comes with it.
+	struct NoteEvent {
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json("object_attributes", omitempty = true)
+		objectAttributes NoteAttributes = NoteAttributes{}
+		@json("merge_request", omitempty = true)
+		mergeRequest ?MergeRequestAttributes = none
+		@json(omitempty = true)
+		issue ?IssueAttributes = none
+		@json(omitempty = true)
+		commit ?HookCommit = none
+	}
+
+	// PipelineAttributes is the pipeline of a PipelineEvent.
+	struct PipelineAttributes {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		iid int = 0
+		@json(omitempty = true)
+		ref string = ""
+		@json(omitempty = true)
+		tag bool = false
+		@json(omitempty = true)
+		sha string = ""
+		// `push`, `web`, `schedule`, `merge_request_event`, `api`, ...
+		@json(omitempty = true)
+		source string = ""
+		// `created`, `pending`, `running`, `success`, `failed`,
+		// `canceled`, `skipped`, `manual`.
+		@json(omitempty = true)
+		status string = ""
+		@json("detailed_status", omitempty = true)
+		detailedStatus string = ""
+		@json(omitempty = true)
+		stages string[] = []
+		// Seconds it ran.
+		@json(omitempty = true)
+		duration ?int = none
+		@json(omitempty = true)
+		url string = ""
+		@json("created_at", omitempty = true)
+		createdAt string = ""
+		@json("finished_at", omitempty = true)
+		finishedAt ?string = none
+	}
+
+	// PipelineJob is a job of a PipelineEvent.
+	struct PipelineJob {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		stage string = ""
+		@json(omitempty = true)
+		name string = ""
+		@json(omitempty = true)
+		status string = ""
+		@json(omitempty = true)
+		duration ?float = none
+		@json(omitempty = true)
+		manual bool = false
+		@json("allow_failure", omitempty = true)
+		allowFailure bool = false
+		@json("failure_reason", omitempty = true)
+		failureReason ?string = none
+	}
+
+	// PipelineEvent is a pipeline's status changing.
+	struct PipelineEvent {
+		@json("object_attributes", omitempty = true)
+		objectAttributes PipelineAttributes = PipelineAttributes{}
+		@json("merge_request", omitempty = true)
+		mergeRequest ?MergeRequestAttributes = none
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json(omitempty = true)
+		commit HookCommit = HookCommit{}
+		@json(omitempty = true)
+		builds PipelineJob[] = []
+	}
+
+	// JobEvent is a job's status changing.
+	struct JobEvent {
+		@json(omitempty = true)
+		ref string = ""
+		@json(omitempty = true)
+		tag bool = false
+		@json(omitempty = true)
+		sha string = ""
+		@json("build_id", omitempty = true)
+		jobId int = 0
+		@json("build_name", omitempty = true)
+		jobName string = ""
+		@json("build_stage", omitempty = true)
+		jobStage string = ""
+		@json("build_status", omitempty = true)
+		jobStatus string = ""
+		@json("build_duration", omitempty = true)
+		jobDuration ?float = none
+		@json("build_allow_failure", omitempty = true)
+		jobAllowFailure bool = false
+		@json("build_failure_reason", omitempty = true)
+		jobFailureReason string = ""
+		@json("pipeline_id", omitempty = true)
+		pipelineId int = 0
+		@json("project_id", omitempty = true)
+		projectId int = 0
+		@json("project_name", omitempty = true)
+		projectName string = ""
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json(omitempty = true)
+		commit map<string, any> = {}
+	}
+
+	// DeploymentEvent is a deployment starting, succeeding, failing or
+	// being canceled.
+	struct DeploymentEvent {
+		// `running`, `success`, `failed`, `canceled`.
+		@json(omitempty = true)
+		status string = ""
+		@json("status_changed_at", omitempty = true)
+		statusChangedAt string = ""
+		@json("deployment_id", omitempty = true)
+		deploymentId int = 0
+		@json("deployable_id", omitempty = true)
+		deployableId int = 0
+		@json("deployable_url", omitempty = true)
+		deployableUrl string = ""
+		@json(omitempty = true)
+		environment string = ""
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json("short_sha", omitempty = true)
+		shortSha string = ""
+		@json(omitempty = true)
+		user HookUser = HookUser{}
+		@json("commit_url", omitempty = true)
+		commitUrl string = ""
+		@json("commit_title", omitempty = true)
+		commitTitle string = ""
+		@json(omitempty = true)
+		ref string = ""
+	}
+
+	// ReleaseEvent is a release created, changed or deleted.
+	struct ReleaseEvent {
+		@json(omitempty = true)
+		id int = 0
+		@json(omitempty = true)
+		name string = ""
+		@json(omitempty = true)
+		tag string = ""
+		@json(omitempty = true)
+		description string = ""
+		// `create`, `update`, `delete`.
+		@json(omitempty = true)
+		action string = ""
+		@json(omitempty = true)
+		url string = ""
+		@json("released_at", omitempty = true)
+		releasedAt string = ""
+		@json(omitempty = true)
+		project HookProject = HookProject{}
+		@json(omitempty = true)
+		commit HookCommit = HookCommit{}
+	}
+
+	// Webhooks checks webhook deliveries against the hook's secret token
+	// (`X-Gitlab-Token`) and hands each to a function as a WebhookEvent.
+	//
+	// ```
+	// let hooks = new gitlab.Webhooks(secret)
+	// try server.handle("/gitlab", hooks.handler((event gitlab.WebhookEvent) => print(event.kind)))
+	// ```
+	type Webhooks {
+		internal secret string
+
+		// Deliveries carrying `secret` as their token; "" takes them
+		// without one (a hook without a secret token).
+		def new(secret string) {
+			self.secret = secret
+		}
+
+		// handler is an http.Handler that checks each delivery and calls
+		// `handle` with its event.
+		def handler(handle def (WebhookEvent) none) WebhookHandler {
+			return new WebhookHandler(self, def (event WebhookEvent) !none {
+				handle(event)
+				return none
+			})
+		}
+
+		// handler for a function that can fail: a delivery it fails on is
+		// answered 500, which GitLab shows in the hook's recent events.
+		def handler(handle def (WebhookEvent) !none) WebhookHandler {
+			return new WebhookHandler(self, handle)
+		}
+
+		// verify checks a delivery's `X-Gitlab-Token` against the secret.
+		def verify(token string) bool {
+			return true when secret == ""
+			return constantTimeEqual(secret.bytes(), token.bytes())
+		}
+
+		// event reads a delivery whose token checked: its headers and body.
+		// Fails with ErrorKind.Argument when the body is not JSON.
+		def event(headers http.Header, body byte[]) !WebhookEvent {
+			let made = new WebhookEvent(headers.get("X-Gitlab-Event"), body)
+			made.delivery = headers.get("X-Gitlab-Event-UUID")
+			made.instance = headers.get("X-Gitlab-Instance")
+			let head = EventHead{}
+			new JSON().decode(body, head) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "gitlab: the delivery is not JSON: {err.message}", cause = err)
+			}
+			made.kind = head.objectKind
+			return made
+		}
+	}
+
+	// WebhookHandler is the http.Handler `Webhooks.handler` makes: a
+	// delivery that is not a POST is answered 405, one too large 413, one
+	// whose token does not check 401, one that is not JSON 400, one the
+	// function fails on 500, and the others 204.
+	type WebhookHandler {
+		internal hooks  Webhooks
+		internal handle def (WebhookEvent) !none
+
+		def new(hooks Webhooks, handle def (WebhookEvent) !none) {
+			self.hooks = hooks
+			self.handle = handle
+		}
+
+		// Implements http.Handler.
+		// Fails when the answer cannot be written, or the function fails on
+		// the event.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "webhook deliveries come by POST") unless ctx.method() == http.Method.POST
+			return ctx.text(401, "the token does not match") unless hooks.verify(ctx.header("X-Gitlab-Token"))
+			let body = try ctx.bytes()
+			return ctx.text(413, "the delivery is larger than 25 MB") when body.len() > longestPayload
+			let event = hooks.event(ctx.request.headers, body) onerror (err error) {
+				return ctx.text(400, err.message)
+			}
+			try handle(event)
+			return ctx.noContent()
+		}
+	}
+}

@@ -1,3 +1,95 @@
+// A GitLab API client: REST and GraphQL as a personal, project or group
+// access token, a CI job token or an OAuth user, with pagination (offset
+// and keyset) and the rate limit waited for, and webhooks checked against
+// their secret token and handed out as typed events. Self-managed
+// instances are reached through their URL.
+//
+// ```adm
+// let gl = try gitlab.connect(token, url = "https://gitlab.example.com")
+// let project = gl.project("group/app")
+// for let mr in try project.mergeRequests.list(state = gitlab.State.Opened).all() {
+// 	print("!{mr.iid} {mr.title}")
+// }
+// ```
 partial module adm.dev.gitlab {
-	// GitLab API over std.net.http: REST and GraphQL, personal, project, job and OAuth tokens, pagination and rate limits, webhook token verification and typed events, self-managed base URLs
+	use (
+		std.errors
+		std.time
+	)
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is GitLabError`.
+	enum ErrorKind {
+		// GitLab cannot be reached, or the connection broke.
+		Connection  = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut    = "timeout",
+		// A parameter GitLab or the client does not take (400 and other
+		// 4xx), or a URL the client cannot read.
+		Argument    = "argument",
+		// The token was refused (401), or it may not do this (403).
+		Denied      = "denied",
+		// No such project, group, user or object, or one the token may not
+		// see (404).
+		NotFound    = "notfound",
+		// The request conflicts with the object's state (409): a branch or
+		// a merge request already there.
+		Conflict    = "conflict",
+		// The request does not pass validation (422).
+		Invalid     = "invalid",
+		// The rate limit is exhausted for longer than the client waits.
+		RateLimited = "ratelimited",
+		// A GraphQL query answered with errors.
+		Query       = "query",
+		// What GitLab sent is not what the API says it sends.
+		Protocol    = "protocol",
+		// GitLab failed (500 and the rest).
+		Server      = "server",
+	}
+
+	// GitLabError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct GitLabError {
+		message   string
+		code      string
+		cause     ?error
+		stack     errors.StackTrace
+		kind      ErrorKind
+		// The HTTP status GitLab answered with; 0 when the failure is not
+		// an answer of GitLab.
+		status    int
+		// What GitLab said about each field it refused, by field.
+		problems  map<string, string[]> = {}
+		// GitLab's id of the request (`X-Request-Id`), for its logs.
+		requestId string                = ""
+	}
+
+	// State filters issues and merge requests, and sets theirs.
+	enum State {
+		Opened = "opened",
+		Closed = "closed",
+		Merged = "merged",
+		Locked = "locked",
+		All    = "all",
+	}
+
+	// TokenKind is how a token is sent.
+	enum TokenKind {
+		// A personal, project or group access token (`PRIVATE-TOKEN`).
+		Private = "private",
+		// A CI job token (`JOB-TOKEN`), `CI_JOB_TOKEN` in a pipeline.
+		Job     = "job",
+		// An OAuth access token (`Authorization: Bearer`).
+		OAuth   = "oauth",
+	}
+
+	// RateLimit is how much of the rate limit is left, as the last answer
+	// said.
+	struct RateLimit {
+		// Requests allowed per window; 0 before an answer said.
+		limit     int        = 0
+		remaining int        = 0
+		// When the window starts again.
+		reset     ?time.Time = none
+	}
 }

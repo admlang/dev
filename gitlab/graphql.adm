@@ -1,0 +1,186 @@
+partial module adm.dev.gitlab {
+	use (
+		std.data.encoding::(JSON, json)
+		std.net.http
+		adm.dev.gitlab.api::*
+	)
+
+	// What a GraphQL answer holds.
+	internal struct GraphQLAnswer {
+		@json(omitempty = true)
+		data any
+		@json(omitempty = true)
+		errors GraphQLProblem[] = []
+	}
+
+	// GraphQLProblem is one error a GraphQL answer lists.
+	struct GraphQLProblem {
+		@json(omitempty = true)
+		message string = ""
+		// `NOT_FOUND`, `FORBIDDEN`, ...
+		@json("type", omitempty = true)
+		typeName string = ""
+		// Where in the answer the error is, as names and indexes.
+		@json(omitempty = true)
+		path any[] = []
+	}
+
+	// Client's GraphQL.
+	partial type Client {
+		// graphql runs a query or mutation with its variables and returns
+		// the answer's `data`, decoded onto `target` too when one is given
+		// (a struct shaped like the query).
+		//
+		// ```
+		// struct CurrentUser { username string }
+		// struct Data { currentUser CurrentUser = CurrentUser{} }
+		// let out = Data{}
+		// try gl.graphql("query { currentUser { username } }", target = out)
+		// ```
+		// Fails with ErrorKind.Query when the answer lists errors (their
+		// messages joined), and as Client's calls do.
+		def graphql(query string, variables map<string, any> = {}, target any = none) !any {
+			let body = map<string, any>{"query": query}
+			body["variables"] = variables unless variables.len() == 0
+			let codec = new JSON()
+			let (data, _) = try wire.exchange(http.Method.POST, wire.graphqlUrl, codec.encode(body))
+			let answer = GraphQLAnswer{}
+			codec.decode(data, answer) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "gitlab: graphql: the answer is not GraphQL's: {err.message}", cause = err)
+			}
+			if answer.errors.len() > 0 {
+				let messages string[] = []
+				for let problem in answer.errors {
+					messages.push(problem.message)
+				}
+				fail errorOf(ErrorKind.Query, "gitlab: graphql: {messages.join("; ")}")
+			}
+			if !(target is none) && !(answer.data is none) {
+				codec.decode(codec.encode(answer.data), target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "gitlab: graphql: the data does not read as the target: {err.message}", cause = err)
+				}
+			}
+			return answer.data
+		}
+
+		// graphqlPages walks a connection of a query page by page: the query
+		// takes `$cursor: String` and passes it as `after: $cursor` to the
+		// connection at `path` (dotted, `project.issues`), which asks for
+		// `pageInfo { hasNextPage endCursor }` and `nodes { ... }`. Each node
+		// is decoded as a T.
+		//
+		// ```
+		// let query = "query($cursor: String) { project(fullPath: \"group/app\") { issues(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { iid title } } } }"
+		// for let issue in try gl.graphqlPages<IssueNode>(query, "project.issues").all() {
+		// 	print(issue.title)
+		// }
+		// ```
+		def graphqlPages<T>(query string, path string, variables map<string, any> = {}) GraphQLPages<T> {
+			return new GraphQLPages<T>(self, query, path, variables)
+		}
+	}
+
+	// GraphQLPages is a connection of a GraphQL query, walked page by page;
+	// `Client.graphqlPages` makes one.
+	type GraphQLPages<T> {
+		internal client    Client
+		internal query     string
+		internal path      string
+		internal variables map<string, any>
+
+		def new(client Client, query string, path string, variables map<string, any>) {
+			self.client = client
+			self.query = query
+			self.path = path
+			self.variables = variables
+		}
+
+		// all walks every node of the connection, asking for the next page
+		// as the iteration reaches it. The first page is read at once.
+		// Fails as `Client.graphql` does for the first page, and with
+		// ErrorKind.Protocol when `path` names no connection with `nodes`
+		// and `pageInfo`; a later page that fails ends the iteration with
+		// its error in `failure`.
+		def all() !GraphQLStream<T> {
+			let (nodes, cursor) = try fetch(none)
+			return new GraphQLStream<T>(self, nodes, cursor)
+		}
+
+		// One page: its nodes and the cursor of the next ("" for the last).
+		// Fails as `all` does.
+		def fetch(cursor ?string) !(T[], string) {
+			let asked = variables.clone()
+			asked["cursor"] = cursor unless cursor is none
+			let data = try client.graphql(query, asked)
+			let at ?any = data
+			for let step in path.split(".") {
+				fail errorOf(ErrorKind.Protocol, "gitlab: graphql: the answer has no {path}") unless at is map<string, any>
+				at = at.get(step)
+			}
+			fail errorOf(ErrorKind.Protocol, "gitlab: graphql: {path} is not a connection") unless at is map<string, any>
+			let codec = new JSON()
+			let nodes T[] = []
+			let found = at.get("nodes")
+			if found is none {
+				let edges = at.get("edges")
+				if edges is any[] {
+					let picked any[] = []
+					for let edge in edges {
+						continue unless edge is map<string, any>
+						let node = edge.get("node")
+						picked.push(node) unless node is none
+					}
+					found = picked
+				}
+			}
+			fail errorOf(ErrorKind.Protocol, "gitlab: graphql: {path} asks for neither nodes nor edges") when found is none
+			codec.decode(codec.encode(found), nodes) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "gitlab: graphql: the nodes of {path} do not read as the type: {err.message}", cause = err)
+			}
+			let info = at.get("pageInfo")
+			fail errorOf(ErrorKind.Protocol, "gitlab: graphql: {path} asks for no pageInfo") unless info is map<string, any>
+			let more = info.get("hasNextPage")
+			let end = info.get("endCursor")
+			let next = ""
+			next = end when more is bool && more && end is string
+			return (nodes, next)
+		}
+	}
+
+	// GraphQLStream is every node of a connection, fetched a page at a
+	// time; `GraphQLPages.all` makes one.
+	type GraphQLStream<T> {
+		// The failure that ended the iteration; none while it runs or when
+		// it reached the end.
+		failure         ?error          = none
+		internal pages  GraphQLPages<T>
+		internal nodes  T[]
+		internal taken  int             = 0
+		internal cursor string
+
+		def new(pages GraphQLPages<T>, nodes T[], cursor string) {
+			self.pages = pages
+			self.nodes = nodes
+			self.cursor = cursor
+		}
+
+		// Implements Iterator<T>: the next node; none at the end or when a
+		// page fails.
+		def iterate() ?T {
+			if taken >= nodes.len() {
+				return none when cursor == ""
+				let (more, next) = pages.fetch(cursor) onerror (err error) {
+					failure = err
+					recover (T[], "")
+				}
+				nodes = more
+				taken = 0
+				cursor = next
+				return none when nodes.len() == 0
+			}
+			let node = nodes[taken]
+			taken += 1
+			return node
+		}
+	}
+}

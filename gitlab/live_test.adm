@@ -1,0 +1,155 @@
+// Tests against a GitLab instance; without ADM_TEST_GITLAB_TOKEN,
+// ADM_TEST_GITLAB_URL and ADM_TEST_GITLAB_PROJECT they pass without
+// running. In the project they make a branch with a commit, a merge
+// request with notes and a discussion, an issue, a CI variable, a pipeline
+// and a release, all named `adm-test-*`, and remove what can be removed.
+partial module adm.dev.gitlab {
+	use (
+		std.crypto
+		std.testing
+		std.time
+	)
+
+	@env("ADM_TEST_GITLAB_TOKEN")
+	internal const liveToken string
+
+	@env("ADM_TEST_GITLAB_URL")
+	internal const liveUrl string
+
+	// The path of a scratch project the token may write to.
+	@env("ADM_TEST_GITLAB_PROJECT")
+	internal const liveProject string
+
+	internal def liveName(what string) string {
+		let suffix = (crypto.rand(4) onerror recover byte[1, 2, 3, 4]).hex().lower()
+		return "adm-test-{what}-{suffix}"
+	}
+
+	internal def liveReady() bool {
+		return liveToken != "" && liveUrl != "" && liveProject != ""
+	}
+
+	internal def ensureCiConfig(project Project, branch string) !none {
+		let present = true
+		project.files.get(".gitlab-ci.yml", branch) onerror (err error) {
+			fail err unless kindOf(err) == ErrorKind.NotFound
+			present = false
+			recover none
+		}
+		return none when present
+		try project.files.create(".gitlab-ci.yml", branch, "adm-test:\n  script: echo adm\n", "Add a CI configuration for the adm.dev.gitlab tests")
+		return none
+	}
+
+	internal def waitForDiffs(project Project, iid int) !Diff[] {
+		for let _ in 0..40 {
+			let found = try project.mergeRequests.diffs(iid).page(1)
+			return found when found.len() > 0
+			time.sleep(250ms)
+		}
+		return try project.mergeRequests.diffs(iid).page(1)
+	}
+
+	internal def dropBranch(project Project, branch string) {
+		project.branches.delete(branch) onerror recover none
+	}
+
+	check "GitLab" {
+		@test()
+		def TestLiveMergeRequests() !none {
+			return none unless liveReady()
+			let gl = try connect(liveToken, url = liveUrl)
+			let project = gl.project(liveProject)
+			let details = try project.get()
+			assert details.pathWithNamespace == liveProject
+			let branch = liveName("branch")
+			try project.branches.create(branch, details.defaultBranch)
+			defer dropBranch(project, branch)
+			let file = "{branch}.md"
+			try project.files.create(file, branch, "Written by the adm.dev.gitlab tests.\n", "Add {file}")
+			let read = try project.files.raw(file, branch)
+			assert read is string && read == "Written by the adm.dev.gitlab tests.\n"
+			let mr = try project.mergeRequests.create(liveName("mr"), branch, details.defaultBranch, removeSourceBranch = true)
+			assert mr.iid > 0 && mr.state == "opened"
+			let found = try project.mergeRequests.list(state = State.Opened, sourceBranch = branch).all()
+			let iids int[] = []
+			for let listed in found {
+				iids.push(listed.iid)
+			}
+			assert iids.len() == 1 && iids[0] == mr.iid
+			let note = try project.mergeRequests.createNote(mr.iid, "A note of the tests.")
+			assert note.id > 0
+			let thread = try project.mergeRequests.createDiscussion(mr.iid, "A thread of the tests.")
+			try project.mergeRequests.createDiscussionsNote(mr.iid, thread.id, "A reply.")
+			let threads = try project.mergeRequests.discussions(mr.iid).page(1)
+			assert threads.len() >= 2
+			// GitLab works the diff out after the merge request is made.
+			let changes = try waitForDiffs(project, mr.iid)
+			assert changes.len() == 1 && changes[0].newPath == file
+			let closed = try project.mergeRequests.update(mr.iid, stateEvent = "close")
+			assert closed.state == "closed"
+			return none
+		}
+
+		@test()
+		def TestLiveIssuesAndCi() !none {
+			return none unless liveReady()
+			let gl = try connect(liveToken, url = liveUrl)
+			let project = gl.project(liveProject)
+			let issue = try project.issues.create(liveName("issue"), description = "Opened by the tests.", labels = ["adm-test"])
+			let note = try project.issues.createNote(issue.iid, "Looked at.")
+			assert note.body == "Looked at."
+			let notes = try project.issues.notes(issue.iid).page(1)
+			assert notes.len() >= 1
+			let done = try project.issues.update(issue.iid, stateEvent = "close")
+			assert done.state == "closed"
+			try project.issues.delete(issue.iid)
+			let variable = liveName("var").upper().replace("-", "_")
+			try project.variables.create(variable, "value", masked = false)
+			let listed = try project.variables.list().all()
+			let seen = false
+			for let item in listed {
+				seen = true when item.key == variable
+			}
+			assert seen
+			try project.variables.delete(variable)
+			let me = try gl.me.get()
+			assert me.username != ""
+			let out = CurrentUserData{}
+			try gl.graphql(`query { currentUser { username } }`, target = out)
+			assert out.currentUser.username == me.username
+			let found = try project.search("issues", "adm-test").page(1)
+			for let hit in found {
+				assert hit.text("title").startsWith("adm-test")
+			}
+			return none
+		}
+
+		@test()
+		def TestLivePipelinesAndReleases() !none {
+			return none unless liveReady()
+			let gl = try connect(liveToken, url = liveUrl)
+			let project = gl.project(liveProject)
+			let details = try project.get()
+			let tag = liveName("tag")
+			try project.tags.create(tag, details.defaultBranch)
+			let release = try project.releases.create(tagName = tag, name = "Test release", description = "Made by the tests.")
+			assert release.tagName == tag
+			let releases = try project.releases.list().page(1)
+			assert releases.len() >= 1
+			try project.releases.delete(tag)
+			try project.tags.delete(tag)
+			// A pipeline needs a CI configuration; the project keeps the one
+			// made here.
+			try ensureCiConfig(project, details.defaultBranch)
+			let pipeline = try project.pipelines.create(details.defaultBranch, variables = {"ADM_TEST": "1"})
+			assert pipeline.id > 0
+			let canceled = try project.pipelines.cancel(pipeline.id)
+			assert canceled.id == pipeline.id
+			let pipelines = try project.pipelines.list(ref = details.defaultBranch).page(1)
+			assert pipelines.len() >= 1
+			try project.pipelines.delete(pipeline.id)
+			return none
+		}
+	}
+}

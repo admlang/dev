@@ -1,0 +1,51 @@
+partial module adm.dev.gitlab {
+	use (
+		std.data.encoding::(JSON)
+		adm.dev.gitlab.api::*
+	)
+
+	// JsonValue is an answer the API does not type: a search hit, whose
+	// shape follows the scope searched. `get` reads a member, `decode` reads
+	// it into a type of the program's.
+	type JsonValue {
+		value any = none
+
+		def new() {}
+
+		// The member under a name; none when it is not an object or has no
+		// such member.
+		def get(name string) ?any {
+			let tree = value
+			return none unless tree is map<string, any>
+			return tree.get(name)
+		}
+
+		// The text of a member; "" when it is not a string.
+		def text(name string) string {
+			let member = get(name)
+			return member is string ?? (member, "")
+		}
+
+		// decode reads the value into a type of the program's.
+		// Fails with ErrorKind.Protocol when it does not read as one.
+		def decode(target any) !none {
+			let codec = new JSON()
+			codec.decode(codec.encode(value), target) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "gitlab: the value does not read as the type: {err.message}", cause = err)
+			}
+			return none
+		}
+
+		// Implements JSONDecoder.
+		// Fails when the JSON does not parse.
+		def json(data byte[]) !none {
+			value = try new JSON().parse(data)
+			return none
+		}
+
+		// Implements JSONEncoder.
+		def json() byte[] {
+			return new JSON().encode(value)
+		}
+	}
+}

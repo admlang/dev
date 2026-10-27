@@ -1,0 +1,233 @@
+// The HTTP side of the client: requests to the REST API with the token,
+// the rate limit read from every answer and waited for, and GitLab's
+// errors read into GitLabErrors.
+internal partial module adm.dev.gitlab.api {
+	use (
+		std.bytes
+		std.data.encoding::(JSON)
+		std.io
+		std.net.http
+		std.time
+		adm.dev.gitlab::*
+	)
+
+	// How often a throttled request (429) is sent again.
+	const throttleRetries = 3
+
+	// Link is what a Client and its projects, groups and collections
+	// share: where the API is, the token and the rate limit.
+	type Link {
+		// `https://gitlab.com/api/v4`, or a self-managed instance's.
+		base                  string
+		// The GraphQL endpoint.
+		graphqlUrl            string
+		internal token        ?Secret<string>
+		internal kind         TokenKind
+		// How long a call waits for an exhausted rate limit to reset before
+		// it fails with RateLimited; 0s fails at once.
+		rateLimitWait         duration        = 5min
+		// How long a call may take.
+		timeout               duration        = 1min
+		userAgent             string          = "adm.dev.gitlab"
+		internal client       http.Client
+		internal atomic limit RateLimit       = RateLimit{}
+
+		def new(base string, graphqlUrl string, token ?Secret<string>, kind TokenKind) {
+			self.base = base
+			self.graphqlUrl = graphqlUrl
+			self.token = token
+			self.kind = kind
+			let transport = new http.Transport()
+			transport.maxIdlePerHost = 8
+			client = new http.Client()
+			client.transport = transport
+		}
+
+		def rateLimit() RateLimit {
+			return limit
+		}
+
+		// call sends a request with its parameters and decodes the JSON
+		// answer onto `target` (none: the answer is dropped).
+		// Fails as `fetch` does, and with ErrorKind.Protocol when the answer
+		// does not decode.
+		def call(method http.Method, path string, query Params, body ?Params, target ?any) !none {
+			let data = try fetch(method, path, query, body)
+			if !(target is none) && data.len() > 0 {
+				new JSON().decode(data, target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "gitlab: {method} {path}: the answer does not read as the API says: {err.message}", cause = err)
+				}
+			}
+			return none
+		}
+
+		// fetch sends a request and returns the answer's body.
+		// Fails as `exchange` does.
+		def fetch(method http.Method, path string, query Params, body ?Params) !byte[] {
+			let target = "{base}{path}"
+			let encoded = query.encode()
+			target = "{target}?{encoded}" unless encoded == ""
+			let payload ?byte[] = none
+			let media = ""
+			if !(body is none) {
+				let (data, contentType) = try body.body()
+				payload = data
+				media = contentType
+			}
+			let (data, _) = try exchange(method, target, payload, media)
+			return data
+		}
+
+		// exchange sends a request to a full URL (a page's `next` link among
+		// them) and returns the body and the answer.
+		// Fails with a GitLabError: Connection or TimedOut as the request
+		// fails, RateLimited when the rate limit stays exhausted longer than
+		// `rateLimitWait`, and GitLab's error for a status of 400 and above.
+		def exchange(method http.Method, target string, body ?byte[], media string = "application/json") !(byte[], http.Response) {
+			let throttled = 0
+			for {
+				let payload ?io.Reader = none
+				payload = new bytes.Reader(body) unless body is none
+				let req = http.newRequest(method, target, payload) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "gitlab: {method} {target}: {err.message}", cause = err)
+				}
+				req.headers.set("Accept", "application/json")
+				req.headers.set("User-Agent", userAgent)
+				req.headers.set("Content-Type", media) unless body is none || media == ""
+				authorize(req.headers)
+				req.deadline = time.now() + timeout when timeout > 0s
+				let res = client.do(req) onerror (err error) {
+					fail transportError(err, "{method} {target}")
+				}
+				noteLimit(res)
+				let data = res.bytes() onerror (err error) {
+					fail transportError(err, "{method} {target}")
+				}
+				res.close() onerror recover none
+				if res.status == 429 && throttled < throttleRetries {
+					let wait = throttleWait(res)
+					fail errorOf(ErrorKind.RateLimited, "gitlab: {method} {target}: rate limited for {wait}; longer than rateLimitWait", res.status) when wait > rateLimitWait
+					throttled += 1
+					time.sleep(wait)
+					continue
+				}
+				fail statusError(data, res, "{method} {target}") when res.status >= 400
+				return (data, res)
+			}
+			fail errorOf(ErrorKind.Server, "gitlab: {method} {target}: no answer")
+		}
+
+		// Puts the token on request headers as its kind is sent.
+		def authorize(headers http.Header) {
+			let given = token
+			return when given is none
+			switch kind {
+				case TokenKind.Private:
+					headers.set("PRIVATE-TOKEN", given.reveal())
+				case TokenKind.Job:
+					headers.set("JOB-TOKEN", given.reveal())
+				case TokenKind.OAuth:
+					headers.set("Authorization", "Bearer {given.reveal()}")
+			}
+		}
+
+		// Reads the rate limit an answer reports.
+		internal atomic def noteLimit(res http.Response) {
+			let total = res.header("RateLimit-Limit")
+			return when total == "" || !total.isNumeric()
+			let next = RateLimit{limit: total.toInt<int>()}
+			let remaining = res.header("RateLimit-Remaining")
+			next.remaining = remaining.toInt<int>() when remaining.isNumeric()
+			let reset = res.header("RateLimit-Reset")
+			next.reset = time.fromUnixNs(int64(reset.toInt<int>()) * 1000000000) when reset.isNumeric()
+			limit = next
+		}
+	}
+
+	// How long to wait before sending a throttled request again: its
+	// `Retry-After`, else until `RateLimit-Reset`, else a minute.
+	def throttleWait(res http.Response) duration {
+		let after = res.header("Retry-After")
+		return 1s * float(after.toInt<int>()) when after.isNumeric()
+		let reset = res.header("RateLimit-Reset")
+		if reset.isNumeric() {
+			let wait = time.fromUnixNs(int64(reset.toInt<int>()) * 1000000000) - time.now()
+			return wait > 0s ?? (wait, 1s)
+		}
+		return 1min
+	}
+
+	// The error of a failed request that got no answer.
+	def transportError(err error, about string) GitLabError {
+		return err when err is GitLabError
+		let message = err.message.lower()
+		let kind = message.contains("timeout") || message.contains("timed out") || message.contains("deadline") ?? (ErrorKind.TimedOut, ErrorKind.Connection)
+		return errorOf(kind, "gitlab: {about}: {err.message}", cause = err)
+	}
+
+	// The GitLabError a failed answer says. GitLab writes `message` as text,
+	// or as the fields it refused with their reasons, or `error` as text.
+	def statusError(data byte[], res http.Response, about string) GitLabError {
+		let message = ""
+		let problems map<string, string[]> = {}
+		let tree = new JSON().parse(data) onerror recover none
+		if tree is map<string, any> {
+			let given = tree.get("message")
+			if given is string {
+				message = given
+			} else if given is map<string, any> {
+				let parts string[] = []
+				for let (field, reasons) in given {
+					let texts string[] = []
+					if reasons is any[] {
+						for let reason in reasons {
+							texts.push(textOf(reason))
+						}
+					} else {
+						texts.push(textOf(reasons))
+					}
+					problems[field] = texts
+					parts.push("{field} {texts.join(", ")}")
+				}
+				message = parts.join("; ")
+			} else if given is any[] {
+				let parts string[] = []
+				for let reason in given {
+					parts.push(textOf(reason))
+				}
+				message = parts.join("; ")
+			}
+			let other = tree.get("error")
+			message = other when message == "" && other is string
+		}
+		message = string(data).trim() when message == ""
+		message = "{res.status} {res.reason}" when message == ""
+		let out = errorOf(kindOfStatus(res.status), "gitlab: {about}: {message}", res.status)
+		out.problems = problems
+		out.requestId = res.header("X-Request-Id")
+		return out
+	}
+
+	def kindOfStatus(status int) ErrorKind {
+		switch {
+			case status == 401 || status == 403:
+				return ErrorKind.Denied
+			case status == 404:
+				return ErrorKind.NotFound
+			case status == 409:
+				return ErrorKind.Conflict
+			case status == 422:
+				return ErrorKind.Invalid
+			case status == 429:
+				return ErrorKind.RateLimited
+			case status >= 400 && status < 500:
+				return ErrorKind.Argument
+		}
+		return ErrorKind.Server
+	}
+
+	// The error of a failure of this library.
+	def errorOf(kind ErrorKind, message string, status int = 0, cause ?error = none) GitLabError {
+		return GitLabError{message: message, code: kind.value, cause: cause, kind: kind, status: status}
+	}
+}
