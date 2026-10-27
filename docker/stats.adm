@@ -1,0 +1,182 @@
+partial module adm.dev.docker {
+	use (
+		std.data.encoding
+		std.net.http
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// ContainerStats is a container's resource use at one moment, with the
+	// CPU reading before it (`precpuStats`) to measure the CPU between the
+	// two.
+	type ContainerStats {
+		read ?time.Time
+		preread ?time.Time
+		@json("cpu_stats")
+		cpuStats CpuStats
+		@json("precpu_stats")
+		precpuStats CpuStats
+		@json("memory_stats")
+		memoryStats MemoryStats
+		@json("pids_stats")
+		pidsStats PidsStats
+		@json("blkio_stats")
+		blkioStats BlkioStats
+		// By interface name; empty for a container without a network.
+		networks map<string, NetworkStats>
+
+		def new() {}
+
+		// The CPU the container used between the two readings, in percent
+		// of one CPU (200 is two CPUs busy); 0 without a previous reading.
+		def cpuPercent() float {
+			let used = cpuStats.cpuUsage.totalUsage - precpuStats.cpuUsage.totalUsage
+			let total = cpuStats.systemCpuUsage - precpuStats.systemCpuUsage
+			return 0.0 when used <= 0 || total <= 0 || precpuStats.systemCpuUsage == 0
+			let cpus = cpuStats.onlineCpus
+			cpus = cpuStats.cpuUsage.percpuUsage.len() when cpus == 0
+			cpus = 1 when cpus == 0
+			return float(used) / float(total) * float(cpus) * 100.0
+		}
+
+		// The memory the container uses without the page cache it could
+		// give back, as `docker stats` counts it.
+		def memoryUsed() int {
+			let usage = memoryStats.usage
+			let cache = memoryStats.stats.get("inactive_file")
+			cache = memoryStats.stats.get("total_inactive_file") when cache is none
+			return usage when cache is none || cache > usage
+			return usage - cache
+		}
+	}
+
+	// CpuStats is one CPU reading of a container.
+	struct CpuStats {
+		@json("cpu_usage")
+		cpuUsage CpuUsage
+		// Nanoseconds the host's CPUs have run, all of them.
+		@json("system_cpu_usage")
+		systemCpuUsage int
+		@json("online_cpus")
+		onlineCpus int
+	}
+
+	// CpuUsage is the CPU time a container used, in nanoseconds.
+	struct CpuUsage {
+		@json("total_usage")
+		totalUsage int
+		@json("percpu_usage")
+		percpuUsage int[]
+		@json("usage_in_kernelmode")
+		usageInKernelmode int
+		@json("usage_in_usermode")
+		usageInUsermode int
+	}
+
+	// MemoryStats is a container's memory: what it uses, its limit, and
+	// the cgroup's counters by name.
+	struct MemoryStats {
+		usage int
+		@json("max_usage")
+		maxUsage int
+		limit int
+		stats map<string, int>
+	}
+
+	// PidsStats is how many processes a container runs, and its limit.
+	struct PidsStats {
+		current int
+		limit   int
+	}
+
+	// BlkioStats is a container's block I/O, by device and operation.
+	struct BlkioStats {
+		@json("io_service_bytes_recursive")
+		ioServiceBytes BlkioEntry[]
+		@json("io_serviced_recursive")
+		ioServiced BlkioEntry[]
+	}
+
+	// BlkioEntry is one counter of block I/O: a device, an operation
+	// (`read`, `write`), its value.
+	struct BlkioEntry {
+		major int
+		minor int
+		op    string
+		value int
+	}
+
+	// NetworkStats is one interface's traffic.
+	struct NetworkStats {
+		@json("rx_bytes")
+		rxBytes int
+		@json("rx_packets")
+		rxPackets int
+		@json("rx_errors")
+		rxErrors int
+		@json("rx_dropped")
+		rxDropped int
+		@json("tx_bytes")
+		txBytes int
+		@json("tx_packets")
+		txPackets int
+		@json("tx_errors")
+		txErrors int
+		@json("tx_dropped")
+		txDropped int
+	}
+
+	// StatsStream is what `Container.statsStream` returns: a reading a
+	// second.
+	type StatsStream {
+		// The failure that ended the stream; none while it runs or when it
+		// ended or was closed cleanly.
+		failure        ?error        = none
+		internal res   http.Response
+		internal lines JSONLines
+		atomic closed  bool          = false
+
+		def new(res http.Response) {
+			self.res = res
+			lines = new JSONLines(bodyOf(res))
+		}
+
+		// Implements Iterator<ContainerStats>: the next reading, waiting for
+		// it; none when the stream ends or fails (`failure` says why).
+		def iterate() ?ContainerStats {
+			return next() onerror (err error) {
+				failure = err
+				return none
+			}
+		}
+
+		// The next reading, waiting for it; none once the container stopped
+		// or the stream was closed.
+		// Fails with ErrorKind.Connection when the connection breaks,
+		// ErrorKind.Protocol for a reading that does not read.
+		def next() !?ContainerStats {
+			return none when closed
+			let line = lines.next() onerror (err error) {
+				return none when closed
+				fail err
+			}
+			return none when line is none
+			let out = ContainerStats{}
+			new encoding.JSON().decode(nullTimes(line), out) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "docker: a statistics reading does not read: {err.message}")
+			}
+			return out
+		}
+
+		// close ends the stream. Never fails.
+		def close() !none {
+			closed = true
+			res.close() onerror recover none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+}

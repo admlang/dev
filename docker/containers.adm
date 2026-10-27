@@ -1,0 +1,525 @@
+partial module adm.dev.docker {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// Containers is the containers of an engine (`engine.containers`).
+	//
+	// Calls fail as the Engine's do.
+	type Containers {
+		internal core Core
+
+		def new(core Core) {
+			self.core = core
+		}
+
+		// create makes a container from an image and returns it, not
+		// started. The image must be there: `engine.images.pull` first.
+		// `ports` publishes container ports on the host, `{"5432/tcp":
+		// 5432}`; the ContainerSpec overload takes everything else.
+		//
+		// ```
+		// let pg = try engine.containers.create("postgres:17", name = "db", env = {"POSTGRES_PASSWORD": "secret"}, ports = {"5432/tcp": 5432})
+		// ```
+		//
+		// Fails as the type says, with ErrorKind.NotFound when the image is
+		// not there and ErrorKind.Conflict when the name is taken.
+		def create(image string, name string = "", env map<string, string> = {}, ports map<string, int> = {}, cmd string[] = [], labels map<string, string> = {}, mounts Mount[] = [], network string = "") !Container {
+			return try create(ContainerSpec{image: image, env: env, ports: ports, cmd: cmd, labels: labels, mounts: mounts, network: network}, name)
+		}
+
+		// create makes a container from a spec and returns it, not started.
+		// `platform` (`linux/arm64`) picks the image's variant.
+		// Fails as the other overload does.
+		def create(spec ContainerSpec, name string = "", platform string = "") !Container {
+			let query = new url.Values()
+			query.set("name", name) unless name == ""
+			query.set("platform", platform) unless platform == ""
+			let reply = CreatedReply{}
+			try (try core.wire()).call(http.Method.POST, "/containers/create", query, createBody(spec), reply)
+			return new Container(core, reply.id, name)
+		}
+
+		// list returns the running containers, or every one with `all`.
+		// `filters` narrow the list as `docker ps --filter` does: `{"label":
+		// ["app=web"], "status": ["exited"], "name": ["db"]}`. `size` adds
+		// the bytes each container's layer takes, which is slow.
+		// Fails as the type says.
+		def list(all bool = false, filters map<string, string[]> = {}, size bool = false, limit int = 0) !ContainerSummary[] {
+			let query = new url.Values()
+			query.set("all", "true") when all
+			query.set("size", "true") when size
+			query.set("limit", limit.str()) when limit > 0
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let out ContainerSummary[] = []
+			try (try core.wire()).call(http.Method.GET, "/containers/json", query, target = out)
+			return out
+		}
+
+		// get returns the container with that name or id (a unique prefix of
+		// it does too).
+		// Fails as the type says, with ErrorKind.NotFound when there is none.
+		def get(nameOrId string) !Container {
+			let info = ContainerInfo{}
+			try (try core.wire()).call(http.Method.GET, "/containers/{url.pathEscape(nameOrId)}/json", target = info)
+			return new Container(core, info.id, info.name.startsWith("/") ?? (info.name.slice(1), info.name))
+		}
+
+		// prune removes the stopped containers `filters` select (all of them
+		// when empty: `{"until": ["24h"], "label": ["tmp"]}`).
+		// Fails as the type says.
+		def prune(filters map<string, string[]> = {}) !PruneReport {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let reply = PruneReply{}
+			try (try core.wire()).call(http.Method.POST, "/containers/prune", query, target = reply)
+			return PruneReport{deleted: reply.containersDeleted, spaceReclaimed: reply.spaceReclaimed}
+		}
+	}
+
+	// WaitCondition is what `Container.wait` waits for.
+	enum WaitCondition {
+		// The container is not running: stopped, or never started.
+		NotRunning = "not-running",
+		// The container next exits.
+		NextExit   = "next-exit",
+		// The container is removed.
+		Removed    = "removed",
+	}
+
+	// Container is one container of an engine: a handle that holds its id.
+	// Calls fail as the Engine's do, with ErrorKind.NotFound once the
+	// container is removed.
+	partial type Container {
+		id            string
+		// The name it was created or found with; "" when it was created
+		// without one (the engine made one up: `inspect` has it).
+		name          string
+		internal core Core
+
+		def new(core Core, id string, name string) {
+			self.core = core
+			self.id = id
+			self.name = name
+		}
+
+		// start starts the container; one already running is left so.
+		// Fails as the type says.
+		def start() !none {
+			return try post("start", none)
+		}
+
+		// stop sends the stop signal and, when the container has not exited
+		// after `timeout` (none: its own stop timeout, else 10 s), kills it.
+		// `signal` replaces the container's stop signal. One already stopped
+		// is left so.
+		// Fails as the type says.
+		def stop(timeout ?duration = none, signal string = "") !none {
+			let query = new url.Values()
+			query.set("t", wholeSeconds(timeout).str()) unless (timeout is none)
+			query.set("signal", signal) unless signal == ""
+			return try post("stop", query, timeout)
+		}
+
+		// restart stops the container as `stop` does and starts it again.
+		// Fails as the type says.
+		def restart(timeout ?duration = none) !none {
+			let query = new url.Values()
+			query.set("t", wholeSeconds(timeout).str()) unless (timeout is none)
+			return try post("restart", query, timeout)
+		}
+
+		// kill sends a signal to the container's main process.
+		// Fails as the type says, with ErrorKind.Conflict when it is not
+		// running.
+		def kill(signal string = "SIGKILL") !none {
+			let query = new url.Values()
+			query.set("signal", signal)
+			return try post("kill", query)
+		}
+
+		// pause freezes every process of the container.
+		// Fails as the type says, with ErrorKind.Conflict when it is not
+		// running.
+		def pause() !none {
+			return try post("pause", none)
+		}
+
+		// unpause lets the processes of a paused container run again.
+		// Fails as the type says.
+		def unpause() !none {
+			return try post("unpause", none)
+		}
+
+		// remove deletes the container; `force` kills it first when it runs,
+		// `volumes` removes its anonymous volumes too.
+		// Fails as the type says, with ErrorKind.Conflict when it runs and
+		// `force` is not set.
+		def remove(force bool = false, volumes bool = false) !none {
+			let query = new url.Values()
+			query.set("force", "true") when force
+			query.set("v", "true") when volumes
+			try (try core.wire()).call(http.Method.DELETE, "/containers/{id}", query)
+			return none
+		}
+
+		// wait waits until the container meets the condition and returns its
+		// exit code. It waits as long as that takes.
+		// Fails as the type says, and with ErrorKind.Server when the engine
+		// reports an error of the wait.
+		def wait(condition WaitCondition = WaitCondition.NotRunning) !int {
+			let query = new url.Values()
+			query.set("condition", condition.value)
+			let link = try core.wire()
+			let res = try link.send(http.Method.POST, "/containers/{id}/wait", query, none, "", none, false)
+			let reply = WaitReply{}
+			res.json(reply) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "docker: waiting for {id}: {err.message}")
+			}
+			let problem = reply.error
+			fail errorOf(ErrorKind.Server, "docker: waiting for {id}: {problem.message}") unless problem is none || problem.message == ""
+			return reply.statusCode
+		}
+
+		// inspect returns what the engine knows about the container.
+		// Fails as the type says.
+		def inspect() !ContainerInfo {
+			let out = ContainerInfo{}
+			try (try core.wire()).call(http.Method.GET, "/containers/{id}/json", target = out)
+			return out
+		}
+
+		// rename gives the container another name.
+		// Fails as the type says, with ErrorKind.Conflict when the name is
+		// taken.
+		def rename(newName string) !none {
+			let query = new url.Values()
+			query.set("name", newName)
+			try post("rename", query)
+			name = newName
+			return none
+		}
+
+		// update changes the resources and restart policy of the container
+		// while it runs, and returns the engine's warnings.
+		// Fails as the type says.
+		def update(change ResourceUpdate) !string[] {
+			let reply = UpdateReply{}
+			try (try core.wire()).call(http.Method.POST, "/containers/{id}/update", body = updateBody(change), target = reply)
+			return reply.warnings
+		}
+
+		// resize sets the size of the container's terminal.
+		// Fails as the type says.
+		def resize(rows int, columns int) !none {
+			let query = new url.Values()
+			query.set("h", rows.str())
+			query.set("w", columns.str())
+			return try post("resize", query)
+		}
+
+		// top returns the processes the container runs, as `ps` lists them
+		// with `psArgs` (`-ef` by default).
+		// Fails as the type says, with ErrorKind.Conflict when it is not
+		// running.
+		def top(psArgs string = "") !ProcessList {
+			let query = new url.Values()
+			query.set("ps_args", psArgs) unless psArgs == ""
+			let out = ProcessList{}
+			try (try core.wire()).call(http.Method.GET, "/containers/{id}/top", query, target = out)
+			return out
+		}
+
+		// changes returns the files the container added, changed or deleted
+		// against its image.
+		// Fails as the type says.
+		def changes() !FileChange[] {
+			let out FileChange[] = []
+			try (try core.wire()).call(http.Method.GET, "/containers/{id}/changes", target = out)
+			return out
+		}
+
+		// Names the container.
+		def str() string {
+			return "docker.Container({name == "" ?? (id.slice(0, 12.min(id.len())), name)})"
+		}
+
+		// ---- internals ----
+
+		// POSTs an action of the container; `extra` adds a wait to the
+		// timeout for actions that wait on the container.
+		internal def post(action string, query ?url.Values, extra ?duration = none) !none {
+			let link = try core.wire()
+			let res = try link.send(http.Method.POST, "/containers/{id}/{action}", query, none, "", none, extra is none)
+			res.bytes() onerror recover byte[]
+			return none
+		}
+	}
+
+	// ResourceUpdate is what `Container.update` changes; zero fields are
+	// left as they are.
+	struct ResourceUpdate {
+		memory            int
+		memorySwap        int
+		memoryReservation int
+		cpus              float
+		cpuShares         int
+		cpusetCpus        string
+		pidsLimit         int
+		restart           ?RestartPolicy
+	}
+
+	// PruneReport is what a prune removed.
+	struct PruneReport {
+		// The ids or names of what was removed.
+		deleted        string[]
+		// The bytes it freed.
+		spaceReclaimed int
+	}
+
+	// ProcessList is what `Container.top` returns: the column titles of
+	// `ps`, and a row for each process.
+	struct ProcessList {
+		titles    string[]
+		processes string[][]
+	}
+
+	// FileChange is one path a container changed: `kind` 0 modified, 1
+	// added, 2 deleted.
+	struct FileChange {
+		path string
+		kind int
+	}
+
+	// ContainerSummary is one container as `Containers.list` returns it.
+	type ContainerSummary {
+		@json("Id")
+		id string
+		// Its names, each with a leading `/`.
+		names string[]
+		image string
+		@json("ImageID")
+		imageId string
+		command string
+		// When it was made, in Unix seconds.
+		created int
+		ports PortSummary[]
+		// Bytes its own layer takes, and its layer with the image's; with
+		// `size` only.
+		sizeRw int
+		sizeRootFs int
+		labels map<string, string>
+		// `created`, `running`, `paused`, `restarting`, `exited`,
+		// `removing`, `dead`.
+		state string
+		// The state as people read it: `Up 3 hours`, `Exited (0) 2 days
+		// ago`.
+		status string
+		mounts MountPoint[]
+
+		def new() {}
+
+		// The first name without its `/`.
+		def name() string {
+			return "" when names.len() == 0
+			let first = names[0]
+			return first.startsWith("/") ?? (first.slice(1), first)
+		}
+	}
+
+	// PortSummary is a container port and where it is published.
+	struct PortSummary {
+		@json("IP")
+		ip string
+		privatePort int
+		// 0 when it is not published.
+		publicPort int
+		// `tcp`, `udp` or `sctp`.
+		@json("Type")
+		protocol string
+	}
+
+	// MountPoint is a mount of a container as the engine reports it.
+	struct MountPoint {
+		@json("Type")
+		kind string
+		// The volume's name; "" for a bind mount.
+		name string
+		source string
+		destination string
+		driver string
+		mode string
+		@json("RW")
+		writable bool
+		propagation string
+	}
+
+	// ContainerInfo is what `Container.inspect` returns.
+	struct ContainerInfo {
+		@json("Id")
+		id string
+		// The name with its leading `/`.
+		name string
+		created ?time.Time
+		path string
+		args string[]
+		state ContainerState
+		// The id of the image it was made from.
+		image string
+		restartCount int
+		driver string
+		platform string
+		mounts MountPoint[]
+		config ContainerConfigInfo
+		hostConfig HostConfigInfo
+		networkSettings NetworkSettings
+		logPath string
+	}
+
+	// ContainerState is the state part of ContainerInfo. `startedAt` and
+	// `finishedAt` are none while the container never started or ended.
+	type ContainerState {
+		// `created`, `running`, `paused`, `restarting`, `removing`,
+		// `exited`, `dead`.
+		status string
+		running bool
+		paused bool
+		restarting bool
+		@json("OOMKilled")
+		oomKilled bool
+		dead bool
+		pid int
+		exitCode int
+		error string
+		startedAt ?time.Time
+		finishedAt ?time.Time
+		// None for a container without a health check.
+		health ?HealthState
+
+		def new() {}
+
+		// Implements JSONDecoder: the engine writes a time it does not know
+		// as Go's zero time, year 1, which reads as none here.
+		// Fails with ErrorKind.Protocol when the state does not read.
+		def json(data byte[]) !none {
+			let wire = StateWire{}
+			try decodeWire(data, wire)
+			status = wire.status
+			running = wire.running
+			paused = wire.paused
+			restarting = wire.restarting
+			oomKilled = wire.oomKilled
+			dead = wire.dead
+			pid = wire.pid
+			exitCode = wire.exitCode
+			error = wire.error
+			startedAt = goTime(wire.startedAt)
+			finishedAt = goTime(wire.finishedAt)
+			health = wire.health
+			return none
+		}
+	}
+
+	// HealthState is a container's health: `starting`, `healthy` or
+	// `unhealthy`, how many checks failed in a row, and the latest checks.
+	type HealthState {
+		status        string
+		failingStreak int
+		log           HealthCheckResult[]
+
+		def new() {}
+	}
+
+	// HealthCheckResult is one run of a health check.
+	type HealthCheckResult {
+		start    ?time.Time
+		end      ?time.Time
+		exitCode int
+		output   string
+
+		def new() {}
+
+		// Implements JSONDecoder, as ContainerState does.
+		// Fails with ErrorKind.Protocol when the result does not read.
+		def json(data byte[]) !none {
+			let wire = CheckWire{}
+			try decodeWire(data, wire)
+			start = goTime(wire.start)
+			end = goTime(wire.end)
+			exitCode = wire.exitCode
+			output = wire.output
+			return none
+		}
+	}
+
+	// ContainerConfigInfo is the configuration part of ContainerInfo.
+	struct ContainerConfigInfo {
+		hostname     string
+		domainname   string
+		user         string
+		tty          bool
+		openStdin    bool
+		env          string[]
+		cmd          string[]
+		entrypoint   string[]
+		image        string
+		workingDir   string
+		labels       map<string, string>
+		stopSignal   string
+		exposedPorts map<string, any>
+	}
+
+	// HostConfigInfo is the host part of ContainerInfo.
+	struct HostConfigInfo {
+		binds           string[]
+		networkMode     string
+		portBindings    map<string, PortBinding[]>
+		restartPolicy   RestartPolicy
+		autoRemove      bool
+		privileged      bool
+		readonlyRootfs  bool
+		capAdd          string[]
+		capDrop         string[]
+		memory          int
+		nanoCpus        int
+		cpuShares       int
+		pidsLimit       ?int
+		init            ?bool
+		publishAllPorts bool
+		logConfig       LogConfig
+	}
+
+	// NetworkSettings is the network part of ContainerInfo: the ports
+	// published, and the container's address in each network.
+	struct NetworkSettings {
+		ports map<string, PortBinding[]>
+		networks map<string, EndpointInfo>
+		@json("IPAddress")
+		ipAddress string
+		gateway string
+		macAddress string
+	}
+
+	// EndpointInfo is a container's place in one network.
+	struct EndpointInfo {
+		@json("NetworkID")
+		networkId string
+		@json("EndpointID")
+		endpointId string
+		gateway string
+		@json("IPAddress")
+		ipAddress string
+		@json("IPPrefixLen")
+		ipPrefixLen int
+		@json("GlobalIPv6Address")
+		globalIPv6Address string
+		macAddress string
+		aliases string[]
+		@json("DNSNames")
+		dnsNames string[]
+	}
+}

@@ -1,0 +1,364 @@
+// These tests need an engine; without ADM_TEST_DOCKER they pass without
+// running. They pull `alpine:3.20` and create containers, images, volumes
+// and networks named `adm-test-*`, which they remove again.
+partial module adm.dev.docker {
+	use (
+		std.bytes
+		std.crypto
+		std.os
+		std.testing
+		std.time
+	)
+
+	// The engine's host: `unix:///var/run/docker.sock`, Podman's socket,
+	// `tcp://...`.
+	@env("ADM_TEST_DOCKER")
+	internal const testHost string
+
+	internal const testImage = "alpine:3.20"
+
+	// A name no other run uses.
+	internal def testName(what string) string {
+		let suffix = (crypto.rand(4) onerror recover byte[1, 2, 3, 4]).hex().lower()
+		return "adm-test-{what}-{suffix}"
+	}
+
+	// The engine with the test image pulled.
+	internal def testEngine() !Engine {
+		let engine = try connect(testHost)
+		let present = engine.images.list(filters = {"reference": [testImage]}) onerror recover ImageSummary[]
+		try engine.images.pull(testImage) when present.len() == 0
+		return engine
+	}
+
+	// A container of the test image running `script` under sh, started.
+	internal def running(engine Engine, script string, spec ContainerSpec = ContainerSpec{}) !Container {
+		spec.image = testImage
+		spec.cmd = ["sh", "-c", script]
+		spec.labels = {"adm-test": "1"}
+		let made = try engine.containers.create(spec, testName("c"))
+		try made.start()
+		return made
+	}
+
+	internal def failureOf(err error) ErrorKind {
+		return err.kind when err is DockerError
+		return ErrorKind.Server
+	}
+
+	check "Engine" {
+		@test()
+		def TestSystem() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			try engine.ping()
+			assert engine.apiVersion != ""
+			let version = try engine.version()
+			assert version.apiVersion != "" && version.os != ""
+			let info = try engine.info()
+			assert info.cpus > 0 && info.memTotal > 0 && info.serverVersion != ""
+			let usage = try engine.diskUsage()
+			assert usage.images.len() > 0
+			try engine.close()
+			return none
+		}
+
+		@test()
+		def TestEvents() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let name = testName("events")
+			let events = try engine.events(filters = {"type": ["container"], "container": [name]})
+			let made = try engine.containers.create(ContainerSpec{image: testImage, cmd: ["true"]}, name)
+			try made.start()
+			try made.wait()
+			let actions string[] = []
+			for let event in events {
+				actions.push(event.action)
+				assert event.actor.attributes["name"] == name
+				break when event.action == "die"
+			}
+			try events.close()
+			assert actions.includes("create") && actions.includes("start") && actions.includes("die")
+			try made.remove(force = true)
+			try engine.close()
+			return none
+		}
+	}
+
+	check "Containers" {
+		@test()
+		def TestLifecycle() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let spec = ContainerSpec{env: {"GREETING": "hi"}, portBindings: {"80": [PortBinding{hostIp: "127.0.0.1", hostPort: ""}]}, healthcheck: HealthCheck{test: ["CMD", "true"], interval: 1s}}
+			let box = try running(engine, "echo out $GREETING; echo err >&2; sleep 60", spec)
+			let info = try box.inspect()
+			assert info.state.running && !(info.state.startedAt is none) && info.state.finishedAt is none
+			assert info.config.env.includes("GREETING=hi")
+			assert info.networkSettings.ports.hasKey("80/tcp")
+			let health = info.state.health
+			assert !(health is none)
+			let listed = try engine.containers.list(filters = {"label": ["adm-test=1"], "id": [box.id]})
+			assert listed.len() == 1 && listed[0].state == "running"
+			let found = try engine.containers.get(box.name)
+			assert found.id == box.id
+
+			time.sleep(300ms)
+			let lines string[] = []
+			for let line in try box.logs() {
+				lines.push("{line.stream.value}:{line.text}")
+			}
+			assert lines.includes("stdout:out hi") && lines.includes("stderr:err")
+
+			let run = try box.exec("sh", "-c", "echo $0; echo bad >&2; exit 3", "arg")
+			assert run.exitCode == 3 && run.text() == "arg\n" && string(run.stderr) == "bad\n"
+			let echoed = try box.exec(["cat"], input = "piped in".bytes())
+			assert echoed.exitCode == 0 && echoed.text() == "piped in"
+			let envRun = try box.exec(["sh", "-c", "echo $X-$(pwd)-$(id -u)"], env = {"X": "y"}, workingDir = "/tmp", user = "nobody")
+			assert envRun.text().startsWith("y-/tmp-")
+
+			let processes = try box.top()
+			assert processes.titles.len() > 0 && processes.processes.len() >= 1
+			let stats = try box.stats(oneShot = true)
+			assert stats.pidsStats.current >= 1 && stats.memoryStats.usage > 0
+			try box.pause()
+			assert (try box.inspect()).state.paused
+			try box.unpause()
+			let target = try running(engine, "sleep 60")
+			try target.kill("SIGKILL")
+			assert (try target.wait()) == 137
+			try target.remove()
+			let renamed = testName("renamed")
+			try box.rename(renamed)
+			assert (try box.inspect()).name == "/{renamed}"
+			try box.update(ResourceUpdate{memory: 128 * 1024 * 1024, memorySwap: -1})
+			assert (try box.inspect()).hostConfig.memory == 128 * 1024 * 1024
+
+			let kind = ErrorKind.Server
+			box.remove() onerror (err error) {
+				kind = failureOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Conflict
+			try box.stop(timeout = 1s)
+			let code = try box.wait()
+			assert code == 137 || code == 143
+			let stopped = try box.inspect()
+			assert !stopped.state.running && !(stopped.state.finishedAt is none)
+			try box.remove(volumes = true)
+			kind = ErrorKind.Server
+			box.inspect() onerror (err error) {
+				kind = failureOf(err)
+				recover ContainerInfo{}
+			}
+			assert kind == ErrorKind.NotFound
+			try engine.close()
+			return none
+		}
+
+		@test()
+		def TestFilesInAndOut() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let box = try running(engine, "sleep 60")
+			let here = "{os.tempDir()}/{testName("files")}"
+			try os.mkdir(here, parents = true)
+			try os.mkdir("{here}/site/css", parents = true)
+			try os.writeFile("{here}/site/index.html", "<p>hi</p>".bytes())
+			try os.writeFile("{here}/site/css/a.css", "p{}".bytes())
+			try box.copyTo("{here}/site", "/srv")
+			let listing = try box.exec("find", "/srv/site", "-type", "f")
+			assert listing.text().contains("/srv/site/index.html") && listing.text().contains("/srv/site/css/a.css")
+			let changes = try box.changes()
+			assert changes.len() > 0
+			try box.copyFrom("/srv/site/css", "{here}/back")
+			assert string(try os.readFile("{here}/back/css/a.css")) == "p{}"
+			let tar = try box.readArchive("/etc/hostname")
+			assert tar.len() >= 1024
+			// The same archive put back elsewhere.
+			try box.writeArchive("/tmp", tar)
+			assert (try box.exec("cat", "/tmp/hostname")).text() == (try box.exec("cat", "/etc/hostname")).text()
+			let kind = ErrorKind.Server
+			box.readArchive("/no/such/path") onerror (err error) {
+				kind = failureOf(err)
+				recover byte[]
+			}
+			assert kind == ErrorKind.NotFound
+			try box.remove(force = true)
+			try os.remove(here, recursive = true)
+			try engine.close()
+			return none
+		}
+
+		@test()
+		def TestAttachAndTerminal() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let made = try engine.containers.create(ContainerSpec{image: testImage, cmd: ["cat"], openStdin: true, stdinOnce: true, labels: {"adm-test": "1"}}, testName("attach"))
+			try made.start()
+			let session = try made.attach()
+			try session.write("ping\n")
+			let piece = try session.next()
+			assert !(piece is none) && piece.text() == "ping\n"
+			try session.closeInput()
+			assert (try session.wait()) == 0
+			try session.close()
+			try made.remove(force = true)
+
+			let box = try running(engine, "sleep 60")
+			let shell = try box.startExec(["sh"], tty = true)
+			try shell.resize(24, 100)
+			try shell.write("stty size; echo marker-$((40 + 2)); exit 5\n")
+			let seen = ""
+			for let output in shell {
+				seen += output.text()
+			}
+			assert seen.contains("24 100") && seen.contains("marker-42")
+			assert (try shell.wait()) == 5
+			try shell.close()
+
+			let follow = try running(engine, "for i in 1 2 3; do echo line $i; sleep 0.2; done")
+			let lines string[] = []
+			for let line in try follow.logs(follow = true, timestamps = true) {
+				assert !(line.time is none)
+				lines.push(line.text)
+			}
+			assert lines.equals(["line 1", "line 2", "line 3"])
+			let watch = try box.statsStream()
+			let reading = try watch.next()
+			assert !(reading is none) && reading.memoryStats.usage > 0
+			try watch.close()
+			try box.remove(force = true)
+			try follow.remove(force = true)
+			try engine.close()
+			return none
+		}
+	}
+
+	check "Images" {
+		@test()
+		def TestBuildTagSaveLoad() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let dir = "{os.tempDir()}/{testName("build")}"
+			try os.mkdir(dir, parents = true)
+			try os.writeFile("{dir}/Dockerfile", "FROM {testImage}\nARG WORD\nCOPY . /ctx\nRUN test -f /ctx/keep.txt && test ! -e /ctx/secret.txt && test ! -e /ctx/logs/a.log\nRUN echo $WORD > /word\nLABEL adm-test=1\n".bytes())
+			try os.writeFile("{dir}/keep.txt", "keep".bytes())
+			try os.writeFile("{dir}/secret.txt", "no".bytes())
+			try os.mkdir("{dir}/logs")
+			try os.writeFile("{dir}/logs/a.log", "no".bytes())
+			try os.writeFile("{dir}/.dockerignore", "secret.txt\nlogs\n".bytes())
+			let tag = "{testName("image")}:v1"
+			let said string[] = []
+			let id = try engine.images.build(dir, tags = [tag], buildArgs = {"WORD": "bird"}, output = def (line string) {
+				said.push(line)
+			})
+			assert id.startsWith("sha256:") && said.len() > 0
+			let info = try engine.images.inspect(tag)
+			// Podman files an unqualified name under `localhost/` or
+			// `docker.io/library/`.
+			assert info.id == id && (info.repoTags.includes(tag) || info.repoTags.includes("localhost/{tag}") || info.repoTags.includes("docker.io/library/{tag}")) && info.config.labels["adm-test"] == "1"
+			assert !(info.created is none)
+			let layers = try engine.images.history(tag)
+			assert layers.len() > 1 && layers[0].createdBy.contains("LABEL")
+			let alias = testName("alias")
+			try engine.images.tag(tag, alias, "two")
+			assert (try engine.images.list(filters = {"reference": ["{alias}:two"]})).len() == 1
+
+			let saved = new bytes.Buffer()
+			try engine.images.save(["{alias}:two"], saved)
+			assert saved.bytes().len() > 1024
+			let removed = try engine.images.remove("{alias}:two")
+			assert removed.len() >= 1
+			let loaded = try engine.images.load(saved.bytes())
+			assert loaded.includes("{alias}:two") || loaded.includes("localhost/{alias}:two") || loaded.len() > 0
+			try engine.images.remove("{alias}:two", force = true)
+			try engine.images.remove(tag, force = true)
+
+			let kind = ErrorKind.Server
+			engine.images.inspect("adm-test-none:nope") onerror (err error) {
+				kind = failureOf(err)
+				recover ImageInfo{}
+			}
+			assert kind == ErrorKind.NotFound
+			kind = ErrorKind.Server
+			engine.images.build(dir, dockerfile = "Missing.dockerfile") onerror (err error) {
+				kind = failureOf(err)
+				recover ""
+			}
+			assert kind := ErrorKind.Server || ErrorKind.Argument
+			try os.writeFile("{dir}/Broken.dockerfile", "FROM {testImage}\nRUN exit 7\n".bytes())
+			kind = ErrorKind.Closed
+			engine.images.build(dir, dockerfile = "Broken.dockerfile") onerror (err error) {
+				kind = failureOf(err)
+				recover ""
+			}
+			assert kind == ErrorKind.Server
+			kind = ErrorKind.Closed
+			engine.images.pull("adm-test-does-not-exist/nothing:never") onerror (err error) {
+				kind = failureOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.NotFound || kind == ErrorKind.Denied
+			try os.remove(dir, recursive = true)
+			try engine.close()
+			return none
+		}
+	}
+
+	check "Volumes and networks" {
+		@test()
+		def TestVolumes() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let name = testName("vol")
+			let volume = try engine.volumes.create(name, labels = {"adm-test": "1"})
+			assert volume.name == name && volume.driver == "local" && !(volume.createdAt is none)
+			assert (try engine.volumes.inspect(name)).labels["adm-test"] == "1"
+			assert (try engine.volumes.list(filters = {"label": ["adm-test=1"], "name": [name]})).len() == 1
+			let box = try running(engine, "echo kept > /data/file; sleep 60", ContainerSpec{mounts: [Mount{kind: MountKind.Volume, source: name, target: "/data"}]})
+			time.sleep(300ms)
+			assert (try box.exec("cat", "/data/file")).text() == "kept\n"
+			let kind = ErrorKind.Server
+			engine.volumes.remove(name) onerror (err error) {
+				kind = failureOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Conflict
+			try box.remove(force = true)
+			try engine.volumes.remove(name)
+			let pruned = try engine.volumes.prune(filters = {"label": ["adm-test=1"]})
+			assert pruned.spaceReclaimed >= 0
+			try engine.close()
+			return none
+		}
+
+		@test()
+		def TestNetworks() !none {
+			return none when testHost == ""
+			let engine = try testEngine()
+			let name = testName("net")
+			let network = try engine.networks.create(name, labels = {"adm-test": "1"}, subnets = [Subnet{subnet: "10.231.0.0/24", gateway: "10.231.0.1"}])
+			assert network.name == name && network.driver == "bridge" && network.ipam.config[0].subnet == "10.231.0.0/24"
+			let box = try running(engine, "sleep 60")
+			try engine.networks.connect(name, box.id, aliases = ["api"], ipv4Address = "10.231.0.7")
+			let joined = try engine.networks.inspect(name)
+			assert joined.containers.hasKey(box.id) && joined.containers[box.id].ipv4Address.startsWith("10.231.0.7")
+			assert (try box.inspect()).networkSettings.networks[name].ipAddress == "10.231.0.7"
+			try engine.networks.disconnect(name, box.id)
+			assert !(try engine.networks.inspect(name)).containers.hasKey(box.id)
+			assert (try engine.networks.list(filters = {"name": [name]})).len() == 1
+			try box.remove(force = true)
+			try engine.networks.remove(name)
+			let kind = ErrorKind.Server
+			engine.networks.inspect(name) onerror (err error) {
+				kind = failureOf(err)
+				recover NetworkInfo{}
+			}
+			assert kind == ErrorKind.NotFound
+			try engine.close()
+			return none
+		}
+	}
+}

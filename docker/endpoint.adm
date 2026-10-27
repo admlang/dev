@@ -1,0 +1,218 @@
+// Where the engine is: a host given by the program, `DOCKER_HOST` with
+// `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH`, the Docker CLI's current
+// context, or a local socket of Docker or Podman.
+internal partial module adm.dev.docker.api {
+	use (
+		std.crypto.hash::(SHA256)
+		std.crypto.x509::(CertPool)
+		std.data.encoding
+		std.net.tls
+		std.net.url
+		std.os
+		std.services.runtime::(Runtime)
+		adm.dev.docker::*
+	)
+
+	// Surroundings is what the client reads about the machine: the
+	// environment, the home folder and files. Tests hand in their own.
+	struct Surroundings {
+		// A variable of the environment; none when it is not set.
+		env       def (string) ?string
+		home      string
+		// A file's bytes; fails when it cannot be read.
+		readFile  def (string) !byte[]
+		// Whether a path exists.
+		exists    def (string) bool
+		// Runs a credential helper's `get` with the input given and returns
+		// its output and exit code.
+		runHelper def (string, string) !(string, int)
+	}
+
+	// The surroundings of a real program.
+	def realSurroundings() Surroundings {
+		let home = os.homeDir() onerror recover ""
+		return Surroundings{env: def (name string) ?string {
+			return Runtime.getEnv(name)
+		}, home: home, readFile: def (path string) !byte[] {
+			return try os.readFile(path)
+		}, exists: def (path string) bool {
+			return os.exists(path) onerror recover false
+		}, runHelper: def (program string, input string) !(string, int) {
+			return try startHelper(program, input)
+		}}
+	}
+
+	def envOf(from Surroundings, name string) string {
+		let read = from.env
+		let value = read(name)
+		return value is none ?? ("", value)
+	}
+
+	// Endpoint is where requests go.
+	struct Endpoint {
+		// The host as it was given or found, for messages.
+		name      string
+		// The path of a Unix socket; "" for TCP.
+		path      string
+		host      string
+		port      int
+		secure    bool
+		tlsConfig ?tls.Config
+	}
+
+	// The folder of the Docker CLI's configuration: `DOCKER_CONFIG`, else
+	// `~/.docker`.
+	def configDir(from Surroundings) string {
+		let dir = envOf(from, "DOCKER_CONFIG")
+		return dir unless dir == ""
+		return "{from.home}/.docker"
+	}
+
+	// locate finds the engine: the host given, else `DOCKER_HOST`, else the
+	// context named by `DOCKER_CONTEXT` or the CLI's current context, else
+	// the first local socket that exists: Docker's, Docker Desktop's,
+	// Podman's rootless one, Podman's system one.
+	// Fails with a DockerError: ErrorKind.Argument for a host or a context
+	// the client cannot read, ErrorKind.Connection when no engine is found.
+	def locate(host string, tlsGiven ?tls.Config, from Surroundings) !Endpoint {
+		return try endpointOf(host, tlsGiven, "", false, from) when host != ""
+		let fromEnv = envOf(from, "DOCKER_HOST")
+		if fromEnv != "" {
+			let verify = envOf(from, "DOCKER_TLS_VERIFY") != ""
+			let certs = envOf(from, "DOCKER_CERT_PATH")
+			certs = configDir(from) when certs == ""
+			return try endpointOf(fromEnv, tlsGiven, verify ?? (certs, ""), false, from)
+		}
+		let context = envOf(from, "DOCKER_CONTEXT")
+		if context == "" {
+			let config = try cliConfig(from)
+			context = config.currentContext
+		}
+		return try contextEndpoint(context, tlsGiven, from) when context != "" && context != "default"
+		let candidates = ["/var/run/docker.sock", "{from.home}/.docker/run/docker.sock"]
+		let runtime = envOf(from, "XDG_RUNTIME_DIR")
+		candidates.push("{runtime}/podman/podman.sock") unless runtime == ""
+		candidates.push("/run/podman/podman.sock")
+		let exists = from.exists
+		for let path in candidates {
+			return Endpoint{name: "unix://{path}", path: path} when exists(path)
+		}
+		fail errorOf(ErrorKind.Connection, "docker: no engine found: DOCKER_HOST is not set and none of {candidates.join(", ")} exists")
+	}
+
+	// endpointOf reads a host: `unix:///path`, `tcp://host[:port]`,
+	// `http://` or `https://host[:port]`. A TCP host uses TLS when `given`
+	// is set, when `certs` names a folder holding `ca.pem`, `cert.pem` and
+	// `key.pem` (checked against that CA), or for `https://`.
+	// Fails with ErrorKind.Argument for another form or certificates that
+	// cannot be read.
+	def endpointOf(host string, given ?tls.Config, certs string, skipVerify bool, from Surroundings) !Endpoint {
+		let parsed = url.parse(host) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: '{host}' is not a host: {err.message}")
+		}
+		match parsed.scheme {
+			case "unix":
+				fail errorOf(ErrorKind.Argument, "docker: '{host}' names no socket path") when parsed.path == ""
+				return Endpoint{name: host, path: parsed.path}
+			case "tcp", "http", "https":
+			case "ssh":
+				fail errorOf(ErrorKind.Argument, "docker: '{host}': engines over ssh are not reached by this client; forward the socket (ssh -L) and give the local end")
+			case "npipe":
+				fail errorOf(ErrorKind.Argument, "docker: '{host}': Windows named pipes are not reached by this client; use a tcp:// host")
+			default:
+				fail errorOf(ErrorKind.Argument, "docker: the scheme of '{host}' is not unix, tcp, http or https")
+		}
+		let secure = parsed.scheme == "https" || !(given is none) || certs != ""
+		let port = parsed.port()
+		port = secure ?? (2376, 2375) when port <= 0
+		let out = Endpoint{name: host, host: parsed.hostname(), port: port, secure: secure}
+		fail errorOf(ErrorKind.Argument, "docker: '{host}' names no host") when out.host == ""
+		return out unless secure
+		let config = tls.Config{}
+		config = tls.Config{...given} unless given is none
+		if certs != "" {
+			let read = from.readFile
+			let ca = read("{certs}/ca.pem") onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {certs}/ca.pem cannot be read: {err.message}")
+			}
+			let pool = new CertPool()
+			pool.appendCertsFromPEM(string(ca))
+			config.rootCAs = pool
+			let cert = read("{certs}/cert.pem") onerror recover byte[]
+			let key = read("{certs}/key.pem") onerror recover byte[]
+			if cert.len() > 0 && key.len() > 0 {
+				let pair = tls.parseKeyPair(string(cert), string(key)) onerror (err error) {
+					fail errorOf(ErrorKind.Argument, "docker: the client certificate in {certs} cannot be read: {err.message}")
+				}
+				config.certificates = [pair]
+			}
+		}
+		config.insecureSkipVerify = true when skipVerify
+		out.tlsConfig = config
+		return out
+	}
+
+	// The parts of the Docker CLI's `config.json` the client reads.
+	struct CliConfig {
+		currentContext string
+		auths          map<string, CliAuth>
+		credsStore     string
+		credHelpers    map<string, string>
+	}
+
+	struct CliAuth {
+		auth          string
+		identitytoken string
+	}
+
+	// cliConfig reads `config.json`; an empty one when there is none.
+	// Fails with ErrorKind.Argument when it is not JSON.
+	def cliConfig(from Surroundings) !CliConfig {
+		let path = "{configDir(from)}/config.json"
+		let out = CliConfig{}
+		let exists = from.exists
+		return out unless exists(path)
+		let read = from.readFile
+		let data = read(path) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: {path} cannot be read: {err.message}")
+		}
+		new encoding.JSON().decode(data, out) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: {path} is not a Docker configuration: {err.message}")
+		}
+		return out
+	}
+
+	struct ContextMeta {
+		name      string
+		endpoints map<string, ContextEndpoint>
+	}
+
+	struct ContextEndpoint {
+		host          string
+		skipTLSVerify bool
+	}
+
+	// contextEndpoint reads the endpoint of a CLI context from
+	// `contexts/meta/<sha256 of the name>/meta.json`, with its TLS files
+	// from `contexts/tls/<same>/docker/` when there are some.
+	// Fails with ErrorKind.Argument when the context does not exist or
+	// names no Docker endpoint.
+	def contextEndpoint(name string, given ?tls.Config, from Surroundings) !Endpoint {
+		let digest = new SHA256().hash(name.bytes()).hex().lower()
+		let dir = configDir(from)
+		let path = "{dir}/contexts/meta/{digest}/meta.json"
+		let read = from.readFile
+		let data = read(path) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: the context '{name}' does not exist ({path}: {err.message})")
+		}
+		let described = ContextMeta{}
+		new encoding.JSON().decode(data, described) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: {path} is not a context: {err.message}")
+		}
+		let found = described.endpoints.get("docker")
+		fail errorOf(ErrorKind.Argument, "docker: the context '{name}' names no Docker endpoint") when found is none || found.host == ""
+		let certs = "{dir}/contexts/tls/{digest}/docker"
+		let exists = from.exists
+		return try endpointOf(found.host, given, exists("{certs}/ca.pem") ?? (certs, ""), found.skipTLSVerify, from)
+	}
+}

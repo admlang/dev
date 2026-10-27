@@ -1,0 +1,214 @@
+partial module adm.dev.docker {
+	use std.data.encoding
+
+	// ContainerSpec is everything a container is created with. Fields left
+	// empty take the image's or the engine's defaults.
+	//
+	// ```
+	// let web = try engine.containers.create(docker.ContainerSpec{
+	//     image: "nginx:1.27",
+	//     ports: {"80/tcp": 8080},
+	//     mounts: [docker.Mount{kind: docker.MountKind.Bind, source: "/srv/site", target: "/usr/share/nginx/html", readOnly: true}],
+	//     restart: docker.RestartPolicy{name: "unless-stopped"},
+	//     memory: 256 * 1024 * 1024,
+	// }, name = "web")
+	// ```
+	struct ContainerSpec {
+		image             string
+		// The command and its arguments; empty runs the image's.
+		cmd               string[]
+		entrypoint        string[]
+		env               map<string, string>
+		labels            map<string, string>
+		workingDir        string
+		// `user`, `user:group`, `uid:gid`.
+		user              string
+		hostname          string
+		domainname        string
+		// Give the process a terminal: its output is one stream, not
+		// stdout and stderr apart.
+		tty               bool
+		// Keep the standard input open for `attach`.
+		openStdin         bool
+		// Close the standard input when the first attached client leaves.
+		stdinOnce         bool
+		// Ports the container listens on, `"8080/tcp"`, beyond the image's.
+		exposedPorts      string[]
+		// The signal `stop` sends; "" takes the image's (SIGTERM).
+		stopSignal        string
+		// How long `stop` waits before it kills; none takes the engine's
+		// (10 s).
+		stopTimeout       ?duration
+		healthcheck       ?HealthCheck
+		// Anonymous volumes, by the path they are mounted on.
+		volumes           string[]
+		// The shell of the image's `RUN`, `CMD` and `ENTRYPOINT` in shell
+		// form.
+		shell             string[]
+		// Container ports published on the host: `{"5432/tcp": 5432}`; a
+		// port without a protocol is TCP. `portBindings` names host
+		// addresses too.
+		ports             map<string, int>
+		portBindings      map<string, PortBinding[]>
+		// Publish every exposed port on a random host port.
+		publishAll        bool
+		mounts            Mount[]
+		// Mounts in the short form, `/host/path:/container/path:ro`.
+		binds             string[]
+		restart           ?RestartPolicy
+		// `bridge`, `host`, `none`, `container:<name>`, or a network's
+		// name; "" is the engine's default bridge.
+		network           string
+		// Networks to join besides, with this container's settings in each.
+		networks          map<string, NetworkEndpoint>
+		// Bytes of memory the container may use; 0 for no limit.
+		memory            int
+		// Memory and swap together; -1 for unlimited swap.
+		memorySwap        int
+		memoryReservation int
+		// CPUs as a fraction: 1.5 is one and a half.
+		cpus              float
+		// The relative weight against other containers (1024 by default).
+		cpuShares         int
+		// The CPUs the container may run on: `0-3`, `0,2`.
+		cpusetCpus        string
+		// How many processes it may hold; 0 for no limit.
+		pidsLimit         int
+		ulimits           Ulimit[]
+		devices           DeviceMapping[]
+		// GPUs and other devices a driver hands out: `[DeviceRequest{driver:
+		// "nvidia", count: -1, capabilities: [["gpu"]]}]` for every GPU.
+		deviceRequests    DeviceRequest[]
+		capAdd            string[]
+		capDrop           string[]
+		privileged        bool
+		readonlyRootfs    bool
+		securityOpt       string[]
+		// Remove the container when it exits.
+		autoRemove        bool
+		// Run an init process that reaps zombies and forwards signals.
+		init              bool
+		// Lines added to `/etc/hosts`: `host:ip`.
+		extraHosts        string[]
+		dns               string[]
+		dnsSearch         string[]
+		dnsOptions        string[]
+		// tmpfs mounts by path, with their mount options.
+		tmpfs             map<string, string>
+		// Bytes of `/dev/shm`; 0 takes the engine's (64 MiB).
+		shmSize           int
+		sysctls           map<string, string>
+		ipcMode           string
+		pidMode           string
+		usernsMode        string
+		groupAdd          string[]
+		// The runtime, `runc` by default.
+		runtime           string
+		logConfig         ?LogConfig
+	}
+
+	// PortBinding is a host address and port a container port is published
+	// on; "" takes every address, or a random port.
+	struct PortBinding {
+		hostIp   string
+		hostPort string
+	}
+
+	// MountKind is what a Mount mounts.
+	enum MountKind {
+		// A host path.
+		Bind   = "bind",
+		// A named volume, created when missing.
+		Volume = "volume",
+		// Memory.
+		Tmpfs  = "tmpfs",
+		// An image's file system (API 1.47 and Docker 28 or later).
+		Image  = "image",
+	}
+
+	// Mount is one mount of a container.
+	struct Mount {
+		kind          MountKind           = MountKind.Volume
+		// The host path, the volume's name or the image; "" for tmpfs or
+		// an anonymous volume.
+		source        string
+		target        string
+		readOnly      bool
+		// Bind: `rprivate`, `private`, `rshared`, `shared`, `rslave`,
+		// `slave`.
+		propagation   string
+		// Volume: do not copy what the image holds at `target` into a new
+		// volume.
+		noCopy        bool
+		// Volume: the driver and its options for a volume this creates.
+		volumeDriver  string
+		volumeOptions map<string, string>
+		volumeLabels  map<string, string>
+		// Tmpfs: its size in bytes (0: half the memory) and mode.
+		tmpfsSize     int
+		tmpfsMode     int
+	}
+
+	// RestartPolicy is when the engine starts a container again: `no`,
+	// `always`, `unless-stopped`, or `on-failure` up to `maximumRetryCount`
+	// times.
+	struct RestartPolicy {
+		name              string
+		maximumRetryCount int
+	}
+
+	// HealthCheck is how the engine checks a container: `test` is
+	// `["CMD", "pg_isready"]`, `["CMD-SHELL", "curl -f localhost"]`, or
+	// `["NONE"]` to turn the image's off. Zero durations take the
+	// defaults.
+	struct HealthCheck {
+		test          string[]
+		interval      duration
+		timeout       duration
+		retries       int
+		startPeriod   duration
+		startInterval duration
+	}
+
+	// NetworkEndpoint is a container's settings in one network.
+	struct NetworkEndpoint {
+		aliases     string[]
+		ipv4Address string
+		ipv6Address string
+		links       string[]
+		driverOpts  map<string, string>
+	}
+
+	// Ulimit is a resource limit: `nofile` with its soft and hard values.
+	struct Ulimit {
+		name string
+		soft int
+		hard int
+	}
+
+	// DeviceMapping is a host device made available in a container.
+	struct DeviceMapping {
+		pathOnHost        string
+		pathInContainer   string
+		// `rwm` by default.
+		cgroupPermissions string
+	}
+
+	// DeviceRequest asks a device driver for devices: `count` of them (-1
+	// for all) or those `deviceIds` names, with the capabilities given.
+	struct DeviceRequest {
+		driver       string
+		count        int
+		deviceIds    string[]
+		capabilities string[][]
+		options      map<string, string>
+	}
+
+	// LogConfig is where a container's output goes: the logging driver
+	// (`json-file`, `local`, `journald`, `syslog`, `none`) and its options.
+	struct LogConfig {
+		@json("Type")
+		kind string
+		config map<string, string>
+	}
+}

@@ -1,0 +1,176 @@
+// What an Engine's parts share: the link to the engine once connected,
+// and the registry credentials the Docker CLI keeps.
+internal partial module adm.dev.docker.api {
+	use (
+		std.data.encoding
+		std.data.encoding::(base64decode)
+		std.services.runtime::(Runtime)
+		std.time
+		adm.dev.docker::*
+	)
+
+	// Core is the state an Engine and its containers, images, volumes and
+	// networks share.
+	type Core {
+		link        ?Link                     = none
+		context     Surroundings
+		// The Engine's `credentials`.
+		credentials map<string, RegistryAuth> = {}
+
+		def new(context Surroundings) {
+			self.context = context
+		}
+
+		// The link to the engine.
+		// Fails with ErrorKind.Closed before `connect`.
+		def wire() !Link {
+			let current = link
+			fail errorOf(ErrorKind.Closed, "docker: the engine is not connected; call connect first") when current is none
+			return current
+		}
+
+		// The `X-Registry-Auth` header for the registry an image reference
+		// names: the credentials given, else those the Engine holds for the
+		// registry, else those the Docker CLI keeps; none when there are
+		// none.
+		// Fails with ErrorKind.Denied when a credential helper fails.
+		def registryHeader(reference string, given ?RegistryAuth) !?map<string, string> {
+			let auth = given
+			if auth is none {
+				let host = registryOf(reference)
+				auth = credentials.get(host)
+				auth = try storedAuth(host, context) when auth is none
+			}
+			return none when auth is none
+			return {"X-Registry-Auth": registryAuthHeader(auth)}
+		}
+	}
+
+	// The registry host an image reference names: its first part when that
+	// has a dot or a port or is `localhost`, else Docker Hub, `docker.io`.
+	def registryOf(reference string) string {
+		let slash = reference.indexOf("/")
+		return "docker.io" when slash < 0
+		let first = reference.slice(0, slash)
+		return first when first.contains(".") || first.contains(":") || first == "localhost"
+		return "docker.io"
+	}
+
+	// The address the Docker CLI files Docker Hub's credentials under.
+	const hubAddress = "https://index.docker.io/v1/"
+
+	// The credentials the Docker CLI keeps for a registry: from the
+	// credential helper `credHelpers` names for it, else the store
+	// `credsStore` names, else `auths`; none when there are none.
+	// Fails with ErrorKind.Denied when the helper cannot be run or fails;
+	// ErrorKind.Argument when the configuration does not read.
+	def storedAuth(host string, from Surroundings) !?RegistryAuth {
+		let config = try cliConfig(from)
+		let address = host == "docker.io" ?? (hubAddress, host)
+		let helper = config.credHelpers.get(host)
+		let program = helper is none ?? (config.credsStore, helper)
+		return try helperAuth(program, address, from) when program != ""
+		for let key in [address, host, "https://{host}", "https://{host}/v1/", "http://{host}"] {
+			let entry = config.auths.get(key)
+			continue when entry is none
+			return RegistryAuth{serverAddress: address, identityToken: entry.identitytoken} when entry.identitytoken != ""
+			continue when entry.auth == ""
+			let pair = string(base64decode(entry.auth) onerror recover byte[])
+			let colon = pair.indexOf(":")
+			continue when colon <= 0
+			return RegistryAuth{username: pair.slice(0, colon), password: pair.slice(colon + 1), serverAddress: address}
+		}
+		return none
+	}
+
+	struct HelperReply {
+		@json("ServerURL")
+		serverURL string
+		username string
+		secret string
+	}
+
+	// Asks the credential helper `docker-credential-<program>` for the
+	// credentials of a registry: `get` with the address on its standard
+	// input, JSON on its standard output. A helper that holds none says so
+	// and exits with an error; that reads as none.
+	// Fails with ErrorKind.Denied when the helper cannot be run, fails
+	// otherwise or answers what is not JSON.
+	def helperAuth(program string, address string, from Surroundings) !?RegistryAuth {
+		let run = from.runHelper
+		let (output, code) = run("docker-credential-{program}", address) onerror (err error) {
+			fail errorOf(ErrorKind.Denied, "docker: the credential helper docker-credential-{program} cannot be run: {err.message}", 0, err)
+		}
+		if code != 0 {
+			return none when output.lower().contains("credentials not found")
+			fail errorOf(ErrorKind.Denied, "docker: docker-credential-{program} get {address} exited with {code}: {output.trim()}")
+		}
+		let reply = HelperReply{}
+		new encoding.JSON().decode(output, reply) onerror (err error) {
+			fail errorOf(ErrorKind.Denied, "docker: docker-credential-{program} answered what is not JSON: {err.message}")
+		}
+		// An identity token comes back under the user name `<token>`.
+		return RegistryAuth{serverAddress: address, identityToken: reply.secret} when reply.username == "<token>"
+		return RegistryAuth{username: reply.username, password: reply.secret, serverAddress: address}
+	}
+
+	// Runs a credential helper's `get` with `input` on its standard input,
+	// without a shell, and returns its output and exit code.
+	def startHelper(program string, input string) !(string, int) {
+		let process = try Runtime.start(program, ["get"])
+		process.input.write(input.bytes()) onerror recover 0
+		process.input.close() onerror recover none
+		let out byte[] = []
+		let chunk byte[] = []
+		chunk.len(4096)
+		for {
+			let got = process.output.read(chunk) onerror recover 0
+			break when got <= 0
+			out.push(...chunk[0:got])
+		}
+		let code = try process.wait()
+		return (string(out), code)
+	}
+
+	// The body `POST /auth` takes, and what `X-Registry-Auth` holds: the
+	// API names these in lower case.
+	struct AuthBody {
+		@json("username")
+		username      string
+		@json("password")
+		password      string
+		@json("serveraddress")
+		serveraddress string
+		@json("identitytoken")
+		identitytoken string
+	}
+
+	def authBody(auth RegistryAuth) AuthBody {
+		return AuthBody{username: auth.username, password: auth.password, serveraddress: auth.serverAddress, identitytoken: auth.identityToken}
+	}
+
+	// The `X-Registry-Auth` header: the credentials as JSON in URL-safe
+	// base64.
+	def registryAuthHeader(auth RegistryAuth) string {
+		let codec = new encoding.JSON()
+		let data = codec.encode(authBody(auth))
+		let base64 = new encoding.Base64()
+		base64.urlSafe = true
+		return base64.encode(data)
+	}
+
+	// A time as the engine's `since` and `until` take it: Unix seconds with
+	// the nanoseconds after a dot.
+	def unixText(at time.Time) string {
+		let ns = at.unixNs()
+		let seconds = ns / int64(1000000000)
+		let fraction = ns % int64(1000000000)
+		return "{seconds}.{"%09d".format(fraction)}"
+	}
+
+	// Filters as the engine's `filters` parameter takes them: JSON of each
+	// name with its values.
+	def filtersText(filters map<string, string[]>) string {
+		return string(new encoding.JSON().encode(filters))
+	}
+}

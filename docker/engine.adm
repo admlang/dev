@@ -1,0 +1,200 @@
+// A Docker Engine API client: containers, images, volumes, networks and
+// the engine itself, over the engine's Unix socket or TCP with TLS, in
+// ADM over std.net.http. It speaks to Podman through its Docker-compatible
+// API too.
+partial module adm.dev.docker {
+	use (
+		std.net.http
+		std.net.tls
+		std.net.url
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// Engine is a connection to one Docker engine. Any number of tasks may
+	// share it.
+	//
+	// ```
+	// let engine = try docker.connect()                 // DOCKER_HOST, else the local socket
+	// try engine.images.pull("postgres:17")
+	// let pg = try engine.containers.create("postgres:17", name = "db", env = {"POSTGRES_PASSWORD": "secret"})
+	// try pg.start()
+	// ```
+	//
+	// Calls fail with a DockerError: ErrorKind.Connection when the engine
+	// cannot be reached, ErrorKind.TimedOut when a call that does not stream
+	// takes longer than `timeout`, ErrorKind.Closed after `close`, and the
+	// engine's answer otherwise (NotFound, Conflict, Argument, Denied,
+	// Server), with its message.
+	partial type Engine {
+		// TLS settings for a TCP host; none uses those `DOCKER_CERT_PATH` or
+		// the context names, or none at all for a plain `tcp://` host.
+		tls        ?tls.Config = none
+		// The API version to speak; "" takes the engine's when it is older
+		// than the client's (1.47), down to 1.41. Holds the version in use
+		// once connected.
+		apiVersion string      = ""
+		// How long a call that does not stream may take.
+		timeout    duration    = 2min
+		// Registry credentials by registry host (`ghcr.io`,
+		// `registry.example.com:5000`, `docker.io` for Docker Hub). A
+		// registry not named here takes its credentials from the Docker
+		// CLI's configuration and credential helpers.
+		credentials map<string, RegistryAuth> {
+			def get() map<string, RegistryAuth> {
+				return core.credentials
+			}
+
+			def set(value map<string, RegistryAuth>) {
+				core.credentials = value
+			}
+		}
+		// The containers, images, volumes and networks of the engine.
+		containers    Containers
+		images        Images
+		volumes       Volumes
+		networks      Networks
+		internal core Core
+
+		def new() {
+			core = new Core(realSurroundings())
+			containers = new Containers(core)
+			images = new Images(core)
+			volumes = new Volumes(core)
+			networks = new Networks(core)
+		}
+
+		// connect finds the engine and agrees on an API version with it.
+		// `host` is `unix:///var/run/docker.sock`, `tcp://host:2376`,
+		// `https://...`; "" looks where the Docker CLI does: `DOCKER_HOST`
+		// (with `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH`), the context
+		// `DOCKER_CONTEXT` or the CLI's configuration names, then the local
+		// sockets of Docker, Docker Desktop and Podman.
+		// Fails with a DockerError: ErrorKind.Argument for a host or context
+		// the client cannot read or an engine already connected,
+		// ErrorKind.Connection when no engine answers, ErrorKind.Protocol
+		// when it speaks an API older than 1.41.
+		def connect(host string = "") !none {
+			fail errorOf(ErrorKind.Argument, "docker: the engine is already connected") unless core.link is none
+			let endpoint = try locate(host, tls, core.context)
+			let made = new Link(endpoint, timeout)
+			made.negotiate(apiVersion) onerror (err error) {
+				made.close()
+				fail err
+			}
+			apiVersion = made.version
+			core.link = made
+			return none
+		}
+
+		// ping asks the engine whether it is up.
+		// Fails as the type says.
+		def ping() !none {
+			let res = try (try core.wire()).send(http.Method.GET, "/_ping", none, none, "", none, true)
+			res.close() onerror recover none
+			return none
+		}
+
+		// info returns what the engine says about itself and its host.
+		// Fails as the type says.
+		def info() !SystemInfo {
+			let out = SystemInfo{}
+			try (try core.wire()).call(http.Method.GET, "/info", target = out)
+			return out
+		}
+
+		// version returns the engine's version and that of its parts.
+		// Fails as the type says.
+		def version() !VersionInfo {
+			let out = VersionInfo{}
+			try (try core.wire()).call(http.Method.GET, "/version", target = out)
+			return out
+		}
+
+		// diskUsage returns the space images, containers, volumes and the
+		// build cache take.
+		// Fails as the type says.
+		def diskUsage() !DiskUsage {
+			let out = DiskUsage{}
+			try (try core.wire()).call(http.Method.GET, "/system/df", target = out)
+			return out
+		}
+
+		// events streams what happens on the engine: containers created,
+		// started and stopped, images pulled, volumes and networks made.
+		// `since` replays events from then on; `until` ends the stream then
+		// (none: it runs until `close`). `filters` narrow it, as `docker
+		// events --filter` does: `{"type": ["container"], "event":
+		// ["start", "die"], "label": ["app=web"]}`.
+		//
+		// ```
+		// let events = try engine.events(filters = {"type": ["container"]})
+		// for let event in events {
+		//     print("{event.action} {event.actor.attributes["name"]}")
+		// }
+		// ```
+		//
+		// Fails as the type says.
+		def events(since ?time.Time = none, until ?time.Time = none, filters map<string, string[]> = {}) !EventStream {
+			let query = new url.Values()
+			query.set("since", unixText(since)) unless (since is none)
+			query.set("until", unixText(until)) unless (until is none)
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let res = try (try core.wire()).send(http.Method.GET, "/events", query, none, "", none, false)
+			return new EventStream(res)
+		}
+
+		// login checks credentials against a registry, as `docker login`
+		// does, and returns the engine's status text. The credentials are not
+		// stored; put them in `credentials` for pulls and pushes.
+		// Fails as the type says, with ErrorKind.Denied when the registry
+		// refuses them.
+		def login(auth RegistryAuth) !string {
+			let out = AuthReply{}
+			try (try core.wire()).call(http.Method.POST, "/auth", body = authBody(auth), target = out)
+			return out.status
+		}
+
+		// close drops the idle connections. Calls made later fail with
+		// ErrorKind.Closed. Never fails.
+		def close() !none {
+			let current = core.link
+			current.close() unless current is none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the engine by its host.
+		def str() string {
+			let current = core.link
+			return "docker.Engine(not connected)" when current is none
+			return "docker.Engine({current.endpoint.name}, API {apiVersion})"
+		}
+	}
+
+	// connect opens an engine; see `Engine.connect` for the hosts it takes.
+	//
+	// ```
+	// let engine = try docker.connect("tcp://build.internal:2376")
+	// ```
+	//
+	// Fails with a DockerError as `Engine.connect` does.
+	def connect(host string = "") !Engine {
+		let engine = new Engine()
+		try engine.connect(host)
+		return engine
+	}
+
+	// RegistryAuth is how a registry is signed in to: a user and password
+	// (or access token), or an identity token from a previous login.
+	struct RegistryAuth {
+		username      string
+		password      string
+		// The registry's address, as `login` sends it.
+		serverAddress string
+		identityToken string
+	}
+}

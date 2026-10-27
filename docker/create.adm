@@ -1,0 +1,298 @@
+// The body of `POST /containers/create`: a ContainerSpec in the API's
+// shape, every field the spec leaves empty left out so the image's and the
+// engine's defaults hold.
+internal partial module adm.dev.docker.api {
+	use (
+		std.data.encoding
+		adm.dev.docker::*
+	)
+
+	struct CreateBody {
+		@json(omitempty = true)
+		hostname string
+		@json(omitempty = true)
+		domainname string
+		@json(omitempty = true)
+		user string
+		attachStdin bool
+		attachStdout bool = true
+		attachStderr bool = true
+		@json(omitempty = true)
+		exposedPorts map<string, map<string, string>>
+		@json(omitempty = true)
+		tty bool
+		@json(omitempty = true)
+		openStdin bool
+		@json(omitempty = true)
+		stdinOnce bool
+		@json(omitempty = true)
+		env string[]
+		@json(omitempty = true)
+		cmd string[]
+		@json(omitempty = true)
+		healthcheck ?HealthBody
+		image string
+		@json(omitempty = true)
+		volumes map<string, map<string, string>>
+		@json(omitempty = true)
+		workingDir string
+		@json(omitempty = true)
+		entrypoint string[]
+		@json(omitempty = true)
+		labels map<string, string>
+		@json(omitempty = true)
+		stopSignal string
+		@json(omitempty = true)
+		stopTimeout ?int
+		@json(omitempty = true)
+		shell string[]
+		hostConfig HostBody
+		@json(omitempty = true)
+		networkingConfig ?NetworkingBody
+	}
+
+	struct HealthBody {
+		@json(omitempty = true)
+		test string[]
+		@json(omitempty = true)
+		interval int
+		@json(omitempty = true)
+		timeout int
+		@json(omitempty = true)
+		retries int
+		@json(omitempty = true)
+		startPeriod int
+		@json(omitempty = true)
+		startInterval int
+	}
+
+	struct HostBody {
+		@json(omitempty = true)
+		binds string[]
+		@json(omitempty = true)
+		networkMode string
+		@json(omitempty = true)
+		portBindings map<string, PortBinding[]>
+		@json(omitempty = true)
+		restartPolicy ?RestartPolicy
+		@json(omitempty = true)
+		autoRemove bool
+		@json(omitempty = true)
+		mounts MountBody[]
+		@json(omitempty = true)
+		capAdd string[]
+		@json(omitempty = true)
+		capDrop string[]
+		@json(omitempty = true)
+		dns string[]
+		@json(omitempty = true)
+		dnsOptions string[]
+		@json(omitempty = true)
+		dnsSearch string[]
+		@json(omitempty = true)
+		extraHosts string[]
+		@json(omitempty = true)
+		groupAdd string[]
+		@json(omitempty = true)
+		ipcMode string
+		@json(omitempty = true)
+		pidMode string
+		@json(omitempty = true)
+		privileged bool
+		@json(omitempty = true)
+		publishAllPorts bool
+		@json(omitempty = true)
+		readonlyRootfs bool
+		@json(omitempty = true)
+		securityOpt string[]
+		@json(omitempty = true)
+		tmpfs map<string, string>
+		@json(omitempty = true)
+		usernsMode string
+		@json(omitempty = true)
+		shmSize int
+		@json(omitempty = true)
+		sysctls map<string, string>
+		@json(omitempty = true)
+		runtime string
+		@json(omitempty = true)
+		init bool
+		@json(omitempty = true)
+		logConfig ?LogConfig
+		@json(omitempty = true)
+		memory int
+		@json(omitempty = true)
+		memorySwap int
+		@json(omitempty = true)
+		memoryReservation int
+		@json(omitempty = true)
+		nanoCpus int
+		@json(omitempty = true)
+		cpuShares int
+		@json(omitempty = true)
+		cpusetCpus string
+		@json(omitempty = true)
+		pidsLimit int
+		@json(omitempty = true)
+		ulimits Ulimit[]
+		@json(omitempty = true)
+		devices DeviceMapping[]
+		@json(omitempty = true)
+		deviceRequests DeviceRequestBody[]
+	}
+
+	struct MountBody {
+		@json("Type")
+		kind string
+		@json(omitempty = true)
+		source string
+		target string
+		@json(omitempty = true)
+		readOnly bool
+		@json(omitempty = true)
+		bindOptions ?BindOptionsBody
+		@json(omitempty = true)
+		volumeOptions ?VolumeOptionsBody
+		@json(omitempty = true)
+		tmpfsOptions ?TmpfsOptionsBody
+	}
+
+	struct BindOptionsBody {
+		propagation string
+	}
+
+	struct VolumeOptionsBody {
+		@json(omitempty = true)
+		noCopy bool
+		@json(omitempty = true)
+		labels map<string, string>
+		@json(omitempty = true)
+		driverConfig ?DriverConfigBody
+	}
+
+	struct DriverConfigBody {
+		name string
+		@json(omitempty = true)
+		options map<string, string>
+	}
+
+	struct TmpfsOptionsBody {
+		@json(omitempty = true)
+		sizeBytes int
+		@json(omitempty = true)
+		mode int
+	}
+
+	struct DeviceRequestBody {
+		@json(omitempty = true)
+		driver string
+		count int
+		@json("DeviceIDs", omitempty = true)
+		deviceIds string[]
+		@json(omitempty = true)
+		capabilities string[][]
+		@json(omitempty = true)
+		options map<string, string>
+	}
+
+	struct NetworkingBody {
+		endpointsConfig map<string, EndpointBody>
+	}
+
+	struct EndpointBody {
+		@json("IPAMConfig", omitempty = true)
+		ipamConfig ?EndpointAddresses
+		@json(omitempty = true)
+		aliases string[]
+		@json(omitempty = true)
+		links string[]
+		@json(omitempty = true)
+		driverOpts map<string, string>
+	}
+
+	struct EndpointAddresses {
+		@json("IPv4Address", omitempty = true)
+		ipv4Address string
+		@json("IPv6Address", omitempty = true)
+		ipv6Address string
+	}
+
+	// The body of a container create.
+	def createBody(spec ContainerSpec) CreateBody {
+		let body = CreateBody{image: spec.image, cmd: spec.cmd, entrypoint: spec.entrypoint, labels: spec.labels, workingDir: spec.workingDir, user: spec.user, hostname: spec.hostname, domainname: spec.domainname, tty: spec.tty, openStdin: spec.openStdin, stdinOnce: spec.stdinOnce, attachStdin: spec.openStdin, stopSignal: spec.stopSignal, shell: spec.shell}
+		for let (name, value) in spec.env {
+			body.env.push("{name}={value}")
+		}
+		let exposed = new map<string, map<string, string>>()
+		for let port in spec.exposedPorts {
+			exposed.set(withProtocol(port), new map<string, string>())
+		}
+		let stop = spec.stopTimeout
+		body.stopTimeout = int(stop.nanoseconds() / int64(1000000000)) unless stop is none
+		let health = spec.healthcheck
+		body.healthcheck = HealthBody{test: health.test, interval: int(health.interval.nanoseconds()), timeout: int(health.timeout.nanoseconds()), retries: health.retries, startPeriod: int(health.startPeriod.nanoseconds()), startInterval: int(health.startInterval.nanoseconds())} unless (health is none)
+		let anonymous = new map<string, map<string, string>>()
+		for let path in spec.volumes {
+			anonymous.set(path, new map<string, string>())
+		}
+		body.volumes = anonymous
+		let host = HostBody{binds: spec.binds, networkMode: spec.network, restartPolicy: spec.restart, autoRemove: spec.autoRemove, capAdd: spec.capAdd, capDrop: spec.capDrop, dns: spec.dns, dnsOptions: spec.dnsOptions, dnsSearch: spec.dnsSearch, extraHosts: spec.extraHosts, groupAdd: spec.groupAdd, ipcMode: spec.ipcMode, pidMode: spec.pidMode, privileged: spec.privileged, publishAllPorts: spec.publishAll, readonlyRootfs: spec.readonlyRootfs, securityOpt: spec.securityOpt, tmpfs: spec.tmpfs, usernsMode: spec.usernsMode, shmSize: spec.shmSize, sysctls: spec.sysctls, runtime: spec.runtime, init: spec.init, logConfig: spec.logConfig, memory: spec.memory, memorySwap: spec.memorySwap, memoryReservation: spec.memoryReservation, nanoCpus: int(spec.cpus * 1000000000.0), cpuShares: spec.cpuShares, cpusetCpus: spec.cpusetCpus, pidsLimit: spec.pidsLimit, ulimits: spec.ulimits, devices: spec.devices}
+		let bindings = new map<string, PortBinding[]>()
+		for let (port, hostPort) in spec.ports {
+			let key = withProtocol(port)
+			bindings.set(key, [PortBinding{hostIp: "", hostPort: hostPort.str()}])
+			exposed.set(key, new map<string, string>())
+		}
+		for let (port, list) in spec.portBindings {
+			let key = withProtocol(port)
+			bindings.set(key, list)
+			exposed.set(key, new map<string, string>())
+		}
+		body.exposedPorts = exposed
+		host.portBindings = bindings
+		for let mount in spec.mounts {
+			host.mounts.push(mountBody(mount))
+		}
+		for let request in spec.deviceRequests {
+			host.deviceRequests.push(DeviceRequestBody{driver: request.driver, count: request.count, deviceIds: request.deviceIds, capabilities: request.capabilities, options: request.options})
+		}
+		body.hostConfig = host
+		if spec.networks.len() > 0 {
+			let endpoints = new map<string, EndpointBody>()
+			for let (name, endpoint) in spec.networks {
+				endpoints.set(name, endpointBody(endpoint))
+			}
+			body.networkingConfig = NetworkingBody{endpointsConfig: endpoints}
+		}
+		return body
+	}
+
+	// A container port with its protocol: `80` is `80/tcp`.
+	def withProtocol(port string) string {
+		return port.contains("/") ?? (port, "{port}/tcp")
+	}
+
+	def mountBody(mount Mount) MountBody {
+		let out = MountBody{kind: mount.kind.value, source: mount.source, target: mount.target, readOnly: mount.readOnly}
+		match mount.kind {
+			case MountKind.Bind:
+				out.bindOptions = BindOptionsBody{propagation: mount.propagation} unless mount.propagation == ""
+			case MountKind.Volume:
+				if mount.noCopy || mount.volumeLabels.len() > 0 || mount.volumeDriver != "" {
+					let options = VolumeOptionsBody{noCopy: mount.noCopy, labels: mount.volumeLabels}
+					options.driverConfig = DriverConfigBody{name: mount.volumeDriver, options: mount.volumeOptions} unless mount.volumeDriver == ""
+					out.volumeOptions = options
+				}
+			case MountKind.Tmpfs:
+				out.tmpfsOptions = TmpfsOptionsBody{sizeBytes: mount.tmpfsSize, mode: mount.tmpfsMode} when mount.tmpfsSize > 0 || mount.tmpfsMode > 0
+			default:
+		}
+		return out
+	}
+
+	def endpointBody(endpoint NetworkEndpoint) EndpointBody {
+		let out = EndpointBody{aliases: endpoint.aliases, links: endpoint.links, driverOpts: endpoint.driverOpts}
+		out.ipamConfig = EndpointAddresses{ipv4Address: endpoint.ipv4Address, ipv6Address: endpoint.ipv6Address} unless endpoint.ipv4Address == "" && endpoint.ipv6Address == ""
+		return out
+	}
+}

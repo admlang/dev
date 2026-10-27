@@ -1,0 +1,210 @@
+// The build context: a folder packed as tar, less what `.dockerignore`
+// leaves out, as the Docker CLI sends it.
+internal partial module adm.dev.docker.api {
+	use (
+		std.bytes
+		std.formats.archive
+		std.os
+		adm.dev.docker::*
+	)
+
+	// IgnoreRule is one line of `.dockerignore`: a pattern on the path
+	// relative to the context, `!` before it to take back what an earlier
+	// line left out.
+	struct IgnoreRule {
+		segments  string[]
+		exclusion bool
+	}
+
+	// The rules of a `.dockerignore` text: comments and blank lines
+	// skipped, a leading `/` dropped, `.` and `..` resolved.
+	def ignoreRules(text string) IgnoreRule[] {
+		let out IgnoreRule[] = []
+		for let raw in text.split("\n") {
+			let line = raw.trim()
+			continue when line == "" || line.startsWith("#")
+			let exclusion = line.startsWith("!")
+			line = line.slice(1).trim() when exclusion
+			let segments = cleanPath(line)
+			continue when segments.len() == 0
+			out.push(IgnoreRule{segments: segments, exclusion: exclusion})
+		}
+		return out
+	}
+
+	// The segments of a slash path with empty ones, `.` and `..` resolved.
+	def cleanPath(path string) string[] {
+		let out string[] = []
+		for let part in path.split("/") {
+			continue when part := "" || "."
+			if part == ".." {
+				out.pop() when out.len() > 0
+				continue
+			}
+			out.push(part)
+		}
+		return out
+	}
+
+	// Whether the rules leave a path out: the last rule that matches it, or
+	// one of the folders above it, decides.
+	def ignored(rules IgnoreRule[], path string) bool {
+		let parts = cleanPath(path)
+		let left = false
+		for let rule in rules {
+			// An exclusion only matters once the path is left out, a pattern
+			// only while it is not.
+			continue when rule.exclusion != left
+			let hit = globSegments(rule.segments, 0, parts, 0)
+			for let n = 1; n < parts.len() && !hit; n++ {
+				hit = globSegments(rule.segments, 0, parts[0:n], 0)
+			}
+			left = !rule.exclusion when hit
+		}
+		return left
+	}
+
+	// Whether pattern segments from `p` match path segments from `s`: `**`
+	// takes any number of segments, the others match one each.
+	def globSegments(pattern string[], p int, path string[], s int) bool {
+		return s == path.len() when p == pattern.len()
+		if pattern[p] == "**" {
+			for let skip = s; skip <= path.len(); skip++ {
+				return true when globSegments(pattern, p + 1, path, skip)
+			}
+			return false
+		}
+		return false when s == path.len()
+		return globOne(pattern[p].bytes(), 0, path[s].bytes(), 0) && globSegments(pattern, p + 1, path, s + 1)
+	}
+
+	// Whether one segment matches a glob: `*` any run, `?` one byte,
+	// `[a-z]` and `[^a-z]` a class, `\` the next byte as it is.
+	def globOne(glob byte[], g int, name byte[], n int) bool {
+		let gi = g
+		let ni = n
+		for gi < glob.len() {
+			let c = glob[gi]
+			if c == byte('*') {
+				for let k = ni; k <= name.len(); k++ {
+					return true when globOne(glob, gi + 1, name, k)
+				}
+				return false
+			}
+			return false when ni == name.len()
+			if c == byte('?') {
+				gi++
+				ni++
+				continue
+			}
+			if c == byte('[') {
+				let end = gi + 1
+				let negate = end < glob.len() && (glob[end] == byte('^') || glob[end] == byte('!'))
+				end++ when negate
+				let first = end
+				let inside = false
+				for end < glob.len() && (glob[end] != byte(']') || end == first) {
+					let low = glob[end]
+					let high = low
+					if end + 2 < glob.len() && glob[end + 1] == byte('-') && glob[end + 2] != byte(']') {
+						high = glob[end + 2]
+						end += 2
+					}
+					inside = true when name[ni] >= low && name[ni] <= high
+					end++
+				}
+				return false when end >= glob.len() || inside == negate
+				gi = end + 1
+				ni++
+				continue
+			}
+			if c == byte('\\') && gi + 1 < glob.len() {
+				gi++
+			}
+			return false when glob[gi] != name[ni]
+			gi++
+			ni++
+		}
+		return ni == name.len()
+	}
+
+	// packContext packs a folder as a build context: every file and folder
+	// `.dockerignore` keeps, symbolic links as links, with the Dockerfile
+	// and `.dockerignore` sent even when it leaves them out.
+	// Fails with ErrorKind.Argument when the folder or a file in it cannot
+	// be read.
+	def packContext(dir string, dockerfile string) !byte[] {
+		let root = dir
+		for root.len() > 1 && root.endsWith("/") {
+			root = root.slice(0, root.len() - 1)
+		}
+		let info = os.stat(root) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: the build context {dir} cannot be read: {err.message}")
+		}
+		fail errorOf(ErrorKind.Argument, "docker: the build context {dir} is not a folder") unless info.isDir
+		let rules IgnoreRule[] = []
+		let ignoreFile = "{root}/.dockerignore"
+		if os.exists(ignoreFile) onerror recover false {
+			let text = os.readFile(ignoreFile) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {ignoreFile} cannot be read: {err.message}")
+			}
+			rules = ignoreRules(string(text))
+		}
+		let keep = [dockerfile, ".dockerignore"]
+		let out = new bytes.Buffer()
+		let writer = new archive.Tar().create(out) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: {err.message}")
+		}
+		let mayTakeBack = false
+		for let rule in rules {
+			mayTakeBack = true when rule.exclusion
+		}
+		packFolder(writer, root, "", rules, keep, mayTakeBack) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: the build context {dir} cannot be packed: {err.message}")
+		}
+		writer.close() onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "docker: the build context {dir} cannot be packed: {err.message}")
+		}
+		return out.bytes()
+	}
+
+	def packFolder(writer archive.ArchiveWriter, root string, relative string, rules IgnoreRule[], keep string[], mayTakeBack bool) !none {
+		let folder = relative == "" ?? (root, "{root}/{relative}")
+		let children = try os.readDir(folder, 0)
+		children.sort((a, b) => a.path < b.path)
+		for let child in children {
+			let name = os.base(child.path)
+			let path = relative == "" ?? (name, "{relative}/{name}")
+			let left = ignored(rules, path) && !keep.includes(path)
+			let info = try os.stat(child.path, false)
+			let mode = int(info.mode)
+			if (mode & int(os.FileMode.Symlink)) != 0 {
+				continue when left
+				let target = try os.readLink(child.path)
+				let entry = archive.Entry{name: path, mode: os.FileMode(int(os.FileMode.Symlink) | 0o777), modTime: info.modTime, linkTarget: target}
+				try writer.add(entry, new bytes.Reader(byte[]))
+			} else if info.isDir {
+				// A folder left out is still walked when a later rule may take
+				// back something inside it.
+				continue when left && !mayTakeBack
+				if !left {
+					let entry = archive.Entry{name: path + "/", mode: os.FileMode(int(os.FileMode.Dir) | (mode & 0o777)), modTime: info.modTime}
+					try writer.add(entry, new bytes.Reader(byte[]))
+				}
+				try packFolder(writer, root, path, rules, keep, mayTakeBack)
+			} else {
+				continue when left
+				let file = try os.open(child.path)
+				let entry = archive.Entry{name: path, mode: os.FileMode(mode & 0o777), size: uint64(info.size), modTime: info.modTime}
+				let failure ?error = none
+				writer.add(entry, file) onerror (err error) {
+					failure = err
+					recover none
+				}
+				file.close() onerror recover none
+				fail failure unless failure is none
+			}
+		}
+		return none
+	}
+}

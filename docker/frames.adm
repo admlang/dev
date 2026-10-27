@@ -1,0 +1,180 @@
+// The two forms the engine streams in: JSON documents one per line
+// (events, progress, statistics), and the frames of a container's output
+// when it has no terminal, each marked stdout or stderr.
+internal partial module adm.dev.docker.api {
+	use (
+		std.io
+		std.net
+		adm.dev.docker::*
+	)
+
+	// JSONLines reads the documents of a stream that sends one per line.
+	type JSONLines {
+		source io.Reader
+		buf    byte[]
+		head   int
+		tail   int
+		ended  bool
+
+		def new(source io.Reader) {
+			self.source = source
+			buf.len(16384)
+		}
+
+		// next returns the next document's bytes; none at the end of the
+		// stream. Blank lines are passed over.
+		// Fails with ErrorKind.Connection when the read does.
+		def next() !?byte[] {
+			// Bytes before `searched` were looked through for a line end.
+			let searched = head
+			for {
+				let end = -1
+				for let i = searched; i < tail; i++ {
+					if buf[i] == byte('\n') {
+						end = i
+						break
+					}
+				}
+				if end >= 0 {
+					let line = buf[head:end].clone()
+					head = end + 1
+					searched = head
+					continue when string(line).trim() == ""
+					return line
+				}
+				if ended {
+					return none when head >= tail
+					let last = buf[head:tail].clone()
+					head = tail
+					return none when string(last).trim() == ""
+					return last
+				}
+				searched = tail - head
+				try fill()
+				searched += head
+			}
+			return none
+		}
+
+		// Reads more of the stream after what is buffered.
+		def fill() !none {
+			if head > 0 {
+				let kept = tail - head
+				buf[head:tail].copy(buf[0:kept])
+				head = 0
+				tail = kept
+			}
+			buf.len(buf.len() * 2) when tail == buf.len()
+			let got = source.read(buf[tail:buf.len()]) onerror (err error) {
+				fail transportError(err, "reading a stream")
+			}
+			if got <= 0 {
+				ended = true
+			} else {
+				tail += got
+			}
+			return none
+		}
+	}
+
+	// Frames reads a container's output: in frames of an 8-byte header
+	// (the stream, 1 stdout or 2 stderr, then the size big-endian in the
+	// last four bytes) and the payload, or as one plain stream when the
+	// container has a terminal.
+	type Frames {
+		source io.Reader
+		framed bool
+		header byte[]
+		ended  bool
+
+		def new(source io.Reader, framed bool) {
+			self.source = source
+			self.framed = framed
+			header.len(8)
+		}
+
+		// next returns the next piece of output and its stream (1 stdout,
+		// 2 stderr; 1 for a terminal's); none at the end.
+		// Fails with ErrorKind.Connection when the read does,
+		// ErrorKind.Protocol for a frame with another stream.
+		def next() !?(int, byte[]) {
+			return none when ended
+			if !framed {
+				let chunk byte[] = []
+				chunk.len(32768)
+				let got = try readSome(chunk)
+				if got <= 0 {
+					ended = true
+					return none
+				}
+				return (1, chunk[0:got].clone())
+			}
+			if !(try readExactly(header)) {
+				ended = true
+				return none
+			}
+			let kind = int(header[0])
+			fail errorOf(ErrorKind.Protocol, "docker: an output frame of stream {kind}") unless kind >= 0 && kind <= 2
+			let size = (int(header[4]) << 24) | (int(header[5]) << 16) | (int(header[6]) << 8) | int(header[7])
+			let payload byte[] = []
+			payload.len(size)
+			fail errorOf(ErrorKind.Protocol, "docker: an output frame ends early") unless try readExactly(payload)
+			return (kind == 0 ?? (1, kind), payload)
+		}
+
+		def readSome(into byte[]) !int {
+			let got = source.read(into) onerror (err error) {
+				fail transportError(err, "reading output")
+			}
+			return got
+		}
+
+		// Fills `into`; false when the stream ends before a byte of it.
+		def readExactly(into byte[]) !bool {
+			let at = 0
+			for at < into.len() {
+				let got = try readSome(into[at:into.len()])
+				if got <= 0 {
+					return false when at == 0
+					fail errorOf(ErrorKind.Protocol, "docker: the output ends inside a frame")
+				}
+				at += got
+			}
+			return true
+		}
+	}
+
+	// StreamReader reads a hijacked connection as an io.Reader: first the
+	// bytes the HTTP layer had already read past the answer's head, then
+	// the connection, waiting without end.
+	type StreamReader {
+		stream net.Stream
+		rest   io.Reader
+		inRest bool       = true
+
+		def new(stream net.Stream, rest io.Reader) {
+			self.stream = stream
+			self.rest = rest
+		}
+
+		// Implements io.Reader. A process may stay silent for as long as it
+		// likes: a read waits a day at a time, without end.
+		def read(into byte[]) !int {
+			if inRest {
+				let got = try rest.read(into)
+				return got when got > 0
+				inRest = false
+			}
+			for {
+				let late = false
+				let got = stream.read(into, 24h) onerror (err error) {
+					fail err unless err is net.NetError && err.kind == net.ErrorCode.TimedOut
+					late = true
+					recover 0
+				}
+				return got unless late
+			}
+			return 0
+		}
+	}
+}

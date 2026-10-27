@@ -1,0 +1,194 @@
+partial module adm.dev.docker {
+	use (
+		std.data.encoding
+		std.net.http
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// SystemInfo is what `Engine.info` returns: the engine and its host.
+	struct SystemInfo {
+		@json("ID")
+		id string
+		// The host's name.
+		name string
+		serverVersion string
+		operatingSystem string
+		osType string
+		osVersion string
+		architecture string
+		kernelVersion string
+		@json("NCPU")
+		cpus int
+		// Bytes of memory.
+		memTotal int
+		containers int
+		containersRunning int
+		containersPaused int
+		containersStopped int
+		images int
+		// The storage driver: `overlay2`, `btrfs`, ...
+		driver string
+		dockerRootDir string
+		loggingDriver string
+		cgroupDriver string
+		cgroupVersion string
+		defaultRuntime string
+		isolation string
+		securityOptions string[]
+		labels string[]
+		experimentalBuild bool
+		liveRestoreEnabled bool
+		httpProxy string
+		httpsProxy string
+		noProxy string
+		indexServerAddress string
+		systemTime ?time.Time
+		warnings string[]
+	}
+
+	// VersionInfo is what `Engine.version` returns.
+	struct VersionInfo {
+		version string
+		apiVersion string
+		@json("MinAPIVersion")
+		minAPIVersion string
+		gitCommit string
+		goVersion string
+		os string
+		arch string
+		kernelVersion string
+		experimental bool
+		buildTime string
+		platform PlatformName
+		// The engine's parts and their versions: Engine, containerd, runc,
+		// docker-init; Podman names its own.
+		components ComponentVersion[]
+	}
+
+	// PlatformName names the product an engine is: `Docker Engine -
+	// Community`, `Podman Engine`.
+	struct PlatformName {
+		name string
+	}
+
+	// ComponentVersion is one part of an engine and its version.
+	struct ComponentVersion {
+		name    string
+		version string
+	}
+
+	// DiskUsage is what `Engine.diskUsage` returns.
+	struct DiskUsage {
+		// Bytes the image layers take, shared layers counted once.
+		layersSize int
+		images     ImageSummary[]
+		containers ContainerSummary[]
+		volumes    VolumeInfo[]
+		buildCache BuildCacheRecord[]
+	}
+
+	// BuildCacheRecord is one entry of the build cache.
+	struct BuildCacheRecord {
+		@json("ID")
+		id string
+		@json("Type")
+		kind string
+		description string
+		inUse bool
+		shared bool
+		size int
+		createdAt ?time.Time
+		lastUsedAt ?time.Time
+		usageCount int
+	}
+
+	// Event is one thing that happened on the engine.
+	type Event {
+		// What it happened to: `container`, `image`, `volume`, `network`,
+		// `daemon`, `plugin`, `builder`.
+		@json("Type")
+		kind string
+		// What happened: `create`, `start`, `die`, `pull`, `destroy`, ...
+		action string
+		actor EventActor
+		// `local`, or `swarm` for an event of the swarm.
+		scope string
+		// When, in nanoseconds since the epoch; `at()` as a time.
+		timeNano int
+
+		def new() {}
+
+		// When it happened.
+		def at() time.Time {
+			return time.fromUnixNs(int64(timeNano))
+		}
+	}
+
+	// EventActor is the object an event is about: its id and attributes
+	// (a container's `name` and `image`, its labels, an exit code).
+	struct EventActor {
+		@json("ID")
+		id string
+		attributes map<string, string>
+	}
+
+	// EventStream is the events `Engine.events` streams, in order.
+	//
+	// ```
+	// for let event in events {
+	//     print(event.action)
+	// }
+	// ```
+	type EventStream {
+		// The failure that ended the stream; none while it runs or when it
+		// ended or was closed cleanly.
+		failure        ?error        = none
+		internal res   http.Response
+		internal lines JSONLines
+		atomic closed  bool          = false
+
+		def new(res http.Response) {
+			self.res = res
+			lines = new JSONLines(bodyOf(res))
+		}
+
+		// Implements Iterator<Event>: the next event, waiting for it; none
+		// when the stream ends or fails (`failure` says why).
+		def iterate() ?Event {
+			return next() onerror (err error) {
+				failure = err
+				return none
+			}
+		}
+
+		// The next event, waiting for it; none when the stream ends (`until`
+		// passed) or after `close`.
+		// Fails with ErrorKind.Connection when the connection breaks,
+		// ErrorKind.Protocol for an event that does not read.
+		def next() !?Event {
+			return none when closed
+			let line = lines.next() onerror (err error) {
+				return none when closed
+				fail err
+			}
+			return none when line is none
+			let out = Event{}
+			new encoding.JSON().decode(line, out) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "docker: an event does not read: {err.message}")
+			}
+			return out
+		}
+
+		// close ends the stream. Never fails.
+		def close() !none {
+			closed = true
+			res.close() onerror recover none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+}

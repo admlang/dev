@@ -1,0 +1,93 @@
+partial module adm.dev.docker {
+	use (
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// Volumes is the volumes of an engine (`engine.volumes`).
+	//
+	// Calls fail as the Engine's do.
+	type Volumes {
+		internal core Core
+
+		def new(core Core) {
+			self.core = core
+		}
+
+		// create makes a volume and returns it; "" as the name lets the
+		// engine make one up. Creating one that exists returns it.
+		// Fails as the type says.
+		def create(name string = "", driver string = "local", labels map<string, string> = {}, options map<string, string> = {}) !VolumeInfo {
+			let out = VolumeInfo{}
+			try (try core.wire()).call(http.Method.POST, "/volumes/create", body = VolumeBody{name: name, driver: driver, labels: labels, driverOpts: options}, target = out)
+			return out
+		}
+
+		// inspect returns a volume.
+		// Fails as the type says, with ErrorKind.NotFound when there is none.
+		def inspect(name string) !VolumeInfo {
+			let out = VolumeInfo{}
+			try (try core.wire()).call(http.Method.GET, "/volumes/{url.pathEscape(name)}", target = out)
+			return out
+		}
+
+		// list returns the volumes `filters` select (all of them when empty:
+		// `{"label": ["app=db"], "dangling": ["true"], "driver": ["local"]}`).
+		// Fails as the type says.
+		def list(filters map<string, string[]> = {}) !VolumeInfo[] {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let reply = VolumeList{}
+			try (try core.wire()).call(http.Method.GET, "/volumes", query, target = reply)
+			return reply.volumes
+		}
+
+		// remove deletes a volume; `force` also when the engine cannot find
+		// its driver.
+		// Fails as `inspect` does, and with ErrorKind.Conflict when a
+		// container uses it.
+		def remove(name string, force bool = false) !none {
+			let query = new url.Values()
+			query.set("force", "true") when force
+			try (try core.wire()).call(http.Method.DELETE, "/volumes/{url.pathEscape(name)}", query)
+			return none
+		}
+
+		// prune removes the volumes no container uses that `filters` select:
+		// the anonymous ones when empty, named ones too with `{"all":
+		// ["true"]}`.
+		// Fails as the type says.
+		def prune(filters map<string, string[]> = {}) !PruneReport {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let reply = PruneReply{}
+			try (try core.wire()).call(http.Method.POST, "/volumes/prune", query, target = reply)
+			return PruneReport{deleted: reply.volumesDeleted, spaceReclaimed: reply.spaceReclaimed}
+		}
+	}
+
+	// VolumeInfo is a volume as the engine reports it.
+	struct VolumeInfo {
+		name       string
+		driver     string
+		// Where it is on the engine's host.
+		mountpoint string
+		createdAt  ?time.Time
+		labels     map<string, string>
+		// `local`, or `global` for a cluster volume.
+		scope      string
+		options    map<string, string>
+		// The bytes it takes and how many containers use it; -1 when the
+		// engine did not count (only `Engine.diskUsage` counts).
+		usageData  ?VolumeUsage
+	}
+
+	// VolumeUsage is the space a volume takes and how many containers use
+	// it.
+	struct VolumeUsage {
+		size     int
+		refCount int
+	}
+}

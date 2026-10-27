@@ -1,0 +1,477 @@
+// The protocol suite: hosts and contexts, registry credentials, build
+// contexts, request bodies and the engine's streams, and a loopback server
+// that answers as the engine does. No engine needed.
+partial module adm.dev.docker {
+	use (
+		std.bytes
+		std.crypto.hash::(SHA256)
+		std.data.encoding
+		std.net.http
+		std.net.http.httptest
+		std.testing
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	internal const testCA = `-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUAu0ZC0Nfr52IiWEkqbrXAPHaN0UwCgYIKoZIzj0EAwIw
+FjEUMBIGA1UEAwwLYWRtLXRlc3QtY2EwIBcNMjYxMDI2MTg0MDUyWhgPMjEyNjEw
+MDIxODQwNTJaMBYxFDASBgNVBAMMC2FkbS10ZXN0LWNhMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEqxFt1tZTDAFFywHq4GI5Cy0OPTa8yOlrA2515prldjgftRyt
+jqFxzc6xAUyMdX+lCZ3YS/hiXydqYg/mNkCWaaNTMFEwHQYDVR0OBBYEFOQaVcth
+LiapQiixK2K0IsEYvx8jMB8GA1UdIwQYMBaAFOQaVcthLiapQiixK2K0IsEYvx8j
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhANAH3ANqD5AI0Zks
+1utT2r9xcEhWskq73EqikBXmHEOHAiAFMUPIAnp9wR9oQaK+rHESsnNbqwKcosQj
+tv1UOOio4w==
+-----END CERTIFICATE-----`
+
+	internal const testCert = `-----BEGIN CERTIFICATE-----
+MIIBbjCCAROgAwIBAgIUCN80fwZcrwL+haXHLncI2cRaPgkwCgYIKoZIzj0EAwIw
+FjEUMBIGA1UEAwwLYWRtLXRlc3QtY2EwIBcNMjYxMDI2MTg0MDUyWhgPMjEyNjEw
+MDIxODQwNTJaMBExDzANBgNVBAMMBmNsaWVudDBZMBMGByqGSM49AgEGCCqGSM49
+AwEHA0IABKxtWpKrMBCtTLs51rly8B9l0HgaYY4QyIbjL8GoMAFU12h4ttkPAnH0
+i2wUowWDN9IEHT+SWIqgtqZ4LdfACL+jQjBAMB0GA1UdDgQWBBRlkEwXTF268yT+
+11Ex0kSf2vcSyzAfBgNVHSMEGDAWgBTkGlXLYS4mqUIosStitCLBGL8fIzAKBggq
+hkjOPQQDAgNJADBGAiEAiEJLQgZdu7ZxKzD2wTDSTT143Q9KSTtGhEaO3sCMe10C
+IQD/7ZNp2AN+PYb2EmA45epn+zLScPWU4kekfRCnLQozcQ==
+-----END CERTIFICATE-----`
+
+	internal const testKey = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg73M706UzJrUYZ0X9
+1k3vTrgi9j9wzxiV4Ub3l8p6gdahRANCAASsbVqSqzAQrUy7Oda5cvAfZdB4GmGO
+EMiG4y/BqDABVNdoeLbZDwJx9ItsFKMFgzfSBB0/kliKoLameC3XwAi/
+-----END PRIVATE KEY-----`
+
+	// A machine with these variables and files and nothing else.
+	internal def machine(env map<string, string>, files map<string, string>, helper string = "", helperCode int = 0) Surroundings {
+		return Surroundings{env: def (name string) ?string {
+			return env.get(name)
+		}, home: "/home/ana", readFile: def (path string) !byte[] {
+			let text = files.get(path)
+			fail "no such file: {path}" when text is none
+			return text.bytes()
+		}, exists: def (path string) bool {
+			return files.hasKey(path)
+		}, runHelper: def (program string, input string) !(string, int) {
+			fail "no such program: {program}" when helper == ""
+			return (helper.replace("$INPUT", input).replace("$PROGRAM", program), helperCode)
+		}}
+	}
+
+	internal def kindOf(err error) ErrorKind {
+		return err.kind when err is DockerError
+		return ErrorKind.Server
+	}
+
+	internal def locateFails(host string, from Surroundings) ErrorKind {
+		let kind = ErrorKind.Server
+		locate(host, none, from) onerror (err error) {
+			kind = kindOf(err)
+			recover Endpoint{}
+		}
+		return kind
+	}
+
+	internal def encoded(spec ContainerSpec) string {
+		return string(encodeBody(createBody(spec)))
+	}
+
+	internal def response(body byte[], contentType string = "") http.Response {
+		let res = new http.Response()
+		res.body = new bytes.Reader(body)
+		res.headers.set("Content-Type", contentType) unless contentType == ""
+		return res
+	}
+
+	// A frame of multiplexed output.
+	internal def frame(stream int, text string) byte[] {
+		let data = text.bytes()
+		let n = data.len()
+		let out = byte[byte(stream), byte(0), byte(0), byte(0), byte((n >> 24) & 255), byte((n >> 16) & 255), byte((n >> 8) & 255), byte(n & 255)]
+		out.push(...data)
+		return out
+	}
+
+	// The kind of failure a progress stream of `text` ends in.
+	internal def progressFailure(text string) ErrorKind {
+		let kind = ErrorKind.Closed
+		followProgress(response(text.bytes()), "pulling", none) onerror (err error) {
+			kind = kindOf(err)
+			recover ""
+		}
+		return kind
+	}
+
+	internal def linesOf(stream LogStream) !string[] {
+		let out string[] = []
+		for {
+			let line = try stream.next()
+			break when line is none
+			out.push("{line.stream.value}:{line.text}")
+		}
+		return out
+	}
+
+	check "Hosts" {
+		@test()
+		def TestHostForms() !none {
+			let nothingSet = machine({}, {})
+			let socket = try locate("unix:///run/docker.sock", none, nothingSet)
+			assert socket.path == "/run/docker.sock"
+			let plain = try locate("tcp://build.internal", none, nothingSet)
+			assert plain.host == "build.internal" && plain.port == 2375 && !plain.secure
+			let secure = try locate("https://build.internal", none, nothingSet)
+			assert secure.port == 2376 && secure.secure
+			let given = try locate("tcp://10.0.0.5:2376", none, nothingSet)
+			assert given.port == 2376 && given.host == "10.0.0.5"
+			assert locateFails("ssh://me@build", nothingSet) == ErrorKind.Argument
+			assert locateFails("npipe:////./pipe/docker_engine", nothingSet) == ErrorKind.Argument
+			assert locateFails("ftp://x", nothingSet) == ErrorKind.Argument
+			assert locateFails("unix://", nothingSet) == ErrorKind.Argument
+			return none
+		}
+
+		@test()
+		def TestDockerHostAndCertificates() !none {
+			let env = {"DOCKER_HOST": "tcp://build.internal:2376", "DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "/certs"}
+			let files = {"/certs/ca.pem": testCA, "/certs/cert.pem": testCert, "/certs/key.pem": testKey}
+			let found = try locate("", none, machine(env, files))
+			assert found.secure && found.port == 2376
+			let config = found.tlsConfig
+			assert !(config is none) && config.certificates.len() == 1 && !(config.rootCAs is none)
+			// Without DOCKER_TLS_VERIFY a tcp:// host is plain.
+			let bare = try locate("", none, machine({"DOCKER_HOST": "tcp://build.internal:2375"}, files))
+			assert !bare.secure
+			// The certificates default to ~/.docker; missing ones fail.
+			assert locateFails("", machine({"DOCKER_HOST": "tcp://b:2376", "DOCKER_TLS_VERIFY": "1"}, {})) == ErrorKind.Argument
+			return none
+		}
+
+		@test()
+		def TestContextsAndSockets() !none {
+			let digest = new SHA256().hash("remote".bytes()).hex().lower()
+			let described = `{"Name":"remote","Metadata":{},"Endpoints":{"docker":{"Host":"tcp://remote.internal:2376","SkipTLSVerify":true}}}`
+			let files = new map<string, string>()
+			files.set("/home/ana/.docker/config.json", `{"currentContext": "remote"}`)
+			files.set("/home/ana/.docker/contexts/meta/{digest}/meta.json", described)
+			let viaConfig = try locate("", none, machine({}, files))
+			assert viaConfig.host == "remote.internal" && viaConfig.secure == false
+			// DOCKER_CONTEXT wins over the configuration; TLS files of the
+			// context make it secure and skipTLSVerify is kept.
+			let tlsDir = "/home/ana/.docker/contexts/tls/{digest}/docker"
+			files.set("{tlsDir}/ca.pem", testCA)
+			let viaEnv = try locate("", none, machine({"DOCKER_CONTEXT": "remote"}, files))
+			let config = viaEnv.tlsConfig
+			assert viaEnv.secure && !(config is none) && config.insecureSkipVerify
+			assert locateFails("", machine({"DOCKER_CONTEXT": "gone"}, files)) == ErrorKind.Argument
+			// DOCKER_CONFIG moves the configuration folder.
+			let moved = try locate("", none, machine({"DOCKER_CONFIG": "/etc/dk"}, {"/etc/dk/config.json": `{"currentContext": "default"}`, "/var/run/docker.sock": ""}))
+			assert moved.path == "/var/run/docker.sock"
+			// Without anything set: Docker's socket, then Podman's.
+			let podman = try locate("", none, machine({"XDG_RUNTIME_DIR": "/run/user/1000"}, {"/run/user/1000/podman/podman.sock": ""}))
+			assert podman.path == "/run/user/1000/podman/podman.sock"
+			let desktop = try locate("", none, machine({}, {"/home/ana/.docker/run/docker.sock": ""}))
+			assert desktop.path == "/home/ana/.docker/run/docker.sock"
+			assert locateFails("", machine({}, {})) == ErrorKind.Connection
+			return none
+		}
+	}
+
+	check "Credentials" {
+		@test()
+		def TestRegistriesAndReferences() {
+			assert registryOf("postgres:17") == "docker.io"
+			assert registryOf("library/postgres") == "docker.io"
+			assert registryOf("ghcr.io/acme/api:1.4") == "ghcr.io"
+			assert registryOf("localhost/app") == "localhost"
+			assert registryOf("registry.example.com:5000/app") == "registry.example.com:5000"
+			let (name, tag) = splitReference("postgres:17")
+			assert name == "postgres" && tag == "17"
+			let (portName, portTag) = splitReference("localhost:5000/app")
+			assert portName == "localhost:5000/app" && portTag == ""
+			let (digested, noTag) = splitReference("alpine@sha256:abc")
+			assert digested == "alpine@sha256:abc" && noTag == ""
+			let (both, bothTag) = splitReference("localhost:5000/app:v2")
+			assert both == "localhost:5000/app" && bothTag == "v2"
+		}
+
+		@test()
+		def TestStoredCredentials() !none {
+			let config = `{"auths": {"https://index.docker.io/v1/": {"auth": "YW5hOnNlY3JldA=="}, "ghcr.io": {"identitytoken": "tok"}}, "credHelpers": {"registry.acme.com": "acme"}}`
+			let files = {"/home/ana/.docker/config.json": config}
+			let hub = try storedAuth("docker.io", machine({}, files))
+			assert !(hub is none) && hub.username == "ana" && hub.password == "secret" && hub.serverAddress == "https://index.docker.io/v1/"
+			let token = try storedAuth("ghcr.io", machine({}, files))
+			assert !(token is none) && token.identityToken == "tok"
+			assert (try storedAuth("quay.io", machine({}, files))) is none
+			// A helper named for the registry is asked, with the address.
+			let helped = try storedAuth("registry.acme.com", machine({}, files, `{"ServerURL": "$INPUT", "Username": "$PROGRAM", "Secret": "pw"}`))
+			assert !(helped is none) && helped.username == "docker-credential-acme" && helped.password == "pw" && helped.serverAddress == "registry.acme.com"
+			// A helper that holds none says so; one that fails otherwise fails.
+			assert (try storedAuth("registry.acme.com", machine({}, files, "credentials not found in native keychain", 1))) is none
+			let kind = ErrorKind.Server
+			storedAuth("registry.acme.com", machine({}, files, "boom", 2)) onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Denied
+			// A credentials store answers for every registry.
+			let store = try storedAuth("quay.io", machine({}, {"/home/ana/.docker/config.json": `{"credsStore": "desktop"}`}, `{"Username": "<token>", "Secret": "id-token"}`))
+			assert !(store is none) && store.identityToken == "id-token"
+			// The header is URL-safe base64 of the JSON the engine reads.
+			let header = registryAuthHeader(RegistryAuth{username: "ana", password: "pw", serverAddress: "ghcr.io"})
+			let base64 = new encoding.Base64()
+			base64.urlSafe = true
+			let decoded = string(try base64.decode(header))
+			assert decoded.contains(`"username":"ana"`) && decoded.contains(`"serveraddress":"ghcr.io"`)
+			return none
+		}
+	}
+
+	check "Build context" {
+		@test()
+		def TestDockerignore() {
+			let rules = ignoreRules("# build output\n/dist\n*.log\n**/node_modules\nsecrets/**\n!secrets/public.pem\ndocs/*.md\n!docs/README.md\n.git\n")
+			assert ignored(rules, "dist")
+			assert ignored(rules, "dist/app.js")
+			assert ignored(rules, "error.log")
+			assert !ignored(rules, "logs/error.log")
+			assert ignored(rules, "node_modules/x/index.js")
+			assert ignored(rules, "web/node_modules")
+			assert ignored(rules, "secrets/key.pem")
+			assert !ignored(rules, "secrets/public.pem")
+			assert ignored(rules, "docs/guide.md")
+			assert !ignored(rules, "docs/README.md")
+			assert !ignored(rules, "docs/img/a.png")
+			assert ignored(rules, ".git/HEAD")
+			assert !ignored(rules, "src/main.adm")
+			let classes = ignoreRules("file[0-9].txt\n[!a]*.tmp\nback\\*slash\n?.c")
+			assert ignored(classes, "file3.txt") && !ignored(classes, "filex.txt")
+			assert ignored(classes, "b.tmp") && !ignored(classes, "a.tmp")
+			assert ignored(classes, "back*slash") && !ignored(classes, "backxslash")
+			assert ignored(classes, "x.c") && !ignored(classes, "xy.c")
+			assert ignoreRules("  \n# only comments\n").len() == 0
+			assert cleanPath("./a//b/../c/").join("/") == "a/c"
+		}
+	}
+
+	check "Bodies" {
+		@test()
+		def TestCreateBody() {
+			let small = encoded(ContainerSpec{image: "postgres:17", env: {"POSTGRES_PASSWORD": "secret"}, ports: {"5432": 15432}})
+			assert small.contains(`"Image":"postgres:17"`)
+			assert small.contains(`"Env":["POSTGRES_PASSWORD=secret"]`)
+			assert small.contains(`"ExposedPorts":{"5432/tcp":{}}`)
+			assert small.contains(`"PortBindings":{"5432/tcp":[{"HostIp":"","HostPort":"15432"}]}`)
+			// What is not set is left out, so the image's defaults hold.
+			assert !small.contains(`"Cmd"`) && !small.contains(`"Entrypoint"`) && !small.contains(`"Healthcheck":{`) && !small.contains(`"Memory"`) && !small.contains(`"NetworkingConfig":{`)
+			let full = encoded(ContainerSpec{image: "app", cmd: ["serve"], tty: true, openStdin: true, stopTimeout: 20s, healthcheck: HealthCheck{test: ["CMD", "true"], interval: 5s, retries: 3}, mounts: [Mount{kind: MountKind.Bind, source: "/srv", target: "/data", readOnly: true, propagation: "rslave"}, Mount{kind: MountKind.Tmpfs, target: "/tmp", tmpfsSize: 1048576}], restart: RestartPolicy{name: "on-failure", maximumRetryCount: 3}, cpus: 1.5, memory: 268435456, deviceRequests: [DeviceRequest{driver: "nvidia", count: -1, deviceIds: ["0"], capabilities: [["gpu"]]}], networks: {"back": NetworkEndpoint{aliases: ["api"], ipv4Address: "10.1.0.5"}}, network: "back"})
+			assert full.contains(`"Cmd":["serve"]`) && full.contains(`"Tty":true`) && full.contains(`"OpenStdin":true`) && full.contains(`"AttachStdin":true`)
+			assert full.contains(`"StopTimeout":20`)
+			assert full.contains(`"Healthcheck":{"Test":["CMD","true"],"Interval":5000000000,"Retries":3}`)
+			assert full.contains(`{"Type":"bind","Source":"/srv","Target":"/data","ReadOnly":true,"BindOptions":{"Propagation":"rslave"}`)
+			assert full.contains(`{"Type":"tmpfs","Target":"/tmp",`) && full.contains(`"TmpfsOptions":{"SizeBytes":1048576}}`)
+			assert full.contains(`"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3}`)
+			assert full.contains(`"NanoCpus":1500000000`) && full.contains(`"Memory":268435456`)
+			assert full.contains(`"DeviceRequests":[{"Driver":"nvidia","Count":-1,"DeviceIDs":["0"],"Capabilities":[["gpu"]]}]`)
+			assert full.contains(`"NetworkingConfig":{"EndpointsConfig":{"back":{"IPAMConfig":{"IPv4Address":"10.1.0.5"},"Aliases":["api"]}}}`)
+			assert full.contains(`"NetworkMode":"back"`)
+		}
+
+		@test()
+		def TestSmallHelpers() !none {
+			assert olderThan("1.41", "1.47") && !olderThan("1.47", "1.47") && !olderThan("1.56", "1.47") && olderThan("1.9", "1.10")
+			assert goTime("0001-01-01T00:00:00Z") is none
+			assert goTime("") is none
+			let at = goTime("2026-10-26T18:18:27.102233075Z")
+			assert !(at is none) && at.unixNs() == int64(1793038707102233075)
+			assert unixText(time.fromUnixNs(int64(1793038707102233075))) == "1793038707.102233075"
+			assert filtersText({"label": ["a=b"]}) == `{"label":["a=b"]}`
+			assert wholeSeconds(1500ms) == 2 && wholeSeconds(0s) == 0
+			// Two readings a second apart: 0.5 s of CPU on 2 CPUs of 4 s.
+			let reading = ContainerStats{}
+			try decodeWire(`{"cpu_stats":{"cpu_usage":{"total_usage":1500000000},"system_cpu_usage":8000000000,"online_cpus":2},"precpu_stats":{"cpu_usage":{"total_usage":1000000000},"system_cpu_usage":4000000000},"memory_stats":{"usage":1000,"stats":{"inactive_file":300}}}`.bytes(), reading)
+			assert reading.cpuPercent() == 25.0
+			assert reading.memoryUsed() == 700
+			assert ContainerStats{}.cpuPercent() == 0.0
+			// Go's zero time and "" become null in time fields only.
+			let rewritten = string(nullTimes(`{"Created": "", "State": {"FinishedAt":"0001-01-01T00:00:00Z", "Status":"0001-01-01T00:00:00Z"}, "Labels": {"note": "a \" Created"}, "read": "2026-10-26T18:18:27Z"}`.bytes()))
+			assert rewritten == `{"Created": null, "State": {"FinishedAt":null, "Status":"0001-01-01T00:00:00Z"}, "Labels": {"note": "a \" Created"}, "read": "2026-10-26T18:18:27Z"}`
+			let stats = ContainerStats{}
+			try decodeWire(`{"read":"2026-10-26T18:18:27Z","preread":"0001-01-01T00:00:00Z"}`.bytes(), stats)
+			assert !(stats.read is none) && stats.preread is none
+		}
+	}
+
+	check "Streams" {
+		@test()
+		def TestFramedLogs() !none {
+			let data = frame(1, "one\ntw")
+			data.push(...frame(2, "oops\n"))
+			data.push(...frame(1, "o\nthree"))
+			let stream = new LogStream(response(data), new bytes.Reader(data), true, false)
+			assert (try linesOf(stream)).equals(["stdout:one", "stderr:oops", "stdout:two", "stdout:three"])
+			// A terminal's output is one stream, CRLF line ends trimmed.
+			let raw = "a\r\nb\n".bytes()
+			assert (try linesOf(new LogStream(response(raw), new bytes.Reader(raw), false, false))).equals(["stdout:a", "stdout:b"])
+			// Timestamps lead each line.
+			let stamped = frame(1, "2026-10-26T18:18:27.000000001Z hello\n")
+			let line = try new LogStream(response(stamped), new bytes.Reader(stamped), true, true).next()
+			assert !(line is none) && line.text == "hello" && !(line.time is none)
+			// A frame cut short is a protocol failure.
+			let cut = frame(1, "abcdef").slice(0, 10)
+			let kind = ErrorKind.Server
+			linesOf(new LogStream(response(cut), new bytes.Reader(cut), true, false)) onerror (err error) {
+				kind = kindOf(err)
+				recover string[]
+			}
+			assert kind == ErrorKind.Protocol
+			return none
+		}
+
+		@test()
+		def TestJSONLinesAndProgress() !none {
+			let text = "\{\"status\":\"Pulling fs layer\",\"id\":\"a1\"}\r\n\n\{\"status\":\"Downloading\",\"id\":\"a1\",\"progressDetail\":\{\"current\":5,\"total\":10}}\n\{\"aux\":\{\"ID\":\"sha256:feed\"}}"
+			let heard Progress[] = []
+			let id = try followProgress(response(text.bytes()), "pulling", def (update Progress) {
+				heard.push(update)
+			})
+			assert id == "sha256:feed"
+			assert heard.len() == 3 && heard[1].current == 5 && heard[1].total == 10 && heard[0].id == "a1"
+			let kinds ErrorKind[] = []
+			for let failing in [`{"errorDetail":{"message":"manifest unknown"},"error":"manifest unknown"}`, `{"error":"pull access denied for x"}`, `{"error":"no space left on device"}`, `not json`] {
+				kinds.push(progressFailure(failing))
+			}
+			assert kinds.equals([ErrorKind.NotFound, ErrorKind.Denied, ErrorKind.Server, ErrorKind.Protocol])
+			// Build output reaches the listener a line at a time.
+			let said string[] = []
+			let build = new BuildLines(def (line string) {
+				said.push(line)
+			})
+			build.hear(Progress{stream: "Step 1/2 : FROM al"})
+			build.hear(Progress{stream: "pine\n ---> abc\n"})
+			build.hear(Progress{id: "3.20", status: "Pulling from library/alpine"})
+			assert said.equals(["Step 1/2 : FROM alpine", " ---> abc", "3.20: Pulling from library/alpine"])
+			return none
+		}
+	}
+
+	// A loopback server that answers as an engine speaking API 1.43 does.
+	internal def fakeEngine(seen string[]) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			let target = ctx.path()
+			let query = ctx.request.url.rawQuery
+			seen.push("{ctx.method().value} {target}{query == "" ?? ("", "?" + query)} auth={ctx.header("X-Registry-Auth") != ""}")
+			if target == "/_ping" {
+				ctx.setHeader("Api-Version", "1.43")
+				return ctx.text("OK")
+			}
+			match target {
+				case "/v1.43/containers/json":
+					ctx.setHeader("Content-Type", "application/json")
+					return ctx.text(`[{"Id":"c1","Names":["/db"],"Image":"postgres:17","State":"running","Status":"Up 2 minutes","Created":1793038707,"Ports":[{"IP":"0.0.0.0","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"}],"Labels":{"app":"db"}}]`)
+				case "/v1.43/containers/missing/json":
+					ctx.setHeader("Content-Type", "application/json")
+					return ctx.text(404, `{"message":"No such container: missing"}`)
+				case "/v1.43/auth":
+					let body = try ctx.text()
+					return ctx.text(401, `{"message":"unauthorized: incorrect username or password"}`) unless body.contains(`"password":"right"`)
+					return ctx.text(`{"Status":"Login Succeeded","IdentityToken":""}`)
+				case "/v1.43/containers/c1":
+					// Podman's answer to removing a running container.
+					return ctx.text(500, `{"cause":"container state improper","message":"cannot remove container c1 as it is running","response":500}`)
+				case "/v1.43/containers/create":
+					return ctx.text(409, `{"message":"Conflict. The container name \"/db\" is already in use"}`)
+				case "/v1.43/images/create":
+					return ctx.text(`{"status":"Pulling from library/x"}` + "\n" + `{"errorDetail":{"message":"pull access denied for x"},"error":"pull access denied for x"}`)
+				case "/v1.43/containers/c1/logs":
+					let data = frame(1, "ready\n")
+					data.push(...frame(2, "warn\n"))
+					return ctx.blob(200, "application/vnd.docker.multiplexed-stream", data)
+				default:
+					return ctx.text(500, "unexpected {target}")
+			}
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	check "Loopback engine" {
+		@test()
+		def TestAgainstFakeEngine() !none {
+			let seen string[] = []
+			let server = try fakeEngine(seen)
+			let engine = new Engine()
+			engine.credentials = {"docker.io": RegistryAuth{username: "ana", password: "pw"}}
+			try engine.connect("tcp://{server.address().str()}")
+			assert engine.apiVersion == "1.43"
+			assert engine.str().contains("API 1.43")
+			let listed = try engine.containers.list(all = true, filters = {"label": ["app=db"]})
+			assert listed.len() == 1 && listed[0].name() == "db" && listed[0].ports[0].publicPort == 5432 && listed[0].labels["app"] == "db"
+			assert seen.join("\n").contains("GET /v1.43/containers/json?all=true&filters=%7B%22label%22%3A%5B%22app%3Ddb%22%5D%7D")
+			let kind = ErrorKind.Server
+			let message = ""
+			engine.containers.get("missing") onerror (err error) {
+				kind = kindOf(err)
+				message = err.message
+				recover new Container(new Core(machine({}, {})), "", "")
+			}
+			assert kind == ErrorKind.NotFound && message.contains("No such container: missing")
+			kind = ErrorKind.Server
+			engine.containers.create("postgres:17", name = "db") onerror (err error) {
+				kind = kindOf(err)
+				recover new Container(new Core(machine({}, {})), "", "")
+			}
+			assert kind == ErrorKind.Conflict
+			kind = ErrorKind.Server
+			engine.images.pull("x") onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Denied
+			assert seen.join("\n").contains("POST /v1.43/images/create?fromImage=x auth=true")
+			kind = ErrorKind.Server
+			new Container(engine.core, "c1", "db").remove() onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Conflict
+			assert (try engine.login(RegistryAuth{username: "ana", password: "right", serverAddress: "ghcr.io"})) == "Login Succeeded"
+			kind = ErrorKind.Server
+			engine.login(RegistryAuth{username: "ana", password: "wrong"}) onerror (err error) {
+				kind = kindOf(err)
+				recover ""
+			}
+			assert kind == ErrorKind.Denied
+			let logs = try new Container(engine.core, "c1", "db").logs()
+			assert (try linesOf(logs)).equals(["stdout:ready", "stderr:warn"])
+			try engine.close()
+			kind = ErrorKind.Server
+			engine.ping() onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestNotConnected() {
+			let kind = ErrorKind.Server
+			new Engine().info() onerror (err error) {
+				kind = kindOf(err)
+				recover SystemInfo{}
+			}
+			assert kind == ErrorKind.Closed
+			kind = ErrorKind.Server
+			connect("tcp://127.0.0.1:1") onerror (err error) {
+				kind = kindOf(err)
+				recover new Engine()
+			}
+			assert kind == ErrorKind.Connection
+		}
+	}
+}

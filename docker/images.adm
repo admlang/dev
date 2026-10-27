@@ -1,0 +1,317 @@
+partial module adm.dev.docker {
+	use (
+		std.bytes
+		std.data.encoding
+		std.io
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// Progress is one report of a pull, push, build or load: a layer's
+	// state and how much of it moved, or a line of build output.
+	struct Progress {
+		// The layer or image the report is about; "" for a general one.
+		id       string
+		// `Pulling fs layer`, `Downloading`, `Pull complete`, ...
+		status   string
+		// The engine's progress bar as text.
+		progress string
+		// Bytes done and in all; 0 when not known.
+		current  int
+		total    int
+		// A line of build output, with its line end.
+		stream   string
+	}
+
+	// Images is the images of an engine (`engine.images`).
+	//
+	// Calls fail as the Engine's do. A pull, push, build or load that the
+	// engine reports an error part way through fails with ErrorKind.Server,
+	// ErrorKind.NotFound when the image or tag does not exist, or
+	// ErrorKind.Denied when the registry refuses the credentials.
+	type Images {
+		internal core Core
+
+		def new(core Core) {
+			self.core = core
+		}
+
+		// pull fetches an image from its registry, with the credentials
+		// given, else those the Engine or the Docker CLI holds for the
+		// registry, and returns once it is there. `platform` (`linux/arm64`)
+		// picks a variant; `progress` hears each report.
+		//
+		// ```
+		// try engine.images.pull("postgres:17")
+		// try engine.images.pull("ghcr.io/acme/api:1.4", progress = def (p docker.Progress) {
+		//     print("{p.id} {p.status} {p.current}/{p.total}")
+		// })
+		// ```
+		//
+		// Fails as the type says.
+		def pull(reference string, platform string = "", auth ?RegistryAuth = none, progress ?def (update Progress) = none) !none {
+			let query = new url.Values()
+			let (name, tag) = splitReference(reference)
+			query.set("fromImage", name)
+			query.set("tag", tag) unless tag == ""
+			query.set("platform", platform) unless platform == ""
+			let headers = try core.registryHeader(reference, auth)
+			let res = try (try core.wire()).send(http.Method.POST, "/images/create", query, none, "", headers, false)
+			try followProgress(res, "pulling {reference}", progress)
+			return none
+		}
+
+		// push sends an image to the registry its name says, with
+		// credentials as `pull` finds them.
+		// Fails as the type says.
+		def push(reference string, auth ?RegistryAuth = none, progress ?def (update Progress) = none) !none {
+			let (name, tag) = splitReference(reference)
+			let query = new url.Values()
+			query.set("tag", tag) unless tag == ""
+			let headers = try core.registryHeader(reference, auth)
+			// The engine wants the header even for a registry without
+			// credentials.
+			let sent = headers is none ?? ({"X-Registry-Auth": registryAuthHeader(RegistryAuth{})}, headers)
+			let res = try (try core.wire()).send(http.Method.POST, "/images/{url.pathEscape(name)}/push", query, none, "", sent, false)
+			try followProgress(res, "pushing {reference}", progress)
+			return none
+		}
+
+		// build builds an image from a folder with a Dockerfile, as `docker
+		// build` does with the classic builder, and returns the image's id.
+		// The folder goes to the engine less what its `.dockerignore` leaves
+		// out. `output` hears each line the build prints.
+		//
+		// ```
+		// let id = try engine.images.build("./api", tags = ["acme/api:dev"], buildArgs = {"VERSION": "1.4"})
+		// ```
+		//
+		// Fails as the type says, with ErrorKind.Argument when the folder
+		// cannot be read and ErrorKind.Server when a step fails.
+		def build(context string, tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none) !string {
+			let tar = try packContext(context, dockerfile)
+			return try build(tar, tags, dockerfile, buildArgs, target, labels, noCache, pull, platform, output)
+		}
+
+		// build builds an image from a build context packed as tar; see the
+		// folder overload.
+		// Fails as the folder overload does.
+		def build(contextTar byte[], tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none) !string {
+			let query = new url.Values()
+			for let tag in tags {
+				query.add("t", tag)
+			}
+			query.set("dockerfile", dockerfile)
+			query.set("buildargs", string(new encoding.JSON().encode(buildArgs))) when buildArgs.len() > 0
+			query.set("labels", string(new encoding.JSON().encode(labels))) when labels.len() > 0
+			query.set("target", target) unless target == ""
+			query.set("nocache", "true") when noCache
+			query.set("pull", "true") when pull
+			query.set("platform", platform) unless platform == ""
+			query.set("rm", "true")
+			query.set("version", "1")
+			let headers = {"X-Registry-Config": registryConfigHeader(core)}
+			let res = try (try core.wire()).send(http.Method.POST, "/build", query, new bytes.Reader(contextTar), "application/x-tar", headers, false)
+			let lines = new BuildLines(output)
+			let id = try followProgress(res, "building", def (update Progress) {
+				lines.hear(update)
+			})
+			fail errorOf(ErrorKind.Protocol, "docker: the build ended without an image id") when id == ""
+			return id
+		}
+
+		// list returns the images: those with a tag, or every one with
+		// `all`, intermediate layers too. `filters` narrow the list as
+		// `docker images --filter` does: `{"reference": ["postgres:*"],
+		// "dangling": ["true"], "label": ["team=api"]}`.
+		// Fails as the type says.
+		def list(all bool = false, filters map<string, string[]> = {}) !ImageSummary[] {
+			let query = new url.Values()
+			query.set("all", "true") when all
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let out ImageSummary[] = []
+			try (try core.wire()).call(http.Method.GET, "/images/json", query, target = out)
+			return out
+		}
+
+		// inspect returns what the engine knows about an image.
+		// Fails as the type says, with ErrorKind.NotFound when there is none.
+		def inspect(name string) !ImageInfo {
+			let out = ImageInfo{}
+			try (try core.wire()).call(http.Method.GET, "/images/{url.pathEscape(name)}/json", target = out)
+			return out
+		}
+
+		// history returns the layers of an image, newest first, with the
+		// instruction that made each.
+		// Fails as `inspect` does.
+		def history(name string) !ImageLayer[] {
+			let out ImageLayer[] = []
+			try (try core.wire()).call(http.Method.GET, "/images/{url.pathEscape(name)}/history", target = out)
+			return out
+		}
+
+		// tag gives an image another name: `repository:tag`.
+		// Fails as `inspect` does, and with ErrorKind.Argument for a name the
+		// engine does not take.
+		def tag(name string, repository string, tag string = "latest") !none {
+			let query = new url.Values()
+			query.set("repo", repository)
+			query.set("tag", tag)
+			try (try core.wire()).call(http.Method.POST, "/images/{url.pathEscape(name)}/tag", query)
+			return none
+		}
+
+		// remove deletes an image name, and the image when no other name
+		// holds it; `force` removes it from stopped containers' use too,
+		// `noPrune` keeps the untagged parents. Returns what was untagged and
+		// deleted.
+		// Fails as `inspect` does, and with ErrorKind.Conflict when a
+		// container uses the image.
+		def remove(name string, force bool = false, noPrune bool = false) !ImageRemoval[] {
+			let query = new url.Values()
+			query.set("force", "true") when force
+			query.set("noprune", "true") when noPrune
+			let out ImageRemoval[] = []
+			try (try core.wire()).call(http.Method.DELETE, "/images/{url.pathEscape(name)}", query, target = out)
+			return out
+		}
+
+		// prune removes the images no container uses that `filters` select:
+		// those without a tag when empty, every unused one with `{"dangling":
+		// ["false"]}`.
+		// Fails as the type says.
+		def prune(filters map<string, string[]> = {}) !PruneReport {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let reply = PruneReply{}
+			try (try core.wire()).call(http.Method.POST, "/images/prune", query, target = reply)
+			let deleted string[] = []
+			for let removal in reply.imagesDeleted {
+				deleted.push(removal.deleted) unless removal.deleted == ""
+			}
+			return PruneReport{deleted: deleted, spaceReclaimed: reply.spaceReclaimed}
+		}
+
+		// save writes images, with their tags and layers, as one tar archive
+		// to `into` (`docker save`).
+		// Fails as the type says.
+		def save(names string[], into io.Writer) !none {
+			let query = new url.Values()
+			for let name in names {
+				query.add("names", name)
+			}
+			let res = try (try core.wire()).send(http.Method.GET, "/images/get", query, none, "", none, false)
+			res.copyTo(into) onerror (err error) {
+				fail transportError(err, "saving images")
+			}
+			return none
+		}
+
+		// load reads images from a tar archive `save` wrote and returns the
+		// names (or ids) it loaded.
+		// Fails as the type says.
+		def load(from io.Reader) !string[] {
+			let query = new url.Values()
+			query.set("quiet", "true")
+			let res = try (try core.wire()).send(http.Method.POST, "/images/load", query, from, "application/x-tar", none, false)
+			let loaded string[] = []
+			try followProgress(res, "loading images", def (update Progress) {
+				for let line in update.stream.split("\n") {
+					let text = line.trim()
+					for let prefix in ["Loaded image: ", "Loaded image ID: "] {
+						loaded.push(text.slice(prefix.len())) when text.startsWith(prefix)
+					}
+				}
+			})
+			return loaded
+		}
+
+		// load reads images from tar bytes; see the io.Reader overload.
+		// Fails as that one does.
+		def load(tar byte[]) !string[] {
+			return try load(new bytes.Reader(tar))
+		}
+	}
+
+	// ImageSummary is one image as `Images.list` returns it.
+	struct ImageSummary {
+		@json("Id")
+		id string
+		@json("ParentId")
+		parentId string
+		repoTags string[]
+		repoDigests string[]
+		// When it was made, in Unix seconds.
+		created int
+		size int
+		sharedSize int
+		labels map<string, string>
+		// How many containers use it; -1 when the engine did not count.
+		containers int
+	}
+
+	// ImageInfo is what `Images.inspect` returns.
+	struct ImageInfo {
+		@json("Id")
+		id string
+		repoTags string[]
+		repoDigests string[]
+		parent string
+		comment string
+		created ?time.Time
+		author string
+		config ImageConfigInfo
+		architecture string
+		variant string
+		os string
+		size int
+		@json("RootFS")
+		rootFs RootFs
+	}
+
+	// ImageConfigInfo is how containers of an image run unless told
+	// otherwise.
+	struct ImageConfigInfo {
+		user         string
+		env          string[]
+		cmd          string[]
+		entrypoint   string[]
+		workingDir   string
+		labels       map<string, string>
+		exposedPorts map<string, any>
+		volumes      map<string, any>
+		stopSignal   string
+		shell        string[]
+	}
+
+	// RootFs is an image's layers by their digests.
+	struct RootFs {
+		@json("Type")
+		kind string
+		layers string[]
+	}
+
+	// ImageLayer is one entry of `Images.history`.
+	struct ImageLayer {
+		// The image id of the layer; `<missing>` for one pulled with its
+		// image.
+		@json("Id")
+		id string
+		// When it was made, in Unix seconds.
+		created int
+		createdBy string
+		tags string[]
+		size int
+		comment string
+	}
+
+	// ImageRemoval is a name untagged or an image deleted by a remove or a
+	// prune.
+	struct ImageRemoval {
+		untagged string
+		deleted  string
+	}
+}

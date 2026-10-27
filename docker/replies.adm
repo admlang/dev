@@ -1,0 +1,420 @@
+// The engine's answers in the API's shape, before they become the
+// library's types, and the small bodies requests carry.
+internal partial module adm.dev.docker.api {
+	use (
+		std.bytes
+		std.data.encoding
+		std.data.encoding::(base64decode)
+		std.io
+		std.net.http
+		std.time
+		adm.dev.docker::*
+	)
+
+	struct CreatedReply {
+		@json("Id")
+		id string
+		warnings string[]
+	}
+
+	struct PruneReply {
+		containersDeleted string[]
+		volumesDeleted    string[]
+		networksDeleted   string[]
+		imagesDeleted     ImageRemoval[]
+		spaceReclaimed    int
+	}
+
+	struct WaitReply {
+		statusCode int
+		error      ?WaitProblem
+	}
+
+	struct WaitProblem {
+		message string
+	}
+
+	struct UpdateReply {
+		warnings string[]
+	}
+
+	struct UpdateBody {
+		@json(omitempty = true)
+		memory int
+		@json(omitempty = true)
+		memorySwap int
+		@json(omitempty = true)
+		memoryReservation int
+		@json(omitempty = true)
+		nanoCpus int
+		@json(omitempty = true)
+		cpuShares int
+		@json(omitempty = true)
+		cpusetCpus string
+		@json(omitempty = true)
+		pidsLimit int
+		@json(omitempty = true)
+		restartPolicy ?RestartPolicy
+	}
+
+	def updateBody(change ResourceUpdate) UpdateBody {
+		return UpdateBody{memory: change.memory, memorySwap: change.memorySwap, memoryReservation: change.memoryReservation, nanoCpus: int(change.cpus * 1000000000.0), cpuShares: change.cpuShares, cpusetCpus: change.cpusetCpus, pidsLimit: change.pidsLimit, restartPolicy: change.restart}
+	}
+
+	// A container's state with its times as the engine writes them.
+	struct StateWire {
+		status string
+		running bool
+		paused bool
+		restarting bool
+		@json("OOMKilled")
+		oomKilled bool
+		dead bool
+		pid int
+		exitCode int
+		error string
+		startedAt string
+		finishedAt string
+		health ?HealthState
+	}
+
+	struct CheckWire {
+		start    string
+		end      string
+		exitCode int
+		output   string
+	}
+
+	// decodeWire reads an answer of the engine onto `target`.
+	// Fails with ErrorKind.Protocol when it does not read.
+	def decodeWire(data byte[], target any) !none {
+		new encoding.JSON().decode(nullTimes(data), target) onerror (err error) {
+			fail errorOf(ErrorKind.Protocol, "docker: an answer of the engine does not read as the API says: {err.message}")
+		}
+		return none
+	}
+
+	// A time as the engine writes it; none for "" and for Go's zero time
+	// (year 1), which stands for a time that never was.
+	def goTime(text string) ?time.Time {
+		return none when text == "" || text.startsWith("0001-01-01")
+		let failed = false
+		let parsed = time.parse(text) onerror (err error) {
+			failed = true
+			recover time.fromUnixNs(0)
+		}
+		return none when failed
+		return parsed
+	}
+
+	// The whole seconds of a span, rounded up.
+	def wholeSeconds(span duration) int {
+		return int((span.nanoseconds() + 999999999) / 1000000000)
+	}
+
+	struct ExecBody {
+		attachStdin bool
+		attachStdout bool = true
+		attachStderr bool = true
+		@json(omitempty = true)
+		tty bool
+		@json(omitempty = true)
+		env string[]
+		cmd string[]
+		@json(omitempty = true)
+		user string
+		@json(omitempty = true)
+		workingDir string
+		@json(omitempty = true)
+		privileged bool
+	}
+
+	struct ExecStartBody {
+		detach bool
+		tty    bool
+	}
+
+	struct ExecState {
+		running  bool
+		exitCode int
+	}
+
+	// A response's body; an empty reader when it has none.
+	def bodyOf(res http.Response) io.Reader {
+		let body = res.body
+		return body is none ?? (new bytes.Reader(byte[]), body)
+	}
+
+	struct AuthReply {
+		status        string
+		identityToken string
+	}
+
+	struct VolumeBody {
+		@json(omitempty = true)
+		name string
+		driver string
+		@json(omitempty = true)
+		labels map<string, string>
+		@json(omitempty = true)
+		driverOpts map<string, string>
+	}
+
+	struct VolumeList {
+		volumes  VolumeInfo[]
+		warnings string[]
+	}
+
+	struct NetworkBody {
+		name string
+		driver string
+		@json("Internal")
+		internalOnly bool
+		attachable bool
+		@json("EnableIPv6")
+		enableIPv6 bool
+		@json(omitempty = true)
+		labels map<string, string>
+		@json(omitempty = true)
+		options map<string, string>
+		@json("IPAM", omitempty = true)
+		ipam ?IpamBody
+	}
+
+	struct IpamBody {
+		driver string
+		config SubnetBody[]
+	}
+
+	struct SubnetBody {
+		@json(omitempty = true)
+		subnet string
+		@json("IPRange", omitempty = true)
+		ipRange string
+		@json(omitempty = true)
+		gateway string
+		@json(omitempty = true)
+		auxiliaryAddresses map<string, string>
+	}
+
+	struct ConnectBody {
+		container      string
+		endpointConfig EndpointBody
+	}
+
+	struct DisconnectBody {
+		container string
+		force     bool
+	}
+
+	// A progress report as the engine streams it.
+	struct ProgressWire {
+		id             string
+		status         string
+		progress       string
+		progressDetail ProgressDetailWire
+		stream         string
+		error          string
+		errorDetail    ?ErrorDetailWire
+		aux            ?AuxWire
+	}
+
+	struct ProgressDetailWire {
+		current int
+		total   int
+	}
+
+	struct ErrorDetailWire {
+		code    int
+		message string
+	}
+
+	struct AuxWire {
+		@json("ID")
+		id string
+	}
+
+	// followProgress reads a stream of progress reports to its end, hands
+	// each to `hear`, and returns the image id a build reports ("" when
+	// none). The response is closed.
+	// Fails with ErrorKind.Connection when the stream breaks,
+	// ErrorKind.Protocol for a report that does not read, and the error a
+	// report carries: ErrorKind.NotFound for a missing image or tag,
+	// ErrorKind.Denied for refused credentials, ErrorKind.Server for the
+	// rest.
+	def followProgress(res http.Response, about string, hear ?def (update Progress)) !string {
+		let lines = new JSONLines(bodyOf(res))
+		let id = ""
+		let failure ?error = none
+		for {
+			let line = lines.next() onerror (err error) {
+				failure = err
+				recover none
+			}
+			break when line is none
+			let report = ProgressWire{}
+			new encoding.JSON().decode(line, report) onerror (err error) {
+				failure = errorOf(ErrorKind.Protocol, "docker: {about}: a progress report does not read: {err.message}")
+				recover none
+			}
+			break unless failure is none
+			let detail = report.errorDetail
+			let problem = report.error
+			problem = detail.message when problem == "" && !(detail is none)
+			if problem != "" {
+				failure = errorOf(streamErrorKind(problem), "docker: {about}: {problem.trim()}")
+				break
+			}
+			let aux = report.aux
+			id = aux.id unless aux is none || aux.id == ""
+			hear(Progress{id: report.id, status: report.status, progress: report.progress, current: report.progressDetail.current, total: report.progressDetail.total, stream: report.stream}) unless (hear is none)
+		}
+		res.close() onerror recover none
+		fail failure unless failure is none
+		return id
+	}
+
+	// The kind of failure an error a stream reports stands for.
+	def streamErrorKind(message string) ErrorKind {
+		let text = message.lower()
+		return ErrorKind.Denied when text.contains("unauthorized") || text.contains("denied") || text.contains("authentication required")
+		return ErrorKind.NotFound when text.contains("not found") || text.contains("manifest unknown") || text.contains("does not exist")
+		return ErrorKind.Server
+	}
+
+	// An image reference split into its name and tag: `postgres:17` is
+	// ("postgres", "17"), `localhost:5000/app` is ("localhost:5000/app",
+	// ""), a reference with a digest stays whole.
+	def splitReference(reference string) (string, string) {
+		return (reference, "") when reference.contains("@")
+		let slash = reference.lastIndexOf("/")
+		let colon = reference.lastIndexOf(":")
+		return (reference.slice(0, colon), reference.slice(colon + 1)) when colon > slash
+		return (reference, "")
+	}
+
+	// The `X-Registry-Config` header of a build: the credentials of every
+	// registry the Engine holds, and those the Docker CLI keeps in
+	// `auths`, by registry, so the build can pull its base images.
+	def registryConfigHeader(core Core) string {
+		let all = new map<string, AuthBody>()
+		let config = cliConfig(core.context) onerror recover CliConfig{}
+		for let (key, entry) in config.auths {
+			continue when entry.auth == ""
+			let pair = string(base64decode(entry.auth) onerror recover byte[])
+			let colon = pair.indexOf(":")
+			continue when colon <= 0
+			all.set(key, AuthBody{username: pair.slice(0, colon), password: pair.slice(colon + 1), serveraddress: key})
+		}
+		for let (host, auth) in core.credentials {
+			all.set(host == "docker.io" ?? (hubAddress, host), authBody(auth))
+		}
+		let base64 = new encoding.Base64()
+		base64.urlSafe = true
+		return base64.encode(new encoding.JSON().encode(all))
+	}
+
+	// BuildLines hands the output of a build to a listener a line at a
+	// time.
+	type BuildLines {
+		output  ?def (line string)
+		pending string             = ""
+
+		def new(output ?def (line string)) {
+			self.output = output
+		}
+
+		def hear(update Progress) {
+			let listener = output
+			return when listener is none
+			let text = update.stream
+			text = update.id == "" ?? ("{update.status}\n", "{update.id}: {update.status}\n") when text == "" && update.status != ""
+			let all = pending + text
+			let lines = all.split("\n")
+			pending = lines.pop()
+			for let line in lines {
+				listener(line)
+			}
+		}
+	}
+
+	// The names of the time fields in the engine's answers: those a value of
+	// Go's zero time (year 1), or "", may stand in for a time that never was.
+	const timeKeys = ["Created", "CreatedAt", "LastUsedAt", "SystemTime", "StartedAt", "FinishedAt", "Start", "End", "read", "preread"]
+
+	// nullTimes rewrites the time fields of an answer that hold Go's zero
+	// time or "" to null, so they read as none into `?time.Time` fields. A
+	// key counts only when a `:` follows it; other strings pass as they are.
+	def nullTimes(data byte[]) byte[] {
+		let out byte[] = []
+		out.cap(data.len())
+		let i = 0
+		let key = ""
+		for i < data.len() {
+			let b = data[i]
+			if b != byte('"') {
+				out.push(b)
+				i++
+				continue
+			}
+			let end = stringEnd(data, i)
+			let text = data[i:end]
+			let after = end
+			for after < data.len() && (data[after] == byte(' ') || data[after] == byte('\n') || data[after] == byte('\r') || data[after] == byte('\t')) {
+				after++
+			}
+			if after < data.len() && data[after] == byte(':') {
+				key = string(data[i + 1:end - 1])
+				out.push(...text)
+				i = end
+				continue
+			}
+			let value = string(data[i + 1:end - 1])
+			if key != "" && timeKeys.includes(key) && (value == "" || value.startsWith("0001-01-01T00:00:00")) {
+				out.push(...("null".bytes()))
+			} else {
+				out.push(...text)
+			}
+			key = ""
+			i = end
+		}
+		return out
+	}
+
+	// Where the JSON string that opens at `start` ends, past its quote.
+	def stringEnd(data byte[], start int) int {
+		let i = start + 1
+		for i < data.len() {
+			if data[i] == byte('\\') {
+				i += 2
+				continue
+			}
+			return i + 1 when data[i] == byte('"')
+			i++
+		}
+		return data.len()
+	}
+
+	// Reads a session's output to its end into `out` and `errs`.
+	// Fails as `Session.next` does.
+	def drain(session Session, out byte[], errs byte[]) !none {
+		for {
+			let piece = try session.next()
+			break when piece is none
+			if piece.stream == OutputStream.Stderr {
+				errs.push(...piece.data)
+			} else {
+				out.push(...piece.data)
+			}
+		}
+		return none
+	}
+
+	// Writes the input of an exec, then ends it.
+	// Fails as `Session.write` and `Session.closeInput` do.
+	def feed(session Session, input byte[]) !none {
+		try session.write(input)
+		try session.closeInput()
+		return none
+	}
+}

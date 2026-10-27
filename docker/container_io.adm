@@ -1,0 +1,529 @@
+partial module adm.dev.docker {
+	use (
+		std.bytes
+		std.data.encoding
+		std.formats.archive
+		std.io
+		std.net
+		std.net.http
+		std.net.tls
+		std.net.url
+		std.os
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// OutputStream is which of a process's streams a piece of output came
+	// on. A process with a terminal has one stream, read as Stdout.
+	enum OutputStream {
+		Stdout = "stdout",
+		Stderr = "stderr",
+	}
+
+	// LogLine is one line of a container's output, without its line end.
+	struct LogLine {
+		stream OutputStream
+		text   string
+		// When the engine took it in; with `timestamps` only.
+		time   ?time.Time
+	}
+
+	// Output is a piece of a process's output as it arrived.
+	type Output {
+		stream OutputStream
+		data   byte[]
+
+		def new() {}
+
+		// The bytes as text.
+		def text() string {
+			return string(data)
+		}
+	}
+
+	// ExecResult is what `Container.exec` returns: the exit code and the
+	// whole output.
+	type ExecResult {
+		exitCode int
+		stdout   byte[]
+		stderr   byte[]
+
+		def new() {}
+
+		// The standard output as text.
+		def text() string {
+			return string(stdout)
+		}
+	}
+
+	partial type Container {
+		// logs returns the container's output, line by line. With `follow`
+		// the stream goes on as the container writes until it stops or the
+		// stream is closed; without, it ends at what was written so far.
+		// `since` and `until` bound it in time, `tail` keeps the last lines
+		// only (-1: all), `timestamps` gives each line the time the engine
+		// took it in.
+		//
+		// ```
+		// for let line in try pg.logs(follow = true) {
+		//     print(line.text)
+		// }
+		// ```
+		//
+		// Fails as the type says.
+		def logs(follow bool = false, stdout bool = true, stderr bool = true, since ?time.Time = none, until ?time.Time = none, timestamps bool = false, tail int = -1) !LogStream {
+			let query = new url.Values()
+			query.set("stdout", stdout ?? ("true", "false"))
+			query.set("stderr", stderr ?? ("true", "false"))
+			query.set("follow", "true") when follow
+			query.set("timestamps", "true") when timestamps
+			query.set("tail", tail < 0 ?? ("all", tail.str()))
+			query.set("since", unixText(since)) unless (since is none)
+			query.set("until", unixText(until)) unless (until is none)
+			let link = try core.wire()
+			let res = try link.send(http.Method.GET, "/containers/{id}/logs", query, none, "", none, false)
+			let framed = try isFramed(res)
+			return new LogStream(res, bodyOf(res), framed, timestamps)
+		}
+
+		// exec runs a command in the running container, waits for it and
+		// returns its exit code and output.
+		//
+		// ```
+		// let ready = try pg.exec("pg_isready", "-U", "postgres")
+		// print(ready.exitCode)
+		// ```
+		//
+		// Fails as the type says, with ErrorKind.Conflict when the container
+		// is not running.
+		def exec(command ...string) !ExecResult {
+			return try exec(command, input = byte[])
+		}
+
+		// exec runs a command as the other overload does: with variables
+		// added to the environment, as another user, in another folder, and
+		// with `input` written to its standard input.
+		// Fails as the other overload does.
+		def exec(command string[], env map<string, string> = {}, user string = "", workingDir string = "", privileged bool = false, input byte[] = []) !ExecResult {
+			let session = try startExec(command, false, input.len() > 0, env, user, workingDir, privileged)
+			let out byte[] = []
+			let errs byte[] = []
+			if input.len() > 0 {
+				// The input goes in while the output comes out: a process that
+				// writes before it reads all it is given would stall otherwise.
+				let writer = async feed(session, input)
+				try drain(session, out, errs)
+				try await writer
+			} else {
+				try drain(session, out, errs)
+			}
+			let code = try session.wait()
+			session.close() onerror recover none
+			return ExecResult{exitCode: code, stdout: out, stderr: errs}
+		}
+
+		// startExec starts a command in the running container and returns
+		// the session to talk to it: write its input, read its output as it
+		// comes, resize its terminal, wait for its exit code.
+		//
+		// ```
+		// let shell = try box.startExec(["sh"], tty = true)
+		// try shell.write("ls /\nexit\n")
+		// for let piece in shell {
+		//     print(piece.text())
+		// }
+		// ```
+		//
+		// Fails as `exec` does.
+		def startExec(command string[], tty bool = false, stdin bool = true, env map<string, string> = {}, user string = "", workingDir string = "", privileged bool = false) !Session {
+			let link = try core.wire()
+			let body = ExecBody{attachStdin: stdin, tty: tty, cmd: command, user: user, workingDir: workingDir, privileged: privileged}
+			for let (variable, value) in env {
+				body.env.push("{variable}={value}")
+			}
+			let made = CreatedReply{}
+			try link.call(http.Method.POST, "/containers/{id}/exec", body = body, target = made)
+			let (stream, rest) = try link.upgrade(http.Method.POST, "/exec/{made.id}/start", none, ExecStartBody{detach: false, tty: tty})
+			return new Session(core, stream, rest, !tty, made.id, id)
+		}
+
+		// attach connects to the container's main process: its output from
+		// now on (with `logs`, what it wrote before too), and its standard
+		// input when the container was created with `openStdin`.
+		// Fails as the type says.
+		def attach(stdin bool = true, logs bool = false) !Session {
+			let link = try core.wire()
+			let info = try inspect()
+			let query = new url.Values()
+			query.set("stream", "true")
+			query.set("stdout", "true")
+			query.set("stderr", "true")
+			query.set("stdin", "true") when stdin && info.config.openStdin
+			query.set("logs", "true") when logs
+			let (stream, rest) = try link.upgrade(http.Method.POST, "/containers/{id}/attach", query, none)
+			return new Session(core, stream, rest, !info.config.tty, "", id)
+		}
+
+		// copyTo copies a file or a folder of this machine into the
+		// container, inside the folder `into`, which must exist there.
+		//
+		// ```
+		// try web.copyTo("site/", "/usr/share/nginx/html")
+		// ```
+		//
+		// Fails as the type says, with ErrorKind.Argument when the local
+		// path cannot be read, ErrorKind.NotFound when `into` is not in the
+		// container.
+		def copyTo(localPath string, into string) !none {
+			let packed = new bytes.Buffer()
+			let writer = new archive.Tar().create(packed) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {err.message}")
+			}
+			let trimmed = localPath
+			for trimmed.len() > 1 && trimmed.endsWith("/") {
+				trimmed = trimmed.slice(0, trimmed.len() - 1)
+			}
+			writer.add(trimmed, archive.AddOptions{path: os.base(trimmed), recursive: true}) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {localPath} cannot be packed: {err.message}")
+			}
+			writer.close() onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {localPath} cannot be packed: {err.message}")
+			}
+			return try writeArchive(into, packed.bytes())
+		}
+
+		// copyFrom copies a file or a folder of the container into the
+		// folder `into` of this machine.
+		// Fails as the type says, with ErrorKind.NotFound when the path is
+		// not in the container, ErrorKind.Argument when it cannot be written
+		// here.
+		def copyFrom(path string, into string) !none {
+			let data = try readArchive(path)
+			let opened = new archive.Tar().open(new bytes.Reader(data)) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "docker: the archive of {path} does not read: {err.message}")
+			}
+			opened.extract(into) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {path} cannot be written to {into}: {err.message}")
+			}
+			return none
+		}
+
+		// writeArchive unpacks a tar archive into the folder `into` of the
+		// container.
+		// Fails as the type says, with ErrorKind.NotFound when the folder is
+		// not there.
+		def writeArchive(into string, tar byte[]) !none {
+			let query = new url.Values()
+			query.set("path", into)
+			try (try core.wire()).raw(http.Method.PUT, "/containers/{id}/archive", query, new bytes.Reader(tar), "application/x-tar")
+			return none
+		}
+
+		// readArchive returns a file or a folder of the container as a tar
+		// archive.
+		// Fails as the type says, with ErrorKind.NotFound when the path is
+		// not there.
+		def readArchive(path string) !byte[] {
+			let query = new url.Values()
+			query.set("path", path)
+			return try (try core.wire()).raw(http.Method.GET, "/containers/{id}/archive", query)
+		}
+
+		// stats returns the container's resource use once: CPU, memory,
+		// network and block I/O. The engine measures the CPU over about a
+		// second, so it takes that long; `oneShot` answers at once without
+		// the CPU's previous reading.
+		// Fails as the type says.
+		def stats(oneShot bool = false) !ContainerStats {
+			let query = new url.Values()
+			query.set("stream", "false")
+			query.set("one-shot", "true") when oneShot
+			let out = ContainerStats{}
+			try (try core.wire()).call(http.Method.GET, "/containers/{id}/stats", query, target = out)
+			return out
+		}
+
+		// statsStream returns the container's resource use once a second
+		// until it stops or the stream is closed.
+		// Fails as the type says.
+		def statsStream() !StatsStream {
+			let query = new url.Values()
+			query.set("stream", "true")
+			let res = try (try core.wire()).send(http.Method.GET, "/containers/{id}/stats", query, none, "", none, false)
+			return new StatsStream(res)
+		}
+
+		// ---- internals ----
+
+		// Whether the output a response streams comes in frames: the
+		// content type says so (API 1.42 and later); an older engine is asked
+		// whether the container has a terminal.
+		internal def isFramed(res http.Response) !bool {
+			let kind = res.header("Content-Type")
+			return true when kind.contains("multiplexed")
+			return false when kind.contains("raw-stream")
+			let info = try inspect()
+			return !info.config.tty
+		}
+	}
+
+	// LogStream is the lines `Container.logs` returns, in order.
+	type LogStream {
+		// The failure that ended the stream; none while it runs or when it
+		// ended or was closed cleanly.
+		failure             ?error        = none
+		internal res        http.Response
+		internal frames     Frames
+		internal timestamps bool
+		internal outPart    byte[]
+		internal errPart    byte[]
+		internal ready      LogLine[]
+		internal taken      int
+		internal ended      bool
+		atomic closed       bool          = false
+
+		def new(res http.Response, body io.Reader, framed bool, timestamps bool) {
+			self.res = res
+			self.timestamps = timestamps
+			frames = new Frames(body, framed)
+		}
+
+		// Implements Iterator<LogLine>: the next line, waiting for it; none
+		// when the stream ends or fails (`failure` says why).
+		def iterate() ?LogLine {
+			return next() onerror (err error) {
+				failure = err
+				return none
+			}
+		}
+
+		// The next line, waiting for it; none at the end of the output or
+		// after `close`. A last line without a line end comes when the
+		// output ends.
+		// Fails with ErrorKind.Connection when the connection breaks.
+		def next() !?LogLine {
+			for taken >= ready.len() {
+				return none when closed
+				ready = []
+				taken = 0
+				return none when ended
+				let piece = frames.next() onerror (err error) {
+					return none when closed
+					fail err
+				}
+				if piece is none {
+					ended = true
+					flush(OutputStream.Stdout, outPart)
+					flush(OutputStream.Stderr, errPart)
+					outPart = []
+					errPart = []
+					continue
+				}
+				let (kind, data) = piece
+				if kind == 2 {
+					errPart = split(OutputStream.Stderr, errPart, data)
+				} else {
+					outPart = split(OutputStream.Stdout, outPart, data)
+				}
+			}
+			taken++
+			return ready[taken - 1]
+		}
+
+		// text reads the rest of the output and returns its lines joined by
+		// line ends, stdout and stderr in the order they came.
+		// Fails as `next` does.
+		def text() !string {
+			let lines string[] = []
+			for {
+				let line = try next()
+				break when line is none
+				lines.push(line.text)
+			}
+			return lines.join("\n")
+		}
+
+		// close ends the stream. Never fails.
+		def close() !none {
+			closed = true
+			res.close() onerror recover none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Adds the lines a piece completes to `ready` and returns what is
+		// left of the last one.
+		internal def split(stream OutputStream, part byte[], data byte[]) byte[] {
+			let held = part
+			let start = 0
+			for let i = 0; i < data.len(); i++ {
+				if data[i] == byte('\n') {
+					held.push(...data[start:i])
+					flush(stream, held)
+					held = []
+					start = i + 1
+				}
+			}
+			held.push(...data[start:data.len()])
+			return held
+		}
+
+		internal def flush(stream OutputStream, line byte[]) {
+			return when line.len() == 0 && stream == OutputStream.Stderr && ended
+			return when line.len() == 0 && ended
+			let text = string(line)
+			text = text.slice(0, text.len() - 1) when text.endsWith("\r")
+			let at ?time.Time = none
+			if timestamps {
+				let space = text.indexOf(" ")
+				if space > 0 {
+					at = goTime(text.slice(0, space))
+					text = text.slice(space + 1) unless at is none
+				}
+			}
+			ready.push(LogLine{stream: stream, text: text, time: at})
+		}
+	}
+
+	// Session is a connection to a process of a container, from `attach`
+	// or `startExec`: its input to write, its output to read as it comes.
+	type Session {
+		// The failure that ended the output; none while it runs or when it
+		// ended cleanly.
+		failure         ?error     = none
+		internal core   Core
+		internal stream net.Stream
+		internal frames Frames
+		// The exec's id; "" for an attach.
+		internal execId string
+		internal owner  string
+		atomic closed   bool       = false
+
+		def new(core Core, stream net.Stream, rest io.Reader, framed bool, execId string, owner string) {
+			self.core = core
+			self.stream = stream
+			self.execId = execId
+			self.owner = owner
+			frames = new Frames(new StreamReader(stream, rest), framed)
+		}
+
+		// write sends bytes to the process's standard input.
+		// Fails with ErrorKind.Connection when the connection breaks.
+		def write(data byte[]) !none {
+			let at = 0
+			for at < data.len() {
+				at += try writeSome(data[at:data.len()])
+			}
+			return none
+		}
+
+		// Writes what the connection takes of `part` and returns how much.
+		// Fails as `write` does.
+		internal def writeSome(part byte[]) !int {
+			let wrote = stream.write(part, (try core.wire()).timeout) onerror (err error) {
+				fail transportError(err, "writing input")
+			}
+			fail errorOf(ErrorKind.Connection, "docker: the connection closed while writing input") when wrote <= 0
+			return wrote
+		}
+
+		// write sends text to the process's standard input.
+		// Fails as the byte[] overload does.
+		def write(text string) !none {
+			return try write(text.bytes())
+		}
+
+		// closeInput ends the process's standard input, as Ctrl-D does on a
+		// terminal; its output goes on.
+		// Fails with ErrorKind.Connection when the connection does.
+		def closeInput() !none {
+			match stream {
+				case net.Connection:
+					stream.shutdownWrite() onerror (err error) {
+						fail transportError(err, "closing input")
+					}
+				case tls.Conn:
+					stream.closeWrite() onerror (err error) {
+						fail transportError(err, "closing input")
+					}
+				default:
+			}
+			return none
+		}
+
+		// Implements Iterator<Output>: the next piece of output, waiting for
+		// it; none when the output ends or fails (`failure` says why).
+		def iterate() ?Output {
+			return next() onerror (err error) {
+				failure = err
+				return none
+			}
+		}
+
+		// The next piece of output, waiting for it; none when the process
+		// closed its output or after `close`.
+		// Fails with ErrorKind.Connection when the connection breaks.
+		def next() !?Output {
+			return none when closed
+			let piece = frames.next() onerror (err error) {
+				return none when closed
+				fail err
+			}
+			return none when piece is none
+			let (kind, data) = piece
+			return Output{stream: kind == 2 ?? (OutputStream.Stderr, OutputStream.Stdout), data: data}
+		}
+
+		// resize sets the size of the process's terminal.
+		// Fails as the Engine's calls do.
+		def resize(rows int, columns int) !none {
+			let query = new url.Values()
+			query.set("h", rows.str())
+			query.set("w", columns.str())
+			let path = execId == "" ?? ("/containers/{owner}/resize", "/exec/{execId}/resize")
+			try (try core.wire()).call(http.Method.POST, path, query)
+			return none
+		}
+
+		// wait waits for the process to end and returns its exit code: an
+		// exec's, or for an attach the container's.
+		// Fails as the Engine's calls do.
+		def wait() !int {
+			let link = try core.wire()
+			if execId == "" {
+				let query = new url.Values()
+				query.set("condition", "not-running")
+				let res = try link.send(http.Method.POST, "/containers/{owner}/wait", query, none, "", none, false)
+				let reply = WaitReply{}
+				res.json(reply) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "docker: waiting for {owner}: {err.message}")
+				}
+				return reply.statusCode
+			}
+			// The engine marks the exec ended a moment after its output closes.
+			let pause = 5ms
+			for {
+				let state = ExecState{}
+				try link.call(http.Method.GET, "/exec/{execId}/json", target = state)
+				return state.exitCode unless state.running
+				time.sleep(pause)
+				pause = pause + pause when pause < 200ms
+			}
+			return -1
+		}
+
+		// close drops the connection. Never fails.
+		def close() !none {
+			closed = true
+			stream.close() onerror recover none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+	}
+}

@@ -1,8 +1,10 @@
-// Docker Engine and Podman API client
-@manifest(version = "0.0.1")
+// A Docker Engine API client as an ADM library, over std.net.http; it
+// speaks to Podman's compatible API too.
+@manifest(version = "0.1.0")
 library adm.dev.docker {
 	use (
 		adm.dev.docker
+		adm.dev.docker.api
 	)
 
 	export (

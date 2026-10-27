@@ -1,0 +1,260 @@
+// The HTTP side of the client: requests to the engine's API over its
+// socket or TCP, the API version both sides speak, and the engine's
+// errors read into DockerErrors.
+internal partial module adm.dev.docker.api {
+	use (
+		std.bytes
+		std.data.encoding
+		std.io
+		std.net
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.docker::*
+	)
+
+	// The newest API version the client was written against; an engine
+	// that speaks an older one is spoken to in that.
+	const newestVersion = "1.47"
+
+	// The oldest API version the client speaks: Docker 20.10, and Podman's
+	// compatible API.
+	const oldestVersion = "1.41"
+
+	def errorOf(kind ErrorKind, message string, status int = 0, cause ?error = none) DockerError {
+		return DockerError{message: message, code: kind.value, kind: kind, status: status, cause: cause}
+	}
+
+	// The kind of failure an HTTP status of the engine stands for.
+	def kindOfStatus(status int) ErrorKind {
+		match status {
+			case 400:
+				return ErrorKind.Argument
+			case 401, 403:
+				return ErrorKind.Denied
+			case 404:
+				return ErrorKind.NotFound
+			case 409:
+				return ErrorKind.Conflict
+			default:
+				return ErrorKind.Server
+		}
+	}
+
+	// The DockerError a failure of std.net or std.net.http stands for.
+	def transportError(err error, about string) DockerError {
+		let late = err.code := "timeout" || "ETIMEDOUT"
+		late = true when err is net.NetError && err.kind == net.ErrorCode.TimedOut
+		return errorOf(late ?? (ErrorKind.TimedOut, ErrorKind.Connection), "docker: {about}: {err.message}", 0, err)
+	}
+
+	// Dials the engine's Unix socket whatever address a request names.
+	type SocketDialer {
+		path string
+
+		def new(path string) {
+			self.path = path
+		}
+
+		// Implements http.Dialer.
+		def dial(network string, addr string, timeout duration) !net.Connection {
+			return try net.dialStream(path, timeout)
+		}
+	}
+
+	// Link sends requests to one engine.
+	type Link {
+		endpoint      Endpoint
+		transport     http.Transport
+		client        http.Client
+		// Where requests go: `http://docker` over a socket.
+		base          string
+		// The API version requests name, "1.47"; "" before `negotiate`.
+		version       string
+		// How long a request that does not stream may take.
+		timeout       duration
+		atomic closed bool
+
+		def new(endpoint Endpoint, timeout duration) {
+			self.endpoint = endpoint
+			self.timeout = timeout
+			transport = new http.Transport()
+			transport.http2 = false
+			transport.maxIdlePerHost = 8
+			if endpoint.path != "" {
+				transport.dialer = new SocketDialer(endpoint.path)
+				base = "http://docker"
+			} else {
+				transport.tls = endpoint.tlsConfig
+				let host = endpoint.host.contains(":") ?? ("[{endpoint.host}]", endpoint.host)
+				base = "{endpoint.secure ?? ("https", "http")}://{host}:{endpoint.port}"
+			}
+			client = new http.Client()
+			client.transport = transport
+			client.decompress = false
+			client.userAgent = "adm.dev.docker"
+		}
+
+		// negotiate settles the API version: `fixed` when given, else the
+		// engine's (`GET /_ping`) when it is older than the client's newest.
+		// Fails with a DockerError: ErrorKind.Connection or TimedOut when the
+		// engine does not answer, ErrorKind.Protocol when it speaks a
+		// version older than the client's oldest.
+		def negotiate(fixed string) !none {
+			if fixed != "" {
+				version = fixed
+				return none
+			}
+			let res = try send(http.Method.GET, "/_ping", none, none, "", none, true)
+			let offered = res.header("Api-Version")
+			res.close() onerror recover none
+			version = newestVersion
+			if offered != "" {
+				version = offered when olderThan(offered, newestVersion)
+				fail errorOf(ErrorKind.Protocol, "docker: {endpoint.name} speaks API {offered}; this client needs {oldestVersion} or newer") when olderThan(offered, oldestVersion)
+			}
+			return none
+		}
+
+		// send makes one request and returns the response with its body
+		// unread. `bounded` gives it `timeout` to finish; a stream (logs,
+		// events, a pull) is not bounded. A path that is not `/_ping` goes
+		// under the API version.
+		// Fails with a DockerError: ErrorKind.Closed after `close`,
+		// ErrorKind.Connection or TimedOut as the request fails, and the
+		// engine's error, its message read from the body, for a status of
+		// 400 and above.
+		def send(method http.Method, path string, query ?url.Values, body ?io.Reader, contentType string, headers ?map<string, string>, bounded bool) !http.Response {
+			fail errorOf(ErrorKind.Closed, "docker: the engine client is closed") when closed
+			let target = try requestFor(method, path, query, body, contentType, headers, bounded)
+			let res = client.do(target) onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+			return try checked(res, "{method} {path}")
+		}
+
+		// The request `send` sends.
+		def requestFor(method http.Method, path string, query ?url.Values, body ?io.Reader, contentType string, headers ?map<string, string>, bounded bool) !http.Request {
+			let full = path == "/_ping" ?? (path, "/v{version}{path}")
+			full = "{full}?{query.encode()}" when !(query is none) && query.len() > 0
+			let target = http.newRequest(method, "{base}{full}", body) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: {method} {path}: {err.message}")
+			}
+			target.headers.set("Content-Type", contentType) unless contentType == ""
+			if !(headers is none) {
+				for let (name, value) in headers {
+					target.headers.set(name, value)
+				}
+			}
+			target.deadline = time.now() + timeout when bounded && timeout > 0s
+			return target
+		}
+
+		// call sends a request with an optional JSON body and decodes the
+		// JSON answer onto `target` (none: the answer is read and dropped).
+		// Fails as `send` does, and with ErrorKind.Protocol when the answer
+		// does not decode.
+		def call(method http.Method, path string, query ?url.Values = none, body ?any = none, target ?any = none, headers ?map<string, string> = none) !none {
+			let payload ?io.Reader = none
+			let kind = ""
+			if !(body is none) {
+				payload = new bytes.Reader(encodeBody(body))
+				kind = "application/json"
+			}
+			let res = try send(method, path, query, payload, kind, headers, true)
+			let data = res.bytes() onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+			if !(target is none) {
+				new encoding.JSON().decode(nullTimes(data), target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "docker: {method} {path}: the answer does not read as the API says: {err.message}")
+				}
+			}
+			return none
+		}
+
+		// raw sends a request and returns the answer's bytes.
+		// Fails as `send` does.
+		def raw(method http.Method, path string, query ?url.Values = none, body ?io.Reader = none, contentType string = "", headers ?map<string, string> = none) !byte[] {
+			let res = try send(method, path, query, body, contentType, headers, true)
+			return res.bytes() onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+		}
+
+		// upgrade sends a request that takes the connection over (attach,
+		// exec) and returns the connection and the bytes already read past
+		// the answer's head. The engine answers `101 UPGRADED`; an older one
+		// answers 200 and goes on the same way.
+		// Fails as `send` does.
+		def upgrade(method http.Method, path string, query ?url.Values, body ?any) !(net.Stream, io.Reader) {
+			fail errorOf(ErrorKind.Closed, "docker: the engine client is closed") when closed
+			let payload ?io.Reader = none
+			let kind = ""
+			if !(body is none) {
+				payload = new bytes.Reader(encodeBody(body))
+				kind = "application/json"
+			}
+			let target = try requestFor(method, path, query, payload, kind, {"Connection": "Upgrade", "Upgrade": "tcp"}, false)
+			target.contentLength = -1
+			let (res, stream, rest) = transport.upgrade(target) onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+			if res.status >= 400 {
+				stream.close() onerror recover none
+				try checked(res, "{method} {path}")
+			}
+			return (stream, rest)
+		}
+
+		def close() {
+			closed = true
+			transport.closeIdle()
+		}
+	}
+
+	// The response when its status is below 400; else the engine's error,
+	// its message read from the JSON body (`{"message": ...}`) or the body
+	// as text.
+	def checked(res http.Response, about string) !http.Response {
+		return res when res.status < 400
+		let data = res.bytes() onerror recover byte[]
+		let message = string(data).trim()
+		let reply = ErrorReply{}
+		new encoding.JSON().decode(data, reply) onerror recover none
+		message = reply.message unless reply.message == ""
+		message = "{res.status} {res.reason}" when message == ""
+		let kind = kindOfStatus(res.status)
+		// Podman answers 500 where Docker answers 409, and says why in
+		// `cause`.
+		let cause = reply.cause.lower()
+		kind = ErrorKind.Conflict when res.status == 500 && (cause.contains("state improper") || cause.contains("in use") || cause.contains("already exists"))
+		fail errorOf(kind, "docker: {about}: {message}", res.status)
+	}
+
+	struct ErrorReply {
+		message string
+		// Podman's reason for the error.
+		cause   string
+	}
+
+	// A request body as JSON: field names in PascalCase, as the API writes
+	// them, empty fields left out where the type says so.
+	def encodeBody(body any) byte[] {
+		let codec = new encoding.JSON()
+		codec.caseStyle = encoding.CaseStyle.Pascal
+		return codec.encode(body)
+	}
+
+	// Whether API version `a` is older than `b` ("1.41" < "1.47").
+	def olderThan(a string, b string) bool {
+		let x = a.split(".")
+		let y = b.split(".")
+		for let i = 0; i < 2; i++ {
+			let p = i < x.len() && /^[0-9]{1,4}$/.test(x[i]) ?? (x[i].toInt<int>(10), 0)
+			let q = i < y.len() && /^[0-9]{1,4}$/.test(y[i]) ?? (y[i].toInt<int>(10), 0)
+			return p < q when p != q
+		}
+		return false
+	}
+}

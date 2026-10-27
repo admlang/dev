@@ -1,0 +1,42 @@
+partial module adm.dev.docker {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is DockerError`.
+	enum ErrorKind {
+		// The engine cannot be reached, or the connection broke.
+		Connection = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut   = "timeout",
+		// The engine was closed.
+		Closed     = "closed",
+		// An argument the client or the engine does not take (400), or a
+		// host, a context or a configuration file the client cannot read.
+		Argument   = "argument",
+		// The engine or a registry refused the credentials (401, 403).
+		Denied     = "denied",
+		// No such container, image, volume, network or exec (404).
+		NotFound   = "notfound",
+		// The object is in the way or in use: a name taken, a container
+		// still running, an image a container uses (409).
+		Conflict   = "conflict",
+		// What the engine sent is not what the API says it sends.
+		Protocol   = "protocol",
+		// The engine failed (500 and the rest), or a pull, push, build or
+		// load reported an error part way.
+		Server     = "server",
+	}
+
+	// DockerError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct DockerError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorKind
+		// The HTTP status the engine answered with; 0 when the failure is
+		// not an answer of the engine.
+		status  int
+	}
+}

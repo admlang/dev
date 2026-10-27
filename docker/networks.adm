@@ -1,0 +1,148 @@
+partial module adm.dev.docker {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.time
+		adm.dev.docker.api::*
+	)
+
+	// Networks is the networks of an engine (`engine.networks`).
+	//
+	// Calls fail as the Engine's do.
+	type Networks {
+		internal core Core
+
+		def new(core Core) {
+			self.core = core
+		}
+
+		// create makes a network and returns it. `subnets` gives it address
+		// ranges (`Subnet{subnet: "10.20.0.0/16", gateway: "10.20.0.1"}`);
+		// none lets the engine pick. `internalOnly` keeps it from the outside,
+		// `attachable` lets standalone containers join a swarm network.
+		// Fails as the type says, with ErrorKind.Conflict when the name is
+		// taken.
+		def create(name string, driver string = "bridge", internalOnly bool = false, attachable bool = false, enableIPv6 bool = false, labels map<string, string> = {}, options map<string, string> = {}, subnets Subnet[] = []) !NetworkInfo {
+			let body = NetworkBody{name: name, driver: driver, internalOnly: internalOnly, attachable: attachable, enableIPv6: enableIPv6, labels: labels, options: options}
+			if subnets.len() > 0 {
+				let ranges SubnetBody[] = []
+				for let range in subnets {
+					ranges.push(SubnetBody{subnet: range.subnet, ipRange: range.ipRange, gateway: range.gateway, auxiliaryAddresses: range.auxiliaryAddresses})
+				}
+				body.ipam = IpamBody{driver: "default", config: ranges}
+			}
+			let reply = CreatedReply{}
+			try (try core.wire()).call(http.Method.POST, "/networks/create", body = body, target = reply)
+			return try inspect(reply.id)
+		}
+
+		// inspect returns a network by name or id, with the containers in
+		// it.
+		// Fails as the type says, with ErrorKind.NotFound when there is none.
+		def inspect(nameOrId string) !NetworkInfo {
+			let out = NetworkInfo{}
+			try (try core.wire()).call(http.Method.GET, "/networks/{url.pathEscape(nameOrId)}", target = out)
+			return out
+		}
+
+		// list returns the networks `filters` select (all of them when empty:
+		// `{"driver": ["bridge"], "label": ["app=web"], "name": ["front"]}`).
+		// Fails as the type says.
+		def list(filters map<string, string[]> = {}) !NetworkInfo[] {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let out NetworkInfo[] = []
+			try (try core.wire()).call(http.Method.GET, "/networks", query, target = out)
+			return out
+		}
+
+		// remove deletes a network.
+		// Fails as `inspect` does, and with ErrorKind.Conflict when
+		// containers are in it.
+		def remove(nameOrId string) !none {
+			try (try core.wire()).call(http.Method.DELETE, "/networks/{url.pathEscape(nameOrId)}")
+			return none
+		}
+
+		// prune removes the networks no container uses that `filters` select.
+		// Fails as the type says.
+		def prune(filters map<string, string[]> = {}) !PruneReport {
+			let query = new url.Values()
+			query.set("filters", filtersText(filters)) when filters.len() > 0
+			let reply = PruneReply{}
+			try (try core.wire()).call(http.Method.POST, "/networks/prune", query, target = reply)
+			return PruneReport{deleted: reply.networksDeleted, spaceReclaimed: 0}
+		}
+
+		// connect puts a container into a network, under extra names and at
+		// a fixed address when they are given.
+		// Fails as `inspect` does, and with ErrorKind.NotFound when the
+		// container is not there.
+		def connect(network string, container string, aliases string[] = [], ipv4Address string = "", ipv6Address string = "") !none {
+			let endpoint = endpointBody(NetworkEndpoint{aliases: aliases, ipv4Address: ipv4Address, ipv6Address: ipv6Address})
+			try (try core.wire()).call(http.Method.POST, "/networks/{url.pathEscape(network)}/connect", body = ConnectBody{container: container, endpointConfig: endpoint})
+			return none
+		}
+
+		// disconnect takes a container out of a network; `force` also when
+		// it is not running.
+		// Fails as `connect` does.
+		def disconnect(network string, container string, force bool = false) !none {
+			try (try core.wire()).call(http.Method.POST, "/networks/{url.pathEscape(network)}/disconnect", body = DisconnectBody{container: container, force: force})
+			return none
+		}
+	}
+
+	// Subnet is an address range of a network.
+	struct Subnet {
+		subnet string
+		@json("IPRange")
+		ipRange string
+		gateway string
+		auxiliaryAddresses map<string, string>
+	}
+
+	// NetworkInfo is a network as the engine reports it.
+	struct NetworkInfo {
+		name string
+		@json("Id")
+		id string
+		created ?time.Time
+		// `local`, `global` or `swarm`.
+		scope string
+		driver string
+		@json("EnableIPv6")
+		enableIPv6 bool
+		@json("IPAM")
+		ipam IpamInfo
+		// Kept from the outside world.
+		@json("Internal")
+		internalOnly bool
+		attachable bool
+		ingress bool
+		// The containers in it, by id; filled by `inspect`, not `list`.
+		containers map<string, NetworkMember>
+		options map<string, string>
+		labels map<string, string>
+	}
+
+	// IpamInfo is how a network hands out addresses.
+	struct IpamInfo {
+		driver  string
+		config  Subnet[]
+		options map<string, string>
+	}
+
+	// NetworkMember is a container in a network.
+	struct NetworkMember {
+		name string
+		@json("EndpointID")
+		endpointId string
+		macAddress string
+		@json("IPv4Address")
+		ipv4Address string
+		@json("IPv6Address")
+		ipv6Address string
+	}
+}
