@@ -253,19 +253,22 @@ partial module adm.dev.git {
 	// Options for writing packs.
 	internal struct PackOptions {
 		// Objects compared as delta bases (pack.window).
-		window           int  = 10
+		window           int                   = 10
 		// Longest delta chain made (pack.depth).
-		depth            int  = 50
+		depth            int                   = 50
 		// Objects larger are stored whole, never searched for deltas
 		// (core.bigFileThreshold).
-		bigFileThreshold int  = 512 << 20
+		bigFileThreshold int                   = 512 << 20
 		// Copy objects and deltas as stored in packs.
-		reuse            bool = true
+		reuse            bool                  = true
 		// zlib level (pack.compression).
-		level            int  = 6
+		level            int                   = 6
 		// Deltas name their base by its offset in the pack; false names it
 		// by id, for readers without `ofs-delta`.
-		ofsDelta         bool = true
+		ofsDelta         bool                  = true
+		// Told before and after the delta search and after each batch
+		// written; false stops the pack with a `stopped` error.
+		progress         ?(def(Progress) bool) = none
 	}
 
 	// The stored entry of a packed object, none for a loose one.
@@ -398,7 +401,9 @@ partial module adm.dev.git {
 				}
 			}
 		}
+		try report(options.progress, "pack", "compressing", 0, slots.len())
 		try findDeltas(repo, slots, options)
+		try report(options.progress, "pack", "compressing", slots.len(), slots.len())
 		let stream = new PackStream(sink, repo.format)
 		let header byte[] = "PACK".bytes()
 		putBe(header, 2, 4)
@@ -458,9 +463,20 @@ partial module adm.dev.git {
 			batches.push(batch)
 		}
 		return none when batches.len() == 0
+		try report(options.progress, "pack", "writing", 0, order.len())
+		let done = 0
 		let next = async compressBatch(repo.objects.dir, repo.format, slots, batches[0], options.level)
 		for let (b, batch) in batches {
 			let (compressed, missing) = try await next
+			done += batch.len()
+			report(options.progress, "pack", "writing", done, order.len()) onerror (err error) {
+				// The batch under way is awaited before the stop, so no task
+				// is left writing into the stream.
+				if b + 1 < batches.len() {
+					let _ = await next onerror recover (byte[][], bool[])
+				}
+				fail err
+			}
 			if b + 1 < batches.len() {
 				next = async compressBatch(repo.objects.dir, repo.format, slots, batches[b + 1], options.level)
 			}

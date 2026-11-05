@@ -3,6 +3,7 @@
 // porcelain) to compare with `git status --porcelain` by hand.
 partial module adm.dev.git {
 	use (
+		std.net.ssh
 		std.os
 		std.testing
 	)
@@ -32,6 +33,102 @@ partial module adm.dev.git {
 	}
 
 	check "Working tree" {
+		// Tags are made lightweight or annotated, signed by hand or from the
+		// configuration (`tag.gpgsign`, `commit.gpgsign` with an SSH key file),
+		// verified through the configured allowed signers, and deleted.
+		@test()
+		def MakesAndSignsTags() !none {
+			let repo = try newWorktree("tags")
+			try writeFile(repo, "a.txt", "one\n")
+			try repo.add(".")
+			let first = try repo.commit("First")
+			let light = try repo.createTag("v1")
+			fail "lightweight" unless light.name == "refs/tags/v1" && !(light.id is none) && (try repo.resolve("v1")).equals(first)
+			let twice = false
+			repo.createTag("v1") onerror (err error) {
+				twice = true
+				recover Reference{name: ""}
+			}
+			fail "existing tag taken" unless twice
+			let noted = try repo.createTag("v2", "HEAD", "Second release\n\nNotes.\n")
+			let tagId = noted.id
+			fail "annotated id" when tagId is none
+			let peeled = noted.peeled
+			fail "annotated peeled" unless !(peeled is none) && peeled.equals(first)
+			let t = try repo.tag(tagId)
+			let tagger = t.tagger
+			fail "tagger" unless !(tagger is none) && tagger.name == "Ana Lima" && t.message == "Second release\n\nNotes.\n" && t.name == "v2"
+			fail "bad name taken" unless repo.createTag("bad name") is error
+			let forced = try repo.createTag("v2", "HEAD", force = true)
+			fail "force" unless forced.peeled is none
+			// Signed by hand, checked with an allowed-signers verifier.
+			let key = try ssh.generateKey()
+			let allowed = try parseAllowedSigners("ana@example.com " + key.publicKey().str())
+			let signed = try repo.createTag("v3", "HEAD", "Signed", signer = new SSHSigner(key))
+			let verdict = try repo.verifyTag("v3", new SSHVerifier(allowed))
+			fail "signature: {verdict.problem}" unless verdict.valid
+			let _ = signed
+			// From the configuration: an SSH key file, tag.gpgsign and
+			// commit.gpgsign, and the verifier from the allowed signers file.
+			let keyFile = os.join(repo.workDir, "..", "signing_key")
+			try os.writeFile(keyFile, (try key.encode()).bytes(), 0o600)
+			let signersFile = os.join(repo.workDir, "..", "allowed_signers")
+			try os.writeFile(signersFile, ("ana@example.com " + key.publicKey().str() + "\n").bytes())
+			repo.config.override("gpg.format", "ssh")
+			repo.config.override("user.signingkey", keyFile)
+			repo.config.override("gpg.ssh.allowedsignersfile", signersFile)
+			repo.config.override("tag.gpgsign", "true")
+			repo.config.override("commit.gpgsign", "true")
+			fail "no signer from the configuration" when (try repo.signer()) is none
+			let verifier = try repo.verifier()
+			fail "no verifier from the configuration" when verifier is none
+			return none when verifier is none
+			let auto = try repo.createTag("v4", "HEAD", "Auto signed")
+			let _ = auto
+			fail "tag not signed from the configuration" unless (try repo.verifyTag("v4", verifier)).valid
+			try writeFile(repo, "a.txt", "two\n")
+			try repo.add(".")
+			let second = try repo.commit("Second")
+			fail "commit not signed from the configuration" unless (try repo.verifyCommit(second.str(), verifier)).valid
+			try repo.deleteTag("v4")
+			fail "tag not deleted" unless repo.resolve("v4") is error
+			repo.close()
+			return none
+		}
+
+		// `checkIgnore` names the pattern that decides a path as git's
+		// check-ignore -v does: the file and line, a negation, an ignored
+		// folder's rule for a path under it, info/exclude and the excludes file.
+		@test()
+		def ReportsTheDecidingIgnorePattern() !none {
+			let repo = try newWorktree("check-ignore")
+			let excludes = os.join(repo.workDir, "..", "global-ignore")
+			try os.writeFile(excludes, "*.log\n".bytes())
+			repo.config.override("core.excludesfile", excludes)
+			try writeFile(repo, ".gitignore", "# build output\n/out/\n*.tmp\n!keep.tmp\n")
+			try writeFile(repo, "src/.gitignore", "gen/\n")
+			try os.mkdir(os.join(repo.gitDir, "info"), true)
+			try os.writeFile(repo.excludePath(), "secret.txt\n".bytes())
+			fail "excludes file" unless repo.excludesFile() == excludes
+			let top = repo.checkIgnore("note.tmp")
+			fail "top: {top}" unless !(top is none) && top.file == os.join(repo.workDir, ".gitignore") && top.line == 3 && top.pattern == "*.tmp" && !top.negate
+			let kept = repo.checkIgnore("keep.tmp")
+			fail "negated" unless !(kept is none) && kept.line == 4 && kept.pattern == "!keep.tmp" && kept.negate
+			let under = repo.checkIgnore("out/a/b.c")
+			fail "folder rule: {under}" unless !(under is none) && under.line == 2 && under.pattern == "/out/" && !under.negate
+			let nested = repo.checkIgnore("src/gen/x.adm")
+			fail "nested: {nested}" unless !(nested is none) && nested.file == os.join(repo.workDir, "src/.gitignore") && nested.line == 1 && nested.pattern == "gen/"
+			let secret = repo.checkIgnore("secret.txt")
+			fail "info/exclude" unless !(secret is none) && secret.file == repo.excludePath() && secret.line == 1
+			let log = repo.checkIgnore("run.log")
+			fail "excludes" unless !(log is none) && log.file == excludes && log.pattern == "*.log"
+			fail "plain file matched" unless repo.checkIgnore("main.adm") is none
+			let status = try repo.status()
+			let _ = status
+			repo.close()
+			return none
+		}
+
 		@test()
 		def reportsChanges() !none {
 			let repo = try newWorktree("status")

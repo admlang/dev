@@ -118,6 +118,120 @@ partial module adm.dev.git {
 			return none
 		}
 
+		// A `.gitmodules` name that would leave `.git/modules` is refused, and
+		// so is a submodule path that goes through a symbolic link: neither
+		// writes anything outside the superproject.
+		@test()
+		def refusesEscapingSubmodules() !none {
+			let (sub, subIds) = try servedRepo("submodule-escape-lib")
+			let make = def (name string) !string {
+				let superDir = try scratch("submodule-escape-{name.len()}")
+				let sup = try init(superDir, InitOptions{bare: true})
+				let modules = try sup.writeBlob("[submodule \"{name}\"]\n\tpath = sub\n\turl = {sub.gitDir}\n".bytes())
+				let root = try sup.writeTree([
+					TreeEntry{name: ".gitmodules", mode: EntryMode.File, id: modules},
+					TreeEntry{name: "sub", mode: EntryMode.Submodule, id: subIds[1]},
+				])
+				let sig = testSignature()
+				let c = try sup.write(ObjectKind.Commit, (new Commit(zeroId(sup.format), root, [], sig, sig, "Add sub\n")).encode())
+				try sup.setRef("refs/heads/{try sup.branch()}", c)
+				sup.close()
+				return superDir
+			}
+			let escaping = try make("../../../escaped")
+			let dir = try scratch("submodule-escape-clone")
+			let repo = try clone(escaping, dir)
+			let refused = ""
+			repo.updateSubmodules(SubmoduleOptions{init: true}) onerror (err error) {
+				refused = err.message
+				recover none
+			}
+			fail "bad name taken: {refused}" unless refused.contains("submodule name") && refused.contains("not allowed")
+			fail "repository written outside" when os.exists(os.join(dir, "..", "..", "escaped")) onerror recover false
+			fail "modules folder made" when os.exists(os.join(dir, ".git", "modules")) onerror recover false
+			repo.close()
+			// A plain name, but the path is a link to a folder elsewhere.
+			let plain = try make("lib")
+			let dir2 = try scratch("submodule-link-clone")
+			let repo2 = try clone(plain, dir2)
+			let elsewhere = try scratch("submodule-link-target")
+			// The checkout left an empty folder for the gitlink; a link takes its place.
+			os.remove(os.join(dir2, "sub"), true) onerror recover none
+			try os.symlink(elsewhere, os.join(dir2, "sub"))
+			refused = ""
+			repo2.updateSubmodules(SubmoduleOptions{init: true}) onerror (err error) {
+				refused = err.message
+				recover none
+			}
+			fail "link taken: {refused}" unless refused.contains("goes through a link")
+			fail "written through the link" unless (try os.readDirNames(elsewhere)).len() == 0
+			repo2.close()
+			return none
+		}
+
+		// A submodule is added, inspected, opened, retargeted, updated with
+		// progress and removed, `.gitmodules`, the index and the configuration
+		// following.
+		@test()
+		def managesSubmodules() !none {
+			let (sub, subIds) = try servedRepo("submodule-managed-lib")
+			let repo = try newWorktree("submodule-manager")
+			try writeFile(repo, "README.md", "top\n")
+			try repo.add(".")
+			let _ = try repo.commit("Start")
+			let added = try repo.addSubmodule(sub.gitDir, "vendor/lib")
+			fail "added: {added.name} {added.path} cloned {added.cloned} init {added.initialized}" unless added.name == "vendor/lib" && added.path == "vendor/lib" && added.cloned && added.initialized
+			let head = added.head
+			fail "head" unless !(head is none) && head.equals(subIds[1])
+			let staged = added.commit
+			fail "gitlink staged" unless !(staged is none) && staged.equals(subIds[1])
+			let modules = string(try os.readFile(os.join(repo.workDir, ".gitmodules")))
+			fail "gitmodules: {modules}" unless modules.contains("[submodule \"vendor/lib\"]") && modules.contains("path = vendor/lib") && modules.contains("url = {sub.gitDir}")
+			fail "config" unless repo.config.get("submodule.vendor/lib.url", "") == sub.gitDir
+			let st = try repo.status()
+			fail "status: {st.entries.len()}" unless st.entries.len() == 2
+			let _ = try repo.commit("Add lib")
+			let inner = try repo.openSubmodule("vendor/lib")
+			fail "opened" unless (try inner.resolve("HEAD")).equals(subIds[1])
+			inner.close()
+			try repo.setSubmoduleBranch("vendor/lib", "main")
+			fail "branch" unless string(try os.readFile(os.join(repo.workDir, ".gitmodules"))).contains("branch = main")
+			try repo.setSubmoduleBranch("vendor/lib", "")
+			fail "branch kept" when string(try os.readFile(os.join(repo.workDir, ".gitmodules"))).contains("branch =")
+			let other = try scratch("submodule-other-url")
+			try repo.setSubmoduleUrl("vendor/lib", other)
+			fail "url" unless repo.config.get("submodule.vendor/lib.url", "") == other
+			let synced = try repo.openSubmodule("vendor/lib")
+			fail "origin" unless synced.config.get("remote.origin.url", "") == other
+			synced.close()
+			try repo.setSubmoduleUrl("vendor/lib", sub.gitDir)
+			// Updating reports its steps; told to stop, it stops.
+			let phases string[] = []
+			try repo.updateSubmodules(SubmoduleOptions{progress: def (p Progress) bool {
+				phases.push("{p.phase} {p.done}/{p.total}")
+				return true
+			}})
+			fail "phases: {phases.join(", ")}" unless phases.join(", ") == "fetching 0/1, checking out 0/1, checking out 1/1"
+			let stopped = ""
+			repo.updateSubmodules(SubmoduleOptions{progress: (p Progress) => false}) onerror (err error) {
+				stopped = err.code
+				recover none
+			}
+			fail "not stopped" unless stopped == "stopped"
+			let listed = try repo.submodules()
+			fail "listed {listed.len()}" unless listed.len() == 1 && !(listed[0].head is none)
+			try repo.removeSubmodule("vendor/lib")
+			fail "folder left" when os.exists(os.join(repo.workDir, "vendor", "lib")) onerror recover false
+			fail "modules left" when os.exists(os.join(repo.gitDir, "modules", "vendor", "lib")) onerror recover false
+			fail "config left" unless repo.config.get("submodule.vendor/lib.url") is none
+			fail "gitmodules left: {string(try os.readFile(os.join(repo.workDir, ".gitmodules")))}" when string(try os.readFile(os.join(repo.workDir, ".gitmodules"))).contains("vendor/lib")
+			fail "still listed" unless (try repo.submodules()).len() == 0
+			let idx = try repo.index()
+			fail "index entry left" unless idx.entry("vendor/lib") is none
+			repo.close()
+			return none
+		}
+
 		@test()
 		def clonesSubmodules() !none {
 			let (sub, subIds) = try servedRepo("submodule-lib")

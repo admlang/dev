@@ -5,14 +5,71 @@ partial module adm.dev.git {
 	)
 
 	// How to repack.
+	// How far a long operation has come: the phase it is in (`counting`,
+	// `compressing`, `writing`, `packing references`, `pruning`, `fetching`,
+	// `checking out`), what it has done of the phase and how much there is
+	// (0 when unknown).
+	struct Progress {
+		phase string
+		done  int
+		total int
+	}
+
+	// How `Repository.repack` writes the pack and what it reports as it goes.
 	struct RepackOptions {
 		// Write a reachability bitmap; none: for bare repositories, as git's
 		// `repack.writeBitmaps`.
-		bitmap          ?bool       = none
+		bitmap          ?bool                 = none
 		// Write objects no reference reaches as loose objects instead of
 		// dropping them, so `prune` can expire them by age (`-A`).
-		keepUnreachable bool        = true
-		pack            PackOptions = PackOptions{}
+		keepUnreachable bool                  = true
+		pack            PackOptions           = PackOptions{}
+		// Told how far the repack has come, at each phase and after each
+		// batch of objects written; returning false stops it, the old packs
+		// kept and the new one dropped.
+		progress        ?(def(Progress) bool) = none
+	}
+
+	// How `gc` tidies the repository.
+	struct GcOptions {
+		// Unreachable loose objects older than this go (`gc.pruneExpire`).
+		expire   duration              = 336h
+		// Told how far the work has come, as a repack's `progress` is;
+		// returning false stops it before the next phase, the repository
+		// left as it was.
+		progress ?(def(Progress) bool) = none
+	}
+
+	// What `countObjects` reports, as `git count-objects -v` does.
+	struct ObjectCount {
+		// Loose objects and their bytes on disk.
+		loose        int
+		looseBytes   int64
+		// Pack files, the objects in them and their bytes (`.pack` files).
+		packs        int
+		packed       int
+		packBytes    int64
+		// Files in the pack folder that are no pack, index, bitmap, rev,
+		// keep, promisor or mtimes file, and their bytes.
+		garbage      int
+		garbageBytes int64
+		// References in loose files, and in `packed-refs` (a reftable's
+		// references all count as packed).
+		looseRefs    int
+		packedRefs   int
+	}
+
+	// The error a stopped operation fails with: its code is `stopped`.
+	internal def stoppedError(what string) error {
+		return Error{message: "git: {what} stopped", code: "stopped"}
+	}
+
+	// Tells `progress` where the work is; fails with a `stopped` error when
+	// it answers false. Nothing without a callback.
+	internal def report(progress ?(def(Progress) bool), what string, phase string, done int, total int) !none {
+		return none when progress is none
+		fail stoppedError(what) unless progress(Progress{phase: phase, done: done, total: total})
+		return none
 	}
 
 	// The objects a repository keeps: those its references, HEAD, reflogs
@@ -79,6 +136,8 @@ partial module adm.dev.git {
 		}
 		repo.objects.fetchMissing = hook
 		items = items.filter(it => repo.objects.hasLocal(it.id))
+		try report(options.progress, "repack", "counting", items.len(), items.len())
+		let packOptions = PackOptions{...options.pack, progress: options.progress}
 		let packDir = os.join(repo.objects.dir, "pack")
 		let oldPacks = repo.objects.packs.clone()
 		let wasPromisor = oldPacks.filter(p => os.exists(p.path.slice(0, p.path.len() - 5) + ".promisor") onerror recover false).len() > 0
@@ -88,7 +147,7 @@ partial module adm.dev.git {
 		}
 		let sum ?ObjectId = none
 		if items.len() > 0 {
-			let s = try writePackFiles(repo, items, options.pack)
+			let s = try writePackFiles(repo, items, packOptions)
 			sum = s
 			let base = os.join(packDir, "pack-{s.str()}")
 			if wasPromisor {
@@ -175,8 +234,9 @@ partial module adm.dev.git {
 	}
 
 	// Removes loose objects nothing reaches that are older than `expiry`
-	// (`git prune --expire`). Returns how many went.
-	internal def pruneUnreachable(repo Repository, expiry time.Time) !int {
+	// (`git prune --expire`), or with `dry` only counts them. Returns how
+	// many went, or would go, and their bytes.
+	internal def pruneUnreachable(repo Repository, expiry time.Time, dry bool = false) !(int, int64) {
 		let roots = try reachableRoots(repo)
 		let hook = repo.objects.fetchMissing
 		repo.objects.fetchMissing = none
@@ -190,6 +250,7 @@ partial module adm.dev.git {
 			reachable[it.id.str()] = true
 		}
 		let removed = 0
+		let bytes int64 = 0
 		for let dir in try os.readDir(repo.objects.dir) {
 			let name = os.base(dir.path)
 			continue unless dir.info.isDir && name.len() == 2 && hexValue(name.bytes()[0]) >= 0 && hexValue(name.bytes()[1]) >= 0
@@ -197,12 +258,69 @@ partial module adm.dev.git {
 				let id = idOrNone(name + os.base(f.path))
 				continue when id is none || reachable.hasKey(id.str())
 				continue when f.info.modTime > expiry
-				os.remove(f.path) onerror recover none
 				removed++
+				bytes += f.info.size
+				continue when dry
+				os.remove(f.path) onerror recover none
 			}
-			os.remove(dir.path) onerror recover none
+			if !dry {
+				os.remove(dir.path) onerror recover none
+			}
 		}
-		return removed
+		return (removed, bytes)
+	}
+
+	// What the repository holds, counted as `git count-objects -v` counts
+	// it, with the references loose and packed.
+	internal def countObjectsOf(repo Repository) !ObjectCount {
+		let out = ObjectCount{}
+		for let dir in try os.readDir(repo.objects.dir) {
+			let name = os.base(dir.path)
+			continue unless dir.info.isDir && name.len() == 2 && hexValue(name.bytes()[0]) >= 0 && hexValue(name.bytes()[1]) >= 0
+			for let f in try os.readDir(dir.path) {
+				out.loose++
+				out.looseBytes += f.info.size
+			}
+		}
+		let packDir = os.join(repo.objects.dir, "pack")
+		let known = string[".pack", ".idx", ".rev", ".bitmap", ".keep", ".promisor", ".mtimes"]
+		if os.exists(packDir) onerror recover false {
+			for let f in try os.readDir(packDir) {
+				let name = os.base(f.path)
+				continue when f.info.isDir || name.startsWith("multi-pack-index")
+				let fine = false
+				for let ext in known {
+					fine = true when name.startsWith("pack-") && name.endsWith(ext)
+				}
+				continue when fine
+				out.garbage++
+				out.garbageBytes += f.info.size
+			}
+		}
+		for let p in repo.objects.packs {
+			out.packs++
+			out.packed += p.count
+			out.packBytes += (os.stat(p.path) onerror recover os.FileInfo{}).size
+		}
+		let refsDir = os.join(repo.commonDir, "refs")
+		out.looseRefs = countFiles(refsDir)
+		let packed = string(os.readFile(os.join(repo.commonDir, "packed-refs")) onerror recover byte[])
+		for let line in packed.split("\n") {
+			out.packedRefs++ unless line == "" || line.startsWith("#") || line.startsWith("^")
+		}
+		if repo.refFormat == RefFormat.Reftable {
+			out.packedRefs = (try repo.refs("refs/")).len()
+		}
+		return out
+	}
+
+	// The files under a folder, at any depth.
+	internal def countFiles(dir string) int {
+		let n = 0
+		for let e in os.readDir(dir) onerror recover os.DirEntry[] {
+			n += e.info.isDir ?? (countFiles(e.path), 1)
+		}
+		return n
 	}
 
 	// ---- bitmaps --------------------------------------------------------------

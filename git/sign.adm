@@ -4,8 +4,64 @@ partial module adm.dev.git {
 		std.crypto.hash
 		std.crypto.openpgp
 		std.net.ssh
+		std.os
 		std.data.encoding::(base64encode, base64decode)
 	)
+
+	// The signer the configuration names, as `git commit -S` and `git tag
+	// -s` use it: `gpg.format` and `user.signingkey`. With `ssh`, the key is
+	// the path of a private key file, the path of a `.pub` file or a
+	// `key::` literal whose private half the SSH agent holds, or a public key
+	// line the agent holds. With `openpgp` (the default), the key is the
+	// path of an armored key file: gpg's own keyring is not read. None when
+	// no key is configured. Fails when the key cannot be read or is locked,
+	// the agent is absent or does not hold it, or the format is another
+	// (x509).
+	internal def configSigner(repo Repository) !?Signer {
+		let key = repo.config.get("user.signingkey", "").trim()
+		return none when key == ""
+		let format = repo.config.get("gpg.format", "openpgp").lower()
+		if format == "ssh" {
+			return try agentSigner(try ssh.parsePublicKey(key.slice(5))) when key.startsWith("key::")
+			let path = expandHome(key)
+			return try agentSigner(try ssh.loadPublicKey(path)) when path.endsWith(".pub")
+			if os.exists(path) onerror recover false {
+				let private = ssh.loadKey(path) onerror (err error) {
+					fail "git: the signing key {path} cannot be read: {err.message}"
+				}
+				return new SSHSigner(private)
+			}
+			return try agentSigner(try ssh.parsePublicKey(key))
+		}
+		fail "git: gpg.format {format} is not supported; openpgp and ssh are" when format != "openpgp"
+		let path = expandHome(key)
+		fail "git: OpenPGP signing needs user.signingkey to be the path of an armored key file; {key} is not one" unless os.exists(path) onerror recover false
+		let keys = try openpgp.readKeys(try os.readFile(path))
+		fail "git: {path} holds no OpenPGP key" when keys.len() == 0
+		return new OpenPGPSigner(keys[0])
+	}
+
+	// The SSH agent's key with the public half `pub`, as a signer. Fails
+	// when there is no agent or it does not hold the key.
+	internal def agentSigner(pub ssh.PublicKey) !Signer {
+		let agent = new ssh.Agent()
+		fail "git: no SSH agent to sign with (SSH_AUTH_SOCK)" unless agent.available()
+		for let held in try agent.keys() {
+			return new SSHSigner(held) when held.publicKey().blob().equals(pub.blob())
+		}
+		fail "git: the SSH agent does not hold the signing key"
+	}
+
+	// The verifier the configuration names: an `SSHVerifier` over
+	// `gpg.ssh.allowedSignersFile`. None when nothing is set, and for
+	// OpenPGP, whose keyring the library does not read (build an
+	// `OpenPGPVerifier` from a keyring). Fails when the file cannot be read
+	// or parsed.
+	internal def configVerifier(repo Repository) !?SignatureVerifier {
+		let file = repo.config.getPath("gpg.ssh.allowedsignersfile", "")
+		return none when file == ""
+		return new SSHVerifier(try parseAllowedSigners(string(try os.readFile(file))))
+	}
 
 	// Signer signs commits and tags: it returns the armored signature git
 	// stores (OpenPGP `-----BEGIN PGP SIGNATURE-----` or SSH `-----BEGIN
@@ -57,7 +113,7 @@ partial module adm.dev.git {
 			let text = base64encode(blob)
 			let lines string[] = ["-----BEGIN SSH SIGNATURE-----"]
 			for let i = 0; i < text.len(); i += 70 {
-				lines.push(text.slice(i, i + 70 < text.len() ?? (70, text.len() - i)))
+				lines.push(text.slice(i, (i + 70).min(text.len())))
 			}
 			lines.push("-----END SSH SIGNATURE-----")
 			return lines.join("\n") + "\n"
@@ -135,12 +191,12 @@ partial module adm.dev.git {
 	// who may sign with which key.
 	struct AllowedSigner {
 		// Email patterns, as the file lists them.
-		principals string[]
-		key        ssh.PublicKey
+		principals  string[]
+		key         ssh.PublicKey
 		// `namespaces="git,..."`; empty for any.
-		namespaces string[] = []
-		validAfter  ?time.Time = none
-		validBefore ?time.Time = none
+		namespaces  string[]      = []
+		validAfter  ?time.Time    = none
+		validBefore ?time.Time    = none
 	}
 
 	// Reads an allowed-signers file: `principals [options] keytype key`
@@ -296,7 +352,7 @@ partial module adm.dev.git {
 	internal type SshReader {
 		data byte[]
 		pos  int
-		ok   bool = true
+		ok   bool   = true
 
 		def new(data byte[], pos int) {
 			self.data = data
@@ -334,6 +390,17 @@ partial module adm.dev.git {
 
 	// Adds a signature over the commit's bytes (without signature headers)
 	// to the commit. Fails when the signer fails.
+	// Signs an annotated tag: the armored signature follows the message, as
+	// git stores it.
+	internal def signTag(t Tag, signer Signer) !none {
+		let (payload, _) = splitTagSignature(t.encode())
+		let sig = try signer.sign(payload)
+		let message = t.message
+		message += "\n" unless message == "" || message.endsWith("\n")
+		t.message = message + sig
+		return none
+	}
+
 	internal def signCommit(c Commit, signer Signer) !none {
 		c.headers = c.headers.filter(h => h.key != "gpgsig" && h.key != "gpgsig-sha256")
 		let sig = try signer.sign(c.encode())

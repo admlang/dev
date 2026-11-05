@@ -35,15 +35,23 @@ clones: everything, a single branch (`branch`, `singleBranch`), a shallow histor
 `"tree:0"`; what it left out is fetched when read), bare or a mirror, with or without its
 submodules. The
 configuration (`repo.config`) reads every file git reads, with includes and `includeIf`, and
-writes the repository's own file in place.
+writes files in place, keeping comments and layout: the repository's own by default, or the one
+of a scope (`set("user.name", "Ana", scope = ConfigScope.Global)` writes `~/.gitconfig`, or
+`$XDG_CONFIG_HOME/git/config` when only that exists, as `git config --global` does;
+`ConfigScope.System` is `/etc/gitconfig`); `path(scope)` names the file a scope writes.
 
 ## Objects and references
 
 Objects come from loose files, packs (deltas, multi-pack indexes, reachability bitmaps) and
 alternates: `repo.object(rev)`, `commitAt`, `tree`, `blob`, `tag`, `raw`, `info`. They are
 written loose (`write`, `writeBlob`, `writeTree`) and packed by `repo.repack()`, which also
-writes a bitmap for a bare repository; `repo.gc()` packs references and objects and prunes
-unreachable loose objects older than two weeks.
+writes a bitmap for a bare repository; `repo.gc()` packs references (`packRefs()`) and objects and
+prunes unreachable loose objects older than two weeks (`GcOptions{expire}`). Both take a
+`progress` callback (`Progress{phase, done, total}`: counting, compressing, writing, packing
+references, pruning) that stops the work when it returns false, the old packs kept and a
+`stopped` error raised. `repo.countObjects()` counts what `git count-objects -v` does, with the
+references loose and packed; `repo.unreachable(expiry)` says how many loose objects and bytes a
+`prune(expiry)` would remove.
 
 References live in loose files and `packed-refs`, or in a reftable stack: `ref`, `refs(prefix)`,
 `setRef` (with an expected old value), `setSymbolicRef`, `deleteRef`, `reflog`. Revision
@@ -61,6 +69,9 @@ filters make it fast where they exist. `mergeBases`, `isAncestor`, and `repo.bla
 
 The index (versions 2 to 4, split and sparse), `status` (and `porcelain`, as `git status
 --porcelain` prints it), `add`, `remove`, `move`, `commit` (with signing), `checkout`, branches, `reset`, `restore`.
+`repo.checkIgnore(path)` names the pattern that decides a path as `git check-ignore -v` does (its
+file and line, a `!` pattern included, an ignored folder's rule for a path under it);
+`excludesFile()` and `excludePath()` are the files outside the tree those decisions read.
 Diffs are git's: `repo.diff(from, to)`, `diffIndex`, `diffWorktree` with rename detection, as
 patches (`.patch()`) or numbers (`.stats()`), Myers, patience, histogram and minimal, the
 whitespace options; `repo.apply(patch)` applies them, binary patches too. Ignore rules,
@@ -117,13 +128,22 @@ let refs = try git.lsRemote("git@github.com:admlang/examples.git", ["refs/tags/"
   (`--force-with-lease`), all-or-nothing, push options, tags, thin packs, the remote's report per
   reference, remote-tracking references updated and the upstream set.
 - Submodules: `repo.submodules()` lists them; `repo.updateSubmodules()` initializes, clones or
-  fetches and checks out each at the commit the superproject records.
+  fetches and checks out each at the commit the superproject records, telling `progress` as
+  it goes; `Submodule.head` is the commit each has checked out, `openSubmodule(path)` its
+  repository, and `addSubmodule`, `removeSubmodule`, `setSubmoduleUrl` and `setSubmoduleBranch`
+  keep `.gitmodules`, the configuration and the index in step. A `.gitmodules` name git refuses
+  is refused, and a submodule path through a symbolic link is never written.
 
 ## Signing
 
 `OpenPGPSigner` (with `std.crypto.openpgp`) and `SSHSigner` (any `std.net.ssh` signer) sign
-commits (`CommitOptions{signer}`) and tags; `verifyCommit` and `verifyTag` check them with an
-`OpenPGPVerifier` or an `SSHVerifier` over git's allowed-signers file.
+commits (`CommitOptions{signer}`) and tags (`createTag(name, rev, message, signer)`); `verifyCommit`
+and `verifyTag` check them with an `OpenPGPVerifier` or an `SSHVerifier` over git's allowed-signers
+file. `repo.signer()` is the signer the configuration names (`gpg.format` with `user.signingkey`:
+an SSH key file, a `.pub` or `key::` whose private half the agent holds, or an armored OpenPGP key
+file; gpg's keyring is not read), used by `commit.gpgsign` and `tag.gpgsign`; `repo.verifier()` is
+an `SSHVerifier` over `gpg.ssh.allowedSignersFile`. `createTag` makes a lightweight tag without a
+message, else an annotated one with the configured identity; `deleteTag` removes one.
 
 ## Hosting
 

@@ -458,6 +458,92 @@ partial module adm.dev.git {
 			return id
 		}
 
+		// ---- tags -----------------------------------------------------------------
+
+		// Makes the tag `name` on `rev` (`git tag`): lightweight without a message
+		// and a signer, else annotated with the configured identity as its
+		// tagger (`identity("committer")`), signed when a signer is given or
+		// `tag.gpgsign` is set (`signer()`). Fails when the name is not a valid
+		// tag name, the tag exists (unless `force`), the revision does not
+		// resolve or signing fails. Returns the reference made, its `peeled`
+		// the object an annotated tag names.
+		def createTag(name string, rev string = "HEAD", message string = "", signer ?Signer = none, force bool = false) !Reference {
+			let ref = "refs/tags/" + name
+			fail "git: '{name}' is not a valid tag name" unless validRefName(ref)
+			let target = try resolve(rev)
+			let (kind, _) = try objects.readRaw(target)
+			let expected ?ObjectId = force ?? (none, zeroId(format))
+			let text = cleanMessage(message)
+			let signing = signer
+			if signing is none && text != "" && (config.getBool("tag.gpgsign", false) onerror recover false) {
+				signing = try configSigner(self)
+				fail "git: tag.gpgsign is set but no signing key is configured" when signing is none
+			}
+			if text == "" && signing is none {
+				try setRef(ref, target, "tag: {name}", expected)
+				return Reference{name: ref, id: target}
+			}
+			let t = new Tag(zeroId(format), target, kind, name, text)
+			t.tagger = try identity("committer")
+			if !(signing is none) {
+				try signTag(t, signing)
+			}
+			let made = try write(ObjectKind.Tag, t.encode())
+			try setRef(ref, made, "tag: {name}", expected)
+			return Reference{name: ref, id: made, peeled: target}
+		}
+
+		// Deletes the tag `name` (`git tag -d`). Fails when there is no such
+		// tag or the reference cannot be written.
+		def deleteTag(name string) !none {
+			try deleteRef("refs/tags/" + name)
+			return none
+		}
+
+		// ---- signing from the configuration -------------------------------------
+
+		// The signer the configuration names (`gpg.format`, `user.signingkey`),
+		// as commits with `commit.gpgsign` and tags with `tag.gpgsign` use it:
+		// an SSH key file, a `.pub` or `key::` whose private half the agent
+		// holds, or an armored OpenPGP key file. None when no key is
+		// configured. Fails when the key cannot be read or used.
+		def signer() !?Signer {
+			return try configSigner(self)
+		}
+
+		// The verifier the configuration names: `gpg.ssh.allowedSignersFile`
+		// for SSH signatures. None when nothing is set, and for OpenPGP.
+		// Fails when the file cannot be read.
+		def verifier() !?SignatureVerifier {
+			return try configVerifier(self)
+		}
+
+		// ---- ignore rules ----------------------------------------------------------
+
+		// The pattern that decides whether `path` (relative to the top of the
+		// working tree) is ignored, as `git check-ignore -v` reports it: the
+		// file and line of the deciding pattern, a `!` one that un-ignores
+		// included, the rule of an ignored folder for a path under it; none
+		// when no pattern matches. Reads the `.gitignore` files along the
+		// path, `info/exclude` and `excludesFile()`.
+		def checkIgnore(path string, isDir bool = false) ?IgnoreMatch {
+			return ignoreRulesOf(self).decision(path, isDir)
+		}
+
+		// The file of the patterns ignored in every repository of the user:
+		// `core.excludesFile`, else `~/.config/git/ignore`; empty when neither
+		// names one. The repository's own patterns outside the tree are in
+		// `excludePath()`.
+		def excludesFile() string {
+			return excludesFileOf(self)
+		}
+
+		// The path of `info/exclude`, the repository's own patterns outside
+		// the tree.
+		def excludePath() string {
+			return excludePathOf(self)
+		}
+
 		// ---- branches and checkout -------------------------------------------------
 
 		// Switches the working tree, index and HEAD to a branch, or to a
@@ -553,22 +639,51 @@ partial module adm.dev.git {
 		// `expiry` (`git prune --expire`). Returns how many went. Fails when
 		// the object folders cannot be read.
 		def prune(expiry time.Time) !int {
-			return try pruneUnreachable(self, expiry)
+			let (removed, _) = try pruneUnreachable(self, expiry)
+			return removed
+		}
+
+		// What `prune(expiry)` would remove: how many loose objects nothing
+		// reaches are older than `expiry`, and their bytes. Fails when the
+		// object folders cannot be read.
+		def unreachable(expiry time.Time) !(int, int64) {
+			return try pruneUnreachable(self, expiry, true)
 		}
 
 		// Tidies the repository as `git gc` does: references into
 		// packed-refs, objects into one pack, unreachable loose objects older
-		// than two weeks removed. Reflogs are kept whole. Fails when a file
+		// than `options.expire` removed. Reflogs are kept whole. Told through
+		// `options.progress`, which stops it between phases. Fails when a
+		// file cannot be written, or with a `stopped` error.
+		def gc(options GcOptions = GcOptions{}) !none {
+			try report(options.progress, "gc", "packing references", 0, 1)
+			try packRefs()
+			let _ = try repackAll(self, RepackOptions{progress: options.progress})
+			try report(options.progress, "gc", "pruning", 0, 1)
+			let _ = try pruneUnreachable(self, time.now() - options.expire)
+			try report(options.progress, "gc", "pruning", 1, 1)
+			return none
+		}
+
+		// Writes every loose reference under `refs/` into `packed-refs` and
+		// removes the loose files (`git pack-refs --all`); a reftable
+		// repository has nothing to pack. Fails when a lock is held or a file
 		// cannot be written.
-		def gc() !none {
+		def packRefs() !none {
 			let store = refStore
 			if store is FileRefs {
 				let files FileRefs = store
 				try files.pack(id => peelOrNone(self, id, ObjectKind.Commit))
 			}
-			let _ = try repackAll(self, RepackOptions{})
-			let _ = try pruneUnreachable(self, time.now() - 336h)
 			return none
+		}
+
+		// What the repository holds, as `git count-objects -v` counts it:
+		// loose objects and their bytes, packs with their objects and bytes,
+		// garbage in the pack folder, and the references loose and packed.
+		// Fails when a folder cannot be read.
+		def countObjects() !ObjectCount {
+			return try countObjectsOf(self)
 		}
 
 		// ---- remotes ----------------------------------------------------
@@ -664,6 +779,50 @@ partial module adm.dev.git {
 		// that cannot be updated.
 		def updateSubmodules(options SubmoduleOptions = SubmoduleOptions{}) !none {
 			return try doUpdateSubmodules(self, options)
+		}
+
+		// The repository of the submodule at `path` (cloned under
+		// `.git/modules`, its working tree at the path). Fails when there is
+		// no submodule there or it is not cloned.
+		def openSubmodule(path string) !Repository {
+			let s = try findSubmodule(self, path)
+			fail "git: submodule {path} is not cloned" unless s.cloned
+			return try openGitDir(submoduleGitDir(self, s.name), os.join(workDir, s.path))
+		}
+
+		// Adds a submodule (`git submodule add`): clones `url` into
+		// `.git/modules/<name>` (the name defaults to the path) with its
+		// working tree at `path`, at `branch` when given, records it in
+		// `.gitmodules` and the configuration, and stages `.gitmodules` and
+		// the gitlink. Fails when the repository is bare, the name or path is
+		// not allowed, the path is not empty, a submodule is there already,
+		// or the clone fails.
+		def addSubmodule(url string, path string, branch string = "", name string = "", options SubmoduleOptions = SubmoduleOptions{}) !Submodule {
+			return try addSubmoduleAt(self, url, path, branch, name, options)
+		}
+
+		// Removes the submodule at `path`: its index entry, working folder,
+		// `.gitmodules` section, configuration and repository under
+		// `.git/modules`, `.gitmodules` staged. Fails when there is no
+		// submodule there, or it has local changes and `force` is not given.
+		def removeSubmodule(path string, force bool = false) !none {
+			try removeSubmoduleAt(self, path, force)
+			return none
+		}
+
+		// Sets the submodule's URL in `.gitmodules` and, when it is
+		// initialized, in the configuration and its `origin`. Fails when
+		// there is no submodule at `path`.
+		def setSubmoduleUrl(path string, url string) !none {
+			try setSubmoduleUrlAt(self, path, url)
+			return none
+		}
+
+		// Sets the branch `.gitmodules` names for the submodule, an empty one
+		// removing it. Fails when there is no submodule at `path`.
+		def setSubmoduleBranch(path string, branch string) !none {
+			try setSubmoduleBranchAt(self, path, branch)
+			return none
 		}
 
 		// Takes the connection settings (credentials, an SSH client) for the

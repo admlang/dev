@@ -167,6 +167,60 @@ partial module adm.dev.git {
 			return none
 		}
 
+		// The writers take a scope: the global file is `~/.gitconfig`, or the
+		// XDG one when only that exists; a scope without a file is refused.
+		@test()
+		def WritesConfigByScope() !none {
+			let dir = try scratch("config-scopes")
+			let xdg = os.join(dir, "xdg", "git", "config")
+			let home = os.join(dir, "home", ".gitconfig")
+			let local = os.join(dir, "config")
+			let cfg = new Config()
+			cfg.file = local
+			cfg.sources = [
+				ConfigSource{path: os.join(dir, "etc", "gitconfig"), scope: ConfigScope.System},
+				ConfigSource{path: xdg, scope: ConfigScope.Global},
+				ConfigSource{path: home, scope: ConfigScope.Global},
+				ConfigSource{path: local, scope: ConfigScope.Local},
+			]
+			try cfg.reload()
+			fail "global path: {cfg.path(ConfigScope.Global)}" unless cfg.path(ConfigScope.Global) == home
+			fail "program path: {cfg.path(ConfigScope.Program)}" unless cfg.path(ConfigScope.Program) == "" && cfg.path(ConfigScope.Worktree) == ""
+			try os.mkdir(os.dir(xdg), true)
+			try os.writeFile(xdg, "[user]\n\tname = Xdg\n".bytes())
+			fail "xdg not preferred when alone" unless cfg.path(ConfigScope.Global) == xdg
+			try cfg.set("user.name", "Ana", scope = ConfigScope.Global)
+			fail "xdg not written" unless string(try os.readFile(xdg)).contains("name = Ana") && !(os.exists(home) onerror recover false)
+			fail "global not read: {cfg.get("user.name", "")}" unless cfg.get("user.name", "") == "Ana"
+			// Once a home file exists it is the global one again.
+			try os.mkdir(os.dir(home), true)
+			try os.writeFile(home, "".bytes())
+			fail "home not preferred" unless cfg.path(ConfigScope.Global) == home
+			try cfg.set("user.name", "Ana", scope = ConfigScope.Global)
+			fail "home not written" unless string(try os.readFile(home)).contains("name = Ana")
+			try cfg.set("user.name", "Local Ana")
+			fail "local does not win" unless cfg.get("user.name", "") == "Local Ana"
+			fail "local file not written" unless string(try os.readFile(local)).contains("Local Ana")
+			try cfg.unset("user.name")
+			fail "global not back: {cfg.get("user.name", "")}" unless cfg.get("user.name", "") == "Ana"
+			try cfg.add("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*", scope = ConfigScope.Global)
+			fail "global add" unless cfg.all("remote.origin.fetch").len() == 1
+			try cfg.renameSection("remote.origin", "remote.up", scope = ConfigScope.Global)
+			fail "global rename" unless cfg.all("remote.up.fetch").len() == 1
+			try cfg.removeSection("remote.up", scope = ConfigScope.Global)
+			fail "global remove" unless cfg.all("remote.up.fetch").len() == 0
+			let refused = false
+			cfg.set("user.email", "x", scope = ConfigScope.Program) onerror (err error) {
+				refused = err.message.contains("no configuration file")
+				recover none
+			}
+			fail "program scope not refused" unless refused
+			try os.mkdir(os.join(dir, "etc"), true)
+			try cfg.set("core.bare", "false", scope = ConfigScope.System)
+			fail "system not written" unless (os.exists(os.join(dir, "etc", "gitconfig")) onerror recover false)
+			return none
+		}
+
 		@test()
 		def editsConfiguration() !none {
 			let dir = try scratch("config")

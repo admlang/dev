@@ -226,7 +226,10 @@ partial module adm.dev.git {
 			let (untracked, ignoredPaths) = try untrackedPaths(repo, idx, UntrackedMode.All, spec, options.force)
 			for let p in untracked {
 				matched = true
-				try stageFile(repo, idx, p, worktreeFile(repo, p), 0, options.intentToAdd)
+				// A folder listed as such (`sub/`) is a nested repository: staged
+				// as a gitlink at the commit it has checked out.
+				let path = p.endsWith("/") ?? (p.slice(0, p.len() - 1), p)
+				try stageFile(repo, idx, path, worktreeFile(repo, path), 0, options.intentToAdd)
 			}
 			if options.force {
 				for let p in ignoredPaths {
@@ -434,6 +437,11 @@ partial module adm.dev.git {
 		let text = try commitHooks(repo, message, options.amend ?? (head, none), options.noVerify)
 		let c = new Commit(zeroId(repo.format), tree, parents, author, committer, cleanMessage(text))
 		let signer = options.signer
+		// `commit.gpgsign`: the configuration's key signs every commit.
+		if signer is none && (repo.config.getBool("commit.gpgsign", false) onerror recover false) {
+			signer = try configSigner(repo)
+			fail "git: commit.gpgsign is set but no signing key is configured" when signer is none
+		}
 		if !(signer is none) {
 			try signCommit(c, signer)
 		}

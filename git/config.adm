@@ -29,9 +29,9 @@ partial module adm.dev.git {
 
 	// What conditional includes are decided on.
 	internal struct IncludeContext {
-		gitDir   string = ""
-		worktree string = ""
-		branch   string = ""
+		gitDir   string   = ""
+		worktree string   = ""
+		branch   string   = ""
 		// remote.*.url values of every file, for hasconfig:remote.*.url.
 		urls     string[] = []
 	}
@@ -47,7 +47,7 @@ partial module adm.dev.git {
 	// the program set. The last value of a key wins.
 	type Config {
 		entries   ConfigEntry[]  = []
-		// The repository's own file, which `set` and `unset` write.
+		// The repository's own file, which `set` and `unset` write by default.
 		file      string         = ""
 		sources   ConfigSource[] = []
 		context   IncludeContext = IncludeContext{}
@@ -134,53 +134,86 @@ partial module adm.dev.git {
 			entries.push(e)
 		}
 
-		// Sets `name` in the repository's own file, replacing its last value
-		// there (or every value with `replaceAll`). Fails when the name is
-		// malformed or the file cannot be written.
-		def set(name string, value string, replaceAll bool = false) !none {
+		// The file a scope's values are written to, as `git config --local`,
+		// `--global` and `--system` pick it: the repository's own file, the
+		// worktree's, `~/.gitconfig` (or `$XDG_CONFIG_HOME/git/config` when
+		// only that one exists), `/etc/gitconfig`. Empty for a scope this
+		// configuration has no file for, and for `Program`.
+		def path(scope ConfigScope) string {
+			return file when scope == ConfigScope.Local && file != ""
+			let own string[] = []
+			for let src in sources {
+				own.push(src.path) when src.scope == scope
+			}
+			return "" when own.len() == 0
+			return own[0] when scope != ConfigScope.Global || own.len() == 1
+			// The home file (listed after the XDG one) unless it is missing
+			// and the XDG one is there.
+			let home = own[own.len() - 1]
+			let xdg = own[0]
+			let homeThere = os.exists(home) onerror recover false
+			let xdgThere = os.exists(xdg) onerror recover false
+			return !homeThere && xdgThere ?? (xdg, home)
+		}
+
+		// `path(scope)`, failing for a scope with no file.
+		internal def fileFor(scope ConfigScope) !string {
+			let target = path(scope)
+			fail "git: no configuration file for the {scope} scope" when target == ""
+			return target
+		}
+
+		// Sets `name` in the file of `scope` (the repository's own by default,
+		// `path(scope)` names it), replacing its last value there (or every
+		// value with `replaceAll`). Fails when the name is malformed, the
+		// scope has no file or the file cannot be written.
+		def set(name string, value string, replaceAll bool = false, scope ConfigScope = ConfigScope.Local) !none {
 			try checkConfigName(name)
-			let f = try readConfigFile(file)
+			let f = try readConfigFile(try fileFor(scope))
 			f.set(name, value, replaceAll)
 			try f.write()
 			try reload()
 			return none
 		}
 
-		// Adds a value to a multi-valued key in the repository's own file.
-		// Fails when the name is malformed or the file cannot be written.
-		def add(name string, value string) !none {
+		// Adds a value to a multi-valued key in the file of `scope`. Fails when
+		// the name is malformed, the scope has no file or the file cannot be
+		// written.
+		def add(name string, value string, scope ConfigScope = ConfigScope.Local) !none {
 			try checkConfigName(name)
-			let f = try readConfigFile(file)
+			let f = try readConfigFile(try fileFor(scope))
 			f.add(name, value)
 			try f.write()
 			try reload()
 			return none
 		}
 
-		// Removes `name` from the repository's own file: its last value, or
-		// every value with `all`. Fails when the file cannot be written.
-		def unset(name string, all bool = false) !none {
-			let f = try readConfigFile(file)
+		// Removes `name` from the file of `scope`: its last value, or every
+		// value with `all`. Fails when the scope has no file or the file cannot
+		// be written.
+		def unset(name string, all bool = false, scope ConfigScope = ConfigScope.Local) !none {
+			let f = try readConfigFile(try fileFor(scope))
 			f.unset(name, all)
 			try f.write()
 			try reload()
 			return none
 		}
 
-		// Removes a whole section (`remote.origin`) from the repository's own
-		// file. Fails when the file cannot be written.
-		def removeSection(name string) !none {
-			let f = try readConfigFile(file)
+		// Removes a whole section (`remote.origin`) from the file of `scope`.
+		// Fails when the scope has no file or the file cannot be written.
+		def removeSection(name string, scope ConfigScope = ConfigScope.Local) !none {
+			let f = try readConfigFile(try fileFor(scope))
 			f.removeSection(name)
 			try f.write()
 			try reload()
 			return none
 		}
 
-		// Renames a section (`branch.old` to `branch.new`) in the repository's
-		// own file. Fails when the file cannot be written.
-		def renameSection(from string, to string) !none {
-			let f = try readConfigFile(file)
+		// Renames a section (`branch.old` to `branch.new`) in the file of
+		// `scope`. Fails when the scope has no file or the file cannot be
+		// written.
+		def renameSection(from string, to string, scope ConfigScope = ConfigScope.Local) !none {
+			let f = try readConfigFile(try fileFor(scope))
 			f.renameSection(from, to)
 			try f.write()
 			try reload()

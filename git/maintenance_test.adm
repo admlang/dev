@@ -8,6 +8,75 @@ partial module adm.dev.git {
 	)
 
 	check "Maintenance" {
+		// `countObjects` counts loose and packed objects and references before
+		// and after a repack; a repack reports its phases and stops when told,
+		// leaving the old packs; `unreachable` counts what `prune` removes;
+		// `packRefs` moves the loose references into packed-refs; `gc` stops
+		// between its phases.
+		@test()
+		def countsReportsAndStops() !none {
+			let root = try fixtures()
+			let repo = try clone(os.join(root, "twopacks.git"), try scratch("count"), bare = true)
+			let tip = try repo.resolve("main")
+			let next = try addCommit(repo, "main", tip, "Loose commit")
+			let _ = next
+			let stray = try repo.writeBlob("nothing reaches this\n".bytes())
+			let _ = stray
+			let before = try repo.countObjects()
+			fail "before: loose {before.loose} packs {before.packs} packed {before.packed}" unless before.loose >= 3 && before.looseBytes > 0 && before.packs >= 1 && before.packed > 0 && before.packBytes > 0 && before.garbage == 0
+			fail "refs before: loose {before.looseRefs} packed {before.packedRefs}" unless before.looseRefs + before.packedRefs >= 1
+			try os.writeFile(os.join(repo.objects.dir, "pack", "stray.txt"), "junk".bytes())
+			let junk = try repo.countObjects()
+			fail "garbage {junk.garbage}" unless junk.garbage == 1 && junk.garbageBytes == 4
+			os.remove(os.join(repo.objects.dir, "pack", "stray.txt")) onerror recover none
+			// A dry count says what a prune would take.
+			let (would, bytes) = try repo.unreachable(time.now() + 24h)
+			fail "unreachable {would} {bytes}" unless would == 2 && bytes > 0 && repo.has(stray)
+			// A repack stopped in its writing phase leaves the old packs.
+			let phases string[] = []
+			let stopped = ""
+			let packsBefore = (try os.readDir(os.join(repo.objects.dir, "pack"))).filter(e => e.path.endsWith(".pack")).len()
+			repo.repack(RepackOptions{progress: def (p Progress) bool {
+				phases.push(p.phase) unless phases.len() > 0 && phases[phases.len() - 1] == p.phase
+				return p.phase != "writing"
+			}}) onerror (err error) {
+				stopped = err.code
+				recover none
+			}
+			fail "not stopped: {stopped} {phases.join(",")}" unless stopped == "stopped" && phases.join(",") == "counting,compressing,writing"
+			let packsAfter = (try os.readDir(os.join(repo.objects.dir, "pack"))).filter(e => e.path.endsWith(".pack")).len()
+			fail "packs changed by a stopped repack: {packsBefore} to {packsAfter}" unless packsAfter == packsBefore
+			fail "temporary pack left" unless (try os.readDir(os.join(repo.objects.dir, "pack"))).filter(e => os.base(e.path).startsWith("tmp_pack")).len() == 0
+			// Let through, the phases run to the end.
+			phases = []
+			let sum = try repo.repack(RepackOptions{progress: def (p Progress) bool {
+				phases.push(p.phase) unless phases.len() > 0 && phases[phases.len() - 1] == p.phase
+				return true
+			}})
+			fail "nothing packed" when sum is none
+			fail "phases {phases.join(",")}" unless phases.join(",") == "counting,compressing,writing"
+			let after = try repo.countObjects()
+			fail "after: packs {after.packs} loose {after.loose}" unless after.packs == 1 && after.packed >= before.packed && after.loose <= before.loose
+			// Loose references go into packed-refs.
+			let loose = try repo.countObjects()
+			try repo.packRefs()
+			let packed = try repo.countObjects()
+			// A loose reference may shadow a packed one of the same name, so the
+			// packed count grows by at most the loose ones.
+			fail "refs: {loose.looseRefs}/{loose.packedRefs} to {packed.looseRefs}/{packed.packedRefs}" unless packed.looseRefs == 0 && packed.packedRefs >= loose.packedRefs && packed.packedRefs <= loose.packedRefs + loose.looseRefs && (try repo.resolve("main")).equals(next)
+			// gc stops at its first phase and changes nothing.
+			let gcStopped = ""
+			repo.gc(GcOptions{progress: (p Progress) => false}) onerror (err error) {
+				gcStopped = err.code
+				recover none
+			}
+			fail "gc not stopped" unless gcStopped == "stopped" && repo.has(stray)
+			try repo.gc(GcOptions{expire: -24h})
+			fail "gc did not prune" when repo.has(stray)
+			repo.close()
+			return none
+		}
+
 		@test()
 		def repacksEverything() !none {
 			let root = try fixtures()
