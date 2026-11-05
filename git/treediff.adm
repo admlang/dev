@@ -16,38 +16,38 @@ partial module adm.dev.git {
 	// new mode and object (mode 0 and the zero id for a side that does not
 	// have it).
 	struct FileChange {
-		kind       ChangeKind
-		oldPath    string
-		newPath    string
-		oldMode    int
-		newMode    int
-		oldId      ObjectId
-		newId      ObjectId
+		kind                ChangeKind
+		oldPath             string
+		newPath             string
+		oldMode             int
+		newMode             int
+		oldId               ObjectId
+		newId               ObjectId
 		// For a rename or copy, how similar the two are: 0 to 100.
-		similarity int = 0
+		similarity          int        = 0
 		// The raw score (0 to 60000) git ranks rename candidates by.
-		internal score int = 0
+		internal score      int        = 0
 		// The new side is the file in the working tree, read on demand.
-		internal inWorktree bool = false
+		internal inWorktree bool       = false
 	}
 
 	// Options for comparing snapshots.
 	struct ChangeOptions {
 		// Find renames (diff.renames, on by default).
-		renames          bool     = true
+		renames         bool     = true
 		// Find copies of files changed in the same snapshot pair too.
-		copies           bool     = false
+		copies          bool     = false
 		// Look for copy sources among unchanged files as well (`-C -C`).
-		copiesHarder     bool     = false
+		copiesHarder    bool     = false
 		// The similarity, 0 to 100, a rename or copy needs (`-M50%`).
-		renameThreshold  int      = 50
+		renameThreshold int      = 50
 		// Most sources times destinations compared for inexact renames is
 		// this squared (diff.renameLimit).
-		renameLimit      int      = 1000
+		renameLimit     int      = 1000
 		// Empty files take part in rename detection.
-		renameEmpty      bool     = false
+		renameEmpty     bool     = false
 		// Pathspecs that limit the paths compared; empty for all.
-		paths            string[] = []
+		paths           string[] = []
 	}
 
 	internal const maxScore = 60000
@@ -76,15 +76,110 @@ partial module adm.dev.git {
 	}
 
 	// The changes between two trees (none for an empty side), with renames
-	// and copies found as the options ask, in git's order (by path).
+	// and copies found as the options ask, in git's order (by path). The
+	// trees are walked together and a subtree both sides hold under one id is
+	// passed over, as git's diff does, so the cost is that of the folders that
+	// changed; with `copiesHarder` such subtrees are read all the same, their
+	// files being copy sources.
 	// Fails when a tree or blob is missing.
 	def diffTrees(repo Repository, oldTree ?ObjectId, newTree ?ObjectId, options ChangeOptions = ChangeOptions{}) !FileChange[] {
 		let spec = try newPathspec(options.paths)
-		let a SnapshotEntry[] = []
-		let b SnapshotEntry[] = []
-		try treeFiles(repo, oldTree, spec, "", a)
-		try treeFiles(repo, newTree, spec, "", b)
-		return try compareSnapshots(repo, a, b, options, false)
+		let changes FileChange[] = []
+		let unchanged FileChange[] = []
+		try diffTreePair(repo, oldTree, newTree, spec, "", options, changes, unchanged)
+		return changes unless options.renames || options.copies
+		return try detectRenames(repo, changes, unchanged, options)
+	}
+
+	// The entries of a tree, none for no tree.
+	internal def entriesOf(repo Repository, tree ?ObjectId) !TreeEntry[] {
+		return [] when tree is none
+		return (try repo.tree(tree)).entries
+	}
+
+	// How two tree entries sort in git's tree order: by name, a subtree as if
+	// its name ended in `/`.
+	internal def compareEntries(a TreeEntry, b TreeEntry) int {
+		return compareBytes(isTree(a.mode) ?? (a.name + "/", a.name), isTree(b.mode) ?? (b.name + "/", b.name))
+	}
+
+	// Walks two trees together under `prefix`, appending the changes between
+	// them and, for rename detection, the files they share.
+	internal def diffTreePair(repo Repository, oldTree ?ObjectId, newTree ?ObjectId, spec Pathspec, prefix string, options ChangeOptions, changes FileChange[], unchanged FileChange[]) !none {
+		let zero = zeroId(repo.format)
+		let a = try entriesOf(repo, oldTree)
+		let b = try entriesOf(repo, newTree)
+		let i = 0
+		let j = 0
+		for i < a.len() || j < b.len() {
+			let c = 0
+			if i >= a.len() {
+				c = 1
+			} else if j >= b.len() {
+				c = -1
+			} else {
+				c = compareEntries(a[i], b[j])
+			}
+			if c < 0 {
+				try sideOnly(repo, a[i], spec, prefix, false, zero, changes)
+				i++
+				continue
+			}
+			if c > 0 {
+				try sideOnly(repo, b[j], spec, prefix, true, zero, changes)
+				j++
+				continue
+			}
+			let x = a[i]
+			let y = b[j]
+			i++
+			j++
+			let path = prefix + x.name
+			if isTree(x.mode) {
+				// Both subtrees: one id is one content, passed over unless its
+				// files may be copy sources.
+				continue unless spec.mayMatchDir(path)
+				if x.id.equals(y.id) {
+					continue unless options.copiesHarder
+					let same SnapshotEntry[] = []
+					try treeFiles(repo, x.id, spec, path + "/", same)
+					for let e in same {
+						unchanged.push(FileChange{kind: ChangeKind.Modified, oldPath: e.path, newPath: e.path, oldMode: e.mode, newMode: e.mode, oldId: e.id, newId: e.id})
+					}
+					continue
+				}
+				try diffTreePair(repo, x.id, y.id, spec, path + "/", options, changes, unchanged)
+				continue
+			}
+			continue unless spec.matches(path)
+			if x.id.equals(y.id) && x.mode == y.mode {
+				unchanged.push(FileChange{kind: ChangeKind.Modified, oldPath: path, newPath: path, oldMode: int(x.mode), newMode: int(y.mode), oldId: x.id, newId: y.id})
+				continue
+			}
+			let kind = modeType(int(x.mode)) == modeType(int(y.mode)) ?? (ChangeKind.Modified, ChangeKind.TypeChanged)
+			changes.push(FileChange{kind: kind, oldPath: path, newPath: path, oldMode: int(x.mode), newMode: int(y.mode), oldId: x.id, newId: y.id})
+		}
+		return none
+	}
+
+	// An entry one side alone has: its file, or every file under its
+	// subtree, added (`added`) or deleted.
+	internal def sideOnly(repo Repository, e TreeEntry, spec Pathspec, prefix string, added bool, zero ObjectId, changes FileChange[]) !none {
+		let path = prefix + e.name
+		let files SnapshotEntry[] = []
+		if isTree(e.mode) {
+			try treeFiles(repo, e.id, spec, path + "/", files) when spec.mayMatchDir(path)
+		} else {
+			files.push(SnapshotEntry{path: path, mode: int(e.mode), id: e.id}) when spec.matches(path)
+		}
+		for let f in files {
+			if added {
+				changes.push(FileChange{kind: ChangeKind.Added, oldPath: f.path, newPath: f.path, oldMode: 0, newMode: f.mode, oldId: zero, newId: f.id})
+			} else {
+				changes.push(FileChange{kind: ChangeKind.Deleted, oldPath: f.path, newPath: f.path, oldMode: f.mode, newMode: 0, oldId: f.id, newId: zero})
+			}
+		}
+		return none
 	}
 
 	// The type of a mode as git distinguishes changes by it: regular file,
@@ -194,10 +289,10 @@ partial module adm.dev.git {
 	internal type RenameFile {
 		change  FileChange
 		newSide bool
-		size    int     = -1
-		data    ?byte[] = none
+		size    int            = -1
+		data    ?byte[]        = none
 		profile ?map<int, int> = none
-		used    bool    = false
+		used    bool           = false
 
 		def new(change FileChange, newSide bool) {
 			self.change = change
@@ -455,15 +550,15 @@ partial module adm.dev.git {
 			removed[src.path()] = true when src.change.kind == ChangeKind.Deleted
 			let k = destOf[d]
 			changes[k] = FileChange{
-				kind: kind,
-				oldPath: src.path(),
-				newPath: dst.path(),
-				oldMode: src.mode(),
-				newMode: dst.mode(),
-				oldId: src.id(),
-				newId: dst.id(),
+				kind:       kind,
+				oldPath:    src.path(),
+				newPath:    dst.path(),
+				oldMode:    src.mode(),
+				newMode:    dst.mode(),
+				oldId:      src.id(),
+				newId:      dst.id(),
 				similarity: pairedScore[d] * 100 / maxScore,
-				score: pairedScore[d],
+				score:      pairedScore[d],
 				inWorktree: dst.change.inWorktree,
 			}
 		}
