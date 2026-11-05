@@ -1,0 +1,115 @@
+// The hooks a commit and a push run, as git runs them.
+partial module adm.dev.git {
+	use (
+		std.os
+		std.testing
+	)
+
+	// Installs a hook script in the repository's hooks folder.
+	internal def installHook(repo Repository, name string, script string) !none {
+		let dir = repo.hooksDir()
+		try os.mkdir(dir, true)
+		try os.writeFile(os.join(dir, name), ("#!/bin/sh\n" + script).bytes(), 0o755)
+		return none
+	}
+
+	check "Hooks" {
+		@test()
+		def runsTheCommitHooks() !none {
+			return none when __os__ == "windows"
+			let repo = try newWorktree("hooks-commit")
+			let log = os.join(repo.gitDir, "hook-log")
+			try writeFile(repo, "a.txt", "one\n")
+			try repo.add(".")
+			// Nothing installed: the commit goes through, and the sample files
+			// git leaves are not hooks.
+			try os.writeFile(os.join(repo.hooksDir(), "pre-commit.sample"), "#!/bin/sh\nexit 1\n".bytes(), 0o755)
+			fail "hooks listed: {repo.hooks().join(",")}" unless repo.hooks().len() == 0
+			let first = try repo.commit("First")
+			// pre-commit refuses: nothing is committed, and what it wrote is in
+			// the error.
+			try installHook(repo, "pre-commit", "echo 'pre-commit: GIT_DIR=' $GIT_DIR >> \"{log}\"\necho no way >&2\nexit 3\n")
+			try writeFile(repo, "a.txt", "two\n")
+			try repo.add(".")
+			let refused = repo.commit("Second")
+			fail "the commit went through" unless refused is error
+			fail "error: {refused.message}" unless refused.message.contains("pre-commit hook refused (3)") && refused.message.contains("no way")
+			fail "HEAD moved" unless (try repo.resolve("HEAD")).equals(first)
+			// --no-verify skips it; prepare-commit-msg and commit-msg see the
+			// message file, and what they write to it is what is committed;
+			// post-commit runs afterwards and its output reaches onHook.
+			let seen string[]
+			repo.onHook = def (ran HookRun) {
+				seen.push("{ran.name}:{ran.code}:{ran.output.trim()}")
+			}
+			try installHook(repo, "prepare-commit-msg", "echo \"prepare: $2\" >> \"{log}\"\nprintf 'Prepared %s\\n' \"$(cat \"$1\")\" > \"$1\"\n")
+			try installHook(repo, "commit-msg", "echo \"msg: $(head -1 \"$1\")\" >> \"{log}\"\nprintf '%s\\n\\nChecked.\\n' \"$(head -1 \"$1\")\" > \"$1\"\n")
+			try installHook(repo, "post-commit", "echo done\necho \"post: $(pwd)\" >> \"{log}\"\n")
+			let second = try repo.commit("Second", CommitOptions{noVerify: true})
+			let c = try repo.commitAt(second)
+			fail "message: {c.message}" unless c.message == "Prepared Second\n"
+			fail "seen: {seen.join(" | ")}" unless seen.join(" | ") == "prepare-commit-msg:0: | post-commit:0:done"
+			let lines = string(try os.readFile(log)).split("\n")
+			fail "log: {lines.join(" | ")}" unless lines[0] == "pre-commit: GIT_DIR= {repo.gitDir}" && lines[1] == "prepare: message" && lines[2] == "post: {repo.workDir}"
+			// With verification, commit-msg rewrites the message too; the hooks
+			// run in order.
+			seen = []
+			try writeFile(repo, "a.txt", "three\n")
+			try repo.add(".")
+			try installHook(repo, "pre-commit", "exit 0\n")
+			let third = try repo.commit("Third")
+			fail "message: {(try repo.commitAt(third)).message}" unless (try repo.commitAt(third)).message == "Prepared Third\n\nChecked.\n"
+			fail "order: {seen.join(" | ")}" unless seen.join(" | ") == "pre-commit:0: | prepare-commit-msg:0: | commit-msg:0: | post-commit:0:done"
+			fail "hooks: {repo.hooks().join(",")}" unless repo.hooks().join(",") == "commit-msg,post-commit,pre-commit,prepare-commit-msg"
+			// A hook refusing the message leaves nothing behind either.
+			try installHook(repo, "commit-msg", "exit 1\n")
+			try writeFile(repo, "a.txt", "four\n")
+			try repo.add(".")
+			fail "bad message committed" unless repo.commit("Fourth") is error
+			fail "HEAD moved" unless (try repo.resolve("HEAD")).equals(third)
+			// runHook by hand, with arguments and input.
+			try installHook(repo, "pre-push", "echo \"args: $1 $2\"\ncat\n")
+			let ran = try repo.runHook("pre-push", ["origin", "url"], "a b\n")
+			fail "ran: {ran.code} {ran.output}" unless ran.code == 0 && ran.output == "args: origin url\na b\n"
+			let missing = try repo.runHook("post-update")
+			fail "missing hook ran" unless missing.code == 0 && missing.output == ""
+			repo.close()
+			return none
+		}
+
+		@test()
+		def runsPrePushAndHonoursHooksPath() !none {
+			return none when __os__ == "windows"
+			let (src, ids) = try servedRepo("hooks-push-src")
+			let branch = try src.branch()
+			let target = try init(try scratch("hooks-push-target"), InitOptions{bare: true})
+			target.close()
+			let repo = try clone(src.gitDir, try scratch("hooks-push"))
+			try repo.addRemote("target", target.gitDir)
+			// The hooks live where core.hooksPath says, relative to the working
+			// tree.
+			repo.config.override("core.hooksPath", "tools/hooks")
+			fail "hooksDir: {repo.hooksDir()}" unless repo.hooksDir() == os.join(repo.workDir, "tools/hooks")
+			let log = os.join(repo.gitDir, "hook-log")
+			try installHook(repo, "pre-push", "echo \"$1 $2\" > \"{log}\"\ncat >> \"{log}\"\n")
+			let pushed = try repo.push("target", refspecs = ["refs/heads/{branch}:refs/heads/{branch}"])
+			fail "not created" unless pushed.changes.len() == 1 && pushed.changes[0].kind == RefChangeKind.Created
+			let zero = zeroId(repo.format).str()
+			let expect = "target {target.gitDir}\nrefs/heads/{branch} {ids[1].str()} refs/heads/{branch} {zero}\n"
+			fail "input: {string(try os.readFile(log))}" unless string(try os.readFile(log)) == expect
+			// A refused push updates nothing; --no-verify goes through.
+			let next = try addCommit(repo, branch, ids[1], "Refused")
+			try installHook(repo, "pre-push", "echo not now >&2\nexit 1\n")
+			let stopped = repo.push("target", refspecs = [branch])
+			fail "push went through" unless stopped is error && stopped.message.contains("pre-push hook refused")
+			let served = try open(target.gitDir)
+			fail "target moved" unless (try served.resolve(branch)).equals(ids[1])
+			let forced = try repo.push("target", refspecs = [branch], noVerify = true)
+			fail "no-verify: {forced.changes[0].reason}" unless forced.changes[0].kind == RefChangeKind.FastForward
+			fail "target not moved" unless (try served.resolve(branch)).equals(next)
+			served.close()
+			repo.close()
+			return none
+		}
+	}
+}

@@ -37,6 +37,8 @@ partial module adm.dev.git {
 		// Record the remote branch as the upstream of the local one
 		// (`--set-upstream`).
 		setUpstream bool          = false
+		// Skip the `pre-push` hook (`--no-verify`).
+		noVerify    bool          = false
 	}
 
 	// What a push did.
@@ -241,6 +243,7 @@ partial module adm.dev.git {
 			}
 			sending.push(p)
 		}
+		try prePushHook(repo, remote, sending) unless options.noVerify
 		let rejected = result.changes.filter(c => c.kind == RefChangeKind.Rejected)
 		if options.allOrNone && rejected.len() > 0 {
 			for let c in result.changes {
@@ -420,7 +423,7 @@ partial module adm.dev.git {
 	// Reads its readers one after another.
 	internal type ConcatReader {
 		internal parts io.Reader[]
-		internal at    int = 0
+		internal at    int         = 0
 
 		def new(parts io.Reader[]) {
 			self.parts = parts

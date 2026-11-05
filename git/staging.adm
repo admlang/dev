@@ -385,6 +385,8 @@ partial module adm.dev.git {
 		all        bool       = false
 		// Sign the commit with this signer (`-S`).
 		signer     ?Signer    = none
+		// Skip the `pre-commit` and `commit-msg` hooks (`--no-verify`).
+		noVerify   bool       = false
 	}
 
 	internal def commitIndex(repo Repository, message string, options CommitOptions) !ObjectId {
@@ -429,7 +431,8 @@ partial module adm.dev.git {
 		}
 		let author = try commitAuthor(repo, options.author, previous is none ?? (picked, previous))
 		let committer = try commitSigner(repo, options.committer)
-		let c = new Commit(zeroId(repo.format), tree, parents, author, committer, cleanMessage(message))
+		let text = try commitHooks(repo, message, options.amend ?? (head, none), options.noVerify)
+		let c = new Commit(zeroId(repo.format), tree, parents, author, committer, cleanMessage(text))
 		let signer = options.signer
 		if !(signer is none) {
 			try signCommit(c, signer)
@@ -442,6 +445,8 @@ partial module adm.dev.git {
 		for let name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG", "AUTO_MERGE", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
 			os.remove(os.join(repo.gitDir, name)) onerror recover none
 		}
+		// Told once the commit is made; what it says changes nothing.
+		let _ = try runHookOf(repo, "post-commit", [], "", {})
 		return id
 	}
 

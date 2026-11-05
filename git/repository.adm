@@ -17,27 +17,30 @@ partial module adm.dev.git {
 		// The folder holding HEAD for this worktree (`.git`, or
 		// `.git/worktrees/<name>` for a linked worktree, or the repository
 		// itself when bare).
-		gitDir    string
+		gitDir                 string
 		// The folder holding objects, shared refs and config.
-		commonDir string
+		commonDir              string
 		// The working tree; empty for a bare repository.
-		workDir   string
-		format    ObjectFormat
-		refFormat RefFormat
-		config    Config
-		internal objects  ObjectDatabase
-		internal refStore RefBackend
-		internal graph       ?CommitGraph = none
-		internal graphLoaded bool         = false
+		workDir                string
+		format                 ObjectFormat
+		refFormat              RefFormat
+		config                 Config
+		internal objects       ObjectDatabase
+		internal refStore      RefBackend
+		internal graph         ?CommitGraph               = none
+		internal graphLoaded   bool                       = false
 		// The commits whose parents the repository lacks (`shallow`), by id.
-		internal shallowIds    map<string, bool> = {}
-		internal shallowLoaded bool              = false
+		internal shallowIds    map<string, bool>          = {}
+		internal shallowLoaded bool                       = false
 		// The reachability bitmap, read on first use.
-		internal bitmap        ?PackBitmap       = none
-		internal bitmapLoaded  bool              = false
-		internal attrs       ?AttributeRules = none
+		internal bitmap        ?PackBitmap                = none
+		internal bitmapLoaded  bool                       = false
+		internal attrs         ?AttributeRules            = none
 		// Long-running filter processes, by driver name.
-		internal filters     map<string, FilterProcess> = {}
+		internal filters       map<string, FilterProcess> = {}
+		// Called with each hook that ran, with what it wrote; none shows it
+		// nowhere (a hook that refuses still fails with its output).
+		onHook                 ?(def(HookRun) none)       = none
 
 		def new(gitDir string, commonDir string, workDir string, format ObjectFormat, refFormat RefFormat, config Config, objects ObjectDatabase, refStore RefBackend) {
 			self.gitDir = gitDir
@@ -418,6 +421,34 @@ partial module adm.dev.git {
 			return try commitIndex(self, message, CommitOptions{author: author})
 		}
 
+		// ---- hooks -----------------------------------------------------------------
+
+		// The folder the hooks are in: `core.hooksPath`, else `hooks` under
+		// the git folder.
+		def hooksDir() string {
+			return hooksDirOf(self)
+		}
+
+		// The names of the hooks that run: the executable files of the hooks
+		// folder, in order, without git's `.sample` files. A commit runs
+		// `pre-commit`, `prepare-commit-msg`, `commit-msg` and `post-commit`,
+		// a push `pre-push`, as git does: in the working tree, with `GIT_DIR`
+		// set, their arguments and input as git gives them, a code other than
+		// 0 from `pre-commit`, `prepare-commit-msg`, `commit-msg` or
+		// `pre-push` stopping the commit or push. `CommitOptions{noVerify}`
+		// and `push(noVerify = true)` skip them as `--no-verify` does.
+		def hooks() string[] {
+			return hookNamesOf(self)
+		}
+
+		// Runs the hook `name` by hand, with `args` on its command line and
+		// `input` on its standard input, as a commit or push would; a hook
+		// that is not installed is a run with code 0. Fails when it could not
+		// be started.
+		def runHook(name string, args string[] = [], input string = "") !HookRun {
+			return try runHookOf(self, name, args, input, {})
+		}
+
 		// Writes the index as trees and returns the root tree's id (`git
 		// write-tree`). Fails when the index has conflicts.
 		def writeIndexTree() !ObjectId {
@@ -598,16 +629,17 @@ partial module adm.dev.git {
 		// expected; `allOrNone` updates every reference or none;
 		// `pushOptions` go to the remote's hooks; `followTags` and `tags`
 		// send annotated tags of pushed commits, or every tag; `setUpstream`
-		// records the remote branch as the local one's upstream.
+		// records the remote branch as the local one's upstream; `noVerify`
+		// skips the `pre-push` hook.
 		// Fails when the remote cannot be reached or refuses the pack;
 		// references it does not update are reported as rejected.
-		def push(remote string = "origin", refspec string = "", credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}) !PushResult {
-			return try push(remote, refspec == "" ?? (string[], [refspec]), credentials, force, leases, allOrNone, pushOptions, followTags, tags, setUpstream, connection)
+		def push(remote string = "origin", refspec string = "", credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}, noVerify bool = false) !PushResult {
+			return try push(remote, refspec == "" ?? (string[], [refspec]), credentials, force, leases, allOrNone, pushOptions, followTags, tags, setUpstream, connection, noVerify)
 		}
 
 		// push with several refspecs. Fails as the other does.
-		def push(remote string, refspecs string[], credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}) !PushResult {
-			let options = PushOptions{remote: withCredentials(connection, credentials), refspecs: refspecs, force: force, leases: leases, allOrNone: allOrNone, pushOptions: pushOptions, followTags: followTags, tags: tags, setUpstream: setUpstream}
+		def push(remote string, refspecs string[], credentials ?Credentials = none, force bool = false, leases Lease[] = [], allOrNone bool = false, pushOptions string[] = [], followTags bool = false, tags bool = false, setUpstream bool = false, connection RemoteOptions = RemoteOptions{}, noVerify bool = false) !PushResult {
+			let options = PushOptions{remote: withCredentials(connection, credentials), refspecs: refspecs, force: force, leases: leases, allOrNone: allOrNone, pushOptions: pushOptions, followTags: followTags, tags: tags, setUpstream: setUpstream, noVerify: noVerify}
 			return try pushRemote(self, remote, options)
 		}
 
@@ -995,15 +1027,15 @@ partial module adm.dev.git {
 	// Options for `init`.
 	struct InitOptions {
 		// No working tree: the folder is the repository.
-		bare          bool         = false
-		format        ObjectFormat = ObjectFormat.Sha1
-		refFormat     RefFormat    = RefFormat.Files
+		bare           bool         = false
+		format         ObjectFormat = ObjectFormat.Sha1
+		refFormat      RefFormat    = RefFormat.Files
 		// The branch HEAD starts on; empty takes init.defaultBranch, else
 		// "master" as git does.
-		initialBranch string       = ""
+		initialBranch  string       = ""
 		// Keep the git folder here and leave a `.git` file pointing at it in
 		// the working tree.
-		separateGitDir string      = ""
+		separateGitDir string       = ""
 	}
 
 	// Creates a repository at `path` (its working tree, or the repository

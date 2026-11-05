@@ -67,6 +67,19 @@ whitespace options; `repo.apply(patch)` applies them, binary patches too. Ignore
 attributes, line endings (`core.autocrlf`, `eol`, `text`), `ident`, `working-tree-encoding`
 and filter drivers (including long-running filter processes) are applied as git applies them.
 
+## Hooks
+
+A commit runs the repository's `pre-commit`, `prepare-commit-msg`, `commit-msg` and `post-commit`
+hooks and a push its `pre-push`, as git runs them: the executable file of that name in
+`core.hooksPath` (else `.git/hooks`), in the working tree, with `GIT_DIR` set, their arguments and
+input as git gives them (the message file, which the message hooks may rewrite; the references a
+push updates, one per line). A code other than 0 from `pre-commit`, `prepare-commit-msg`,
+`commit-msg` or `pre-push` stops the commit or push with what the hook wrote;
+`CommitOptions{noVerify: true}` and `push(noVerify = true)` skip them as `--no-verify` does.
+`repo.hooks()` names the hooks installed, `repo.hooksDir()` their folder, `repo.runHook(name,
+args, input)` runs one by hand, and `repo.onHook` is called with each hook that ran and its
+output. On Windows a hook runs through the interpreter its first line names (`#!/bin/sh`).
+
 ## Merging
 
 `repo.merge(rev)` merges as `merge-ort` does (renames, directory renames, conflict markers in

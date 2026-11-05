@@ -1,0 +1,157 @@
+// The repository's hooks, run as git runs them: `pre-commit`,
+// `prepare-commit-msg`, `commit-msg` and `post-commit` around a commit,
+// `pre-push` before a push.
+partial module adm.dev.git {
+	use (
+		std.io
+		std.os
+		std.services.runtime::(Runtime)
+	)
+
+	// A hook that ran: its name, exit code and everything it wrote.
+	struct HookRun {
+		name   string
+		code   int
+		output string = ""
+	}
+
+	// The folder the hooks are in: `core.hooksPath` (relative to the working
+	// tree, or to the git folder of a bare repository; `~` is the home
+	// folder), else `hooks` under the common git folder.
+	internal def hooksDirOf(repo Repository) string {
+		let set = repo.config.get("core.hooksPath")
+		return os.join(repo.commonDir, "hooks") when set is none || set == ""
+		let path = expandHome(set)
+		return path when os.isAbs(path)
+		return os.join(repo.isBare() ?? (repo.gitDir, repo.workDir), path)
+	}
+
+	// Where git runs a hook: the working tree, the git folder of a bare
+	// repository.
+	internal def hooksCwd(repo Repository) string {
+		return repo.isBare() ?? (repo.gitDir, repo.workDir)
+	}
+
+	// The hook's file when it would run: it exists, is a file, and can be
+	// executed (every file can be on Windows, where git runs them through
+	// the interpreter of their first line).
+	internal def hookFile(repo Repository, name string) ?string {
+		let path = os.join(hooksDirOf(repo), name)
+		let info = os.stat(path)
+		return none when info is error || info.isDir
+		return none when __os__ != "windows" && os.unixMode(info.mode) & 0o111 == 0
+		return path
+	}
+
+	// The names of the hooks that would run: the executable files of the
+	// hooks folder, the `.sample` files git installs left out.
+	internal def hookNamesOf(repo Repository) string[] {
+		let out string[]
+		let names = os.readDirNames(hooksDirOf(repo)) onerror recover string[]
+		names.sort((a string, b string) => a.compare(b) < 0)
+		for let name in names {
+			continue when name.endsWith(".sample")
+			out.push(name) unless hookFile(repo, name) is none
+		}
+		return out
+	}
+
+	// The program and arguments that run a hook file: the file itself, or
+	// on Windows the interpreter its first line names (`#!/bin/sh`,
+	// `#!/usr/bin/env python`), looked up on `PATH`.
+	internal def hookCommand(path string, args string[]) (string, string[]) {
+		return (path, args) unless __os__ == "windows"
+		let head = os.readFile(path) onerror recover byte[]
+		return (path, args) unless head.len() > 2 && head[0] == byte('#') && head[1] == byte('!')
+		let end = head.indexOf("\n".bytes())
+		end = head.len() when end < 0
+		let words = string(head[2:end]).trim().replace("\r", "").split(" ")
+		let names string[]
+		for let w in words {
+			names.push(w) unless w == ""
+		}
+		return (path, args) when names.len() == 0
+		let program = os.base(names[0])
+		let rest string[]
+		for let (i, w) in names {
+			rest.push(w) when i > 0
+		}
+		if program == "env" && rest.len() > 0 {
+			program = rest[0]
+			rest.remove(0)
+		}
+		return (program, rest + [path] + args)
+	}
+
+	// Runs the hook `name` as git does: `args` on its command line, `input`
+	// on its standard input, `env` added to this program's environment with
+	// `GIT_DIR` set, in the working tree (the git folder of a bare
+	// repository). What it writes to its standard output and error is
+	// gathered, given to `repo.onHook` when set, and returned. A hook that is
+	// not installed is a run with code 0 and no output. Fails when the hook
+	// could not be started.
+	internal def runHookOf(repo Repository, name string, args string[], input string, env map<string, string>) !HookRun {
+		let file = hookFile(repo, name)
+		return HookRun{name: name} when file is none
+		let vars = map<string, string>{"GIT_DIR": os.resolve(repo.gitDir) onerror recover repo.gitDir}
+		for let (k, v) in env {
+			vars[k] = v
+		}
+		let (program, argv) = hookCommand(file, args)
+		let p = try Runtime.start(program, argv, vars, hooksCwd(repo), errors = true)
+		// Written whole before anything is read: a hook reads its input
+		// before it writes much, as git's own do.
+		if input != "" {
+			try p.input.write(input.bytes())
+		}
+		try p.input.close()
+		let out = try io.readAll(p.output)
+		let errs = p.errors
+		let errText = errs is none ?? (byte[], try io.readAll(errs))
+		let code = try p.wait()
+		let ran = HookRun{name: name, code: code, output: string(out) + string(errText)}
+		let tell = repo.onHook
+		tell(ran) unless tell is none
+		return ran
+	}
+
+	// Runs a hook that may refuse what is being done: fails with what it
+	// wrote when it exits with a code other than 0.
+	internal def mustRunHook(repo Repository, name string, args string[], input string, env map<string, string>) !none {
+		let ran = try runHookOf(repo, name, args, input, env)
+		return none when ran.code == 0
+		let said = ran.output.trim()
+		fail "git: the {name} hook refused ({ran.code}){said == "" ?? ("", ": " + said)}"
+	}
+
+	// Runs the hooks of a commit before it is written: `pre-commit` (unless
+	// verification is off), then `prepare-commit-msg` and `commit-msg` on
+	// the message written to `COMMIT_EDITMSG`, which they may change.
+	// Returns the message as it stands after them. Fails when a hook
+	// refuses.
+	internal def commitHooks(repo Repository, message string, amended ?ObjectId, noVerify bool) !string {
+		let env = map<string, string>{"GIT_INDEX_FILE": os.join(repo.gitDir, "index"), "GIT_EDITOR": ":"}
+		try mustRunHook(repo, "pre-commit", [], "", env) unless noVerify
+		let path = os.join(repo.gitDir, "COMMIT_EDITMSG")
+		try os.writeFile(path, message.bytes())
+		let source = amended is none ?? (["message"], ["commit", amended.str()])
+		try mustRunHook(repo, "prepare-commit-msg", [path] + source, "", env)
+		try mustRunHook(repo, "commit-msg", [path], "", env) unless noVerify
+		return string(try os.readFile(path))
+	}
+
+	// Runs `pre-push` before a push: the remote's name (its URL when it has
+	// none) and URL as arguments, one line per reference to update on its
+	// input: the local reference (`(delete)` for a deletion), the id to
+	// push, the remote reference and the id it holds. Fails when the hook
+	// refuses.
+	internal def prePushHook(repo Repository, remote RemoteConfig, sending PushPlan[]) !none {
+		let lines string[]
+		for let p in sending {
+			lines.push("{p.local == "" ?? ("(delete)", p.local)} {p.after.str()} {p.remote} {p.before.str()}\n")
+		}
+		let name = remote.name == "" ?? (remote.pushUrl, remote.name)
+		try mustRunHook(repo, "pre-push", [name, remote.pushUrl], lines.join(""), {})
+		return none
+	}
+}
