@@ -193,7 +193,19 @@ partial module adm.dev.git {
 			let _ = try repo.commit("Add lib")
 			let inner = try repo.openSubmodule("vendor/lib")
 			fail "opened" unless (try inner.resolve("HEAD")).equals(subIds[1])
+			// A commit inside the submodule moves it: `add` on its path stages
+			// the new commit as the gitlink, and the parent commits it.
+			try os.writeFile(os.join(inner.workDir, "more.txt"), byte[]("more\n"))
+			try inner.add("more.txt")
+			let moved = try inner.commit("Move lib")
 			inner.close()
+			let before = try repo.status()
+			fail "not moved: {before.entries.len()}" unless before.entries.len() == 1 && before.entries[0].staged is none
+			try repo.add("vendor/lib")
+			let link = (try repo.index()).entry("vendor/lib")
+			fail "gitlink" unless !(link is none) && link.mode == 0o160000 && link.id.equals(moved)
+			let _ = try repo.commit("Move lib")
+			fail "not clean" unless (try repo.status()).entries.len() == 0
 			try repo.setSubmoduleBranch("vendor/lib", "main")
 			fail "branch" unless string(try os.readFile(os.join(repo.workDir, ".gitmodules"))).contains("branch = main")
 			try repo.setSubmoduleBranch("vendor/lib", "")

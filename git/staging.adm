@@ -217,7 +217,11 @@ partial module adm.dev.git {
 				idx.remove(e.path)
 				continue
 			}
-			if e.stage == 0 && statMatches(e, file, policy) && !racy(idx, e) && !e.intentToAdd {
+			if e.stage == 0 && !e.intentToAdd && (e.mode & 0o170000) == 0o160000 {
+				// A submodule's stat says nothing of its commit: it is staged
+				// again when the commit it has checked out is another.
+				continue when file.mode == 0o160000 && (try worktreeId(repo, e.path, file, idx)).equals(e.id)
+			} else if e.stage == 0 && statMatches(e, file, policy) && !racy(idx, e) && !e.intentToAdd {
 				continue
 			}
 			try stageFile(repo, idx, e.path, file, e.mode, options.intentToAdd && e.intentToAdd)
