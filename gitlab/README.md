@@ -35,10 +35,12 @@ let oauth = try gitlab.connect(accessToken, kind = gitlab.TokenKind.OAuth)
 Every operation of projects, groups, users, issues, merge requests (approvals, notes,
 discussions, diffs, merges), commits and statuses, branches, tags and their protection,
 pipelines, jobs and artifacts, CI variables, releases, packages and the container registry,
-snippets and search is a method on the object its path names: the client (`gl.projects`,
+snippets, labels, milestones and search is a method on the object its path names: the client (`gl.projects`,
 `gl.groups`, `gl.users`), a project (`gl.project("group/app")` or by ID), a group, a user or
 the signed-in user (`gl.me`), and the collections under them. Required parameters come first,
-the others are named and left out when not given.
+the others are named and left out when not given. A list re-read every sync round asks with the
+ETag of its last answer: `pages.ifChanged(etag)` is none when GitLab answers 304, else the page
+with the ETag to keep (`PageUpdate`).
 
 ```adm
 let mr = try project.mergeRequests.create("Add geo examples", "feature", "main", removeSourceBranch = true)

@@ -1996,6 +1996,46 @@ partial module adm.dev.gitlab {
 		webUrl string = ""
 	}
 
+	// A label of a project or one of its groups.
+	struct Label {
+		// The label's ID.
+		@json(omitempty = true)
+		id int = 0
+		// The label's name.
+		@json(omitempty = true)
+		name string = ""
+		// The colour, `#RRGGBB`.
+		@json(omitempty = true)
+		color string = ""
+		// The colour of text on it, `#RRGGBB`.
+		@json("text_color", omitempty = true)
+		textColor string = ""
+		// The label's description.
+		@json(omitempty = true)
+		description string = ""
+		// The description rendered as HTML.
+		@json("description_html", omitempty = true)
+		descriptionHtml string = ""
+		// Open issues with the label
+		@json("open_issues_count", omitempty = true)
+		openIssuesCount int = 0
+		// Closed issues with the label
+		@json("closed_issues_count", omitempty = true)
+		closedIssuesCount int = 0
+		// Open merge requests with the label
+		@json("open_merge_requests_count", omitempty = true)
+		openMergeRequestsCount int = 0
+		// Whether the caller is subscribed to the label.
+		@json(omitempty = true)
+		subscribed bool = false
+		// The priority among the project's labels; null for none.
+		@json(omitempty = true)
+		priority int = 0
+		// Whether the label is the project's own rather than a group's.
+		@json("is_project_label", omitempty = true)
+		isProjectLabel bool = false
+	}
+
 	// LdapGroupLink
 	struct LdapGroupLink {
 		@json(omitempty = true)

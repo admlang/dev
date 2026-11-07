@@ -1748,6 +1748,11 @@ partial module adm.dev.gitlab {
 				return new ProjectJobs(wire, id)
 			}
 		}
+		labels ProjectLabels {
+			def get() ProjectLabels {
+				return new ProjectLabels(wire, id)
+			}
+		}
 		members ProjectMembers {
 			def get() ProjectMembers {
 				return new ProjectMembers(wire, id)
@@ -1756,6 +1761,11 @@ partial module adm.dev.gitlab {
 		mergeRequests ProjectMergeRequests {
 			def get() ProjectMergeRequests {
 				return new ProjectMergeRequests(wire, id)
+			}
+		}
+		milestones ProjectMilestones {
+			def get() ProjectMilestones {
+				return new ProjectMilestones(wire, id)
 			}
 		}
 		packages ProjectPackages {
@@ -3987,6 +3997,78 @@ partial module adm.dev.gitlab {
 		}
 	}
 
+	// The labels of a project.
+	type ProjectLabels {
+		internal wire Link
+		internal id   string
+
+		def new(wire Link, id string) {
+			self.wire = wire
+			self.id = id
+		}
+
+		// create: Create a label.
+		// POST /api/v4/projects/{id}/labels
+		// Fails as Client's calls do.
+		def create(name string, color string, description ?string = none, priority ?int = none) !Label {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("name", name)
+			sentBody.put("color", color)
+			sentBody.put("description", description)
+			sentBody.put("priority", priority)
+			let answer = Label{}
+			try self.wire.call(http.Method.POST, "/projects/{segment(self.id)}/labels", sentQuery, sentBody, answer)
+			return answer
+		}
+
+		// delete: Delete a label.
+		// DELETE /api/v4/projects/{id}/labels/{label_id}
+		// Fails as Client's calls do.
+		def delete(labelId string) !none {
+			let sentQuery = new Params()
+			try self.wire.call(http.Method.DELETE, "/projects/{segment(self.id)}/labels/{segment(labelId)}", sentQuery, none, none)
+			return none
+		}
+
+		// get: Get a label.
+		// GET /api/v4/projects/{id}/labels/{label_id}
+		// Fails as Client's calls do.
+		def get(labelId string, includeAncestorGroups ?bool = none) !Label {
+			let sentQuery = new Params()
+			sentQuery.put("include_ancestor_groups", includeAncestorGroups)
+			let answer = Label{}
+			try self.wire.call(http.Method.GET, "/projects/{segment(self.id)}/labels/{segment(labelId)}", sentQuery, none, answer)
+			return answer
+		}
+
+		// list: List the labels of a project.
+		// GET /api/v4/projects/{id}/labels
+		// Fails when the first page is read: see Pages.
+		def list(withCounts ?bool = none, includeAncestorGroups ?bool = none, search ?string = none) Pages<Label> {
+			let sentQuery = new Params()
+			sentQuery.put("with_counts", withCounts)
+			sentQuery.put("include_ancestor_groups", includeAncestorGroups)
+			sentQuery.put("search", search)
+			return new Pages<Label>(self.wire, "/projects/{segment(self.id)}/labels", sentQuery)
+		}
+
+		// update: Update a label.
+		// PUT /api/v4/projects/{id}/labels/{label_id}
+		// Fails as Client's calls do.
+		def update(labelId string, newName ?string = none, color ?string = none, description ?string = none, priority ?int = none) !Label {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("new_name", newName)
+			sentBody.put("color", color)
+			sentBody.put("description", description)
+			sentBody.put("priority", priority)
+			let answer = Label{}
+			try self.wire.call(http.Method.PUT, "/projects/{segment(self.id)}/labels/{segment(labelId)}", sentQuery, sentBody, answer)
+			return answer
+		}
+	}
+
 	// The members of a project.
 	type ProjectMembers {
 		internal wire Link
@@ -4832,6 +4914,82 @@ partial module adm.dev.gitlab {
 		def versions(mergeRequestIid int) Pages<MergeRequestDiff> {
 			let sentQuery = new Params()
 			return new Pages<MergeRequestDiff>(self.wire, "/projects/{segment(self.id)}/merge_requests/{segment(mergeRequestIid)}/versions", sentQuery)
+		}
+	}
+
+	// The milestones of a project.
+	type ProjectMilestones {
+		internal wire Link
+		internal id   string
+
+		def new(wire Link, id string) {
+			self.wire = wire
+			self.id = id
+		}
+
+		// create: Create a milestone.
+		// POST /api/v4/projects/{id}/milestones
+		// Fails as Client's calls do.
+		def create(title string, description ?string = none, dueDate ?string = none, startDate ?string = none) !Milestone {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("title", title)
+			sentBody.put("description", description)
+			sentBody.put("due_date", dueDate)
+			sentBody.put("start_date", startDate)
+			let answer = Milestone{}
+			try self.wire.call(http.Method.POST, "/projects/{segment(self.id)}/milestones", sentQuery, sentBody, answer)
+			return answer
+		}
+
+		// delete: Delete a milestone.
+		// DELETE /api/v4/projects/{id}/milestones/{milestone_id}
+		// Fails as Client's calls do.
+		def delete(milestoneId int) !none {
+			let sentQuery = new Params()
+			try self.wire.call(http.Method.DELETE, "/projects/{segment(self.id)}/milestones/{segment(milestoneId)}", sentQuery, none, none)
+			return none
+		}
+
+		// get: Get a milestone.
+		// GET /api/v4/projects/{id}/milestones/{milestone_id}
+		// Fails as Client's calls do.
+		def get(milestoneId int) !Milestone {
+			let sentQuery = new Params()
+			let answer = Milestone{}
+			try self.wire.call(http.Method.GET, "/projects/{segment(self.id)}/milestones/{segment(milestoneId)}", sentQuery, none, answer)
+			return answer
+		}
+
+		// list: List the milestones of a project.
+		// GET /api/v4/projects/{id}/milestones
+		// Fails when the first page is read: see Pages.
+		def list(iids int[] = [], state ?string = none, title ?string = none, search ?string = none, includeAncestors ?bool = none, updatedBefore ?time.Time = none, updatedAfter ?time.Time = none) Pages<Milestone> {
+			let sentQuery = new Params()
+			sentQuery.put("iids[]", iids)
+			sentQuery.put("state", state)
+			sentQuery.put("title", title)
+			sentQuery.put("search", search)
+			sentQuery.put("include_ancestors", includeAncestors)
+			sentQuery.put("updated_before", updatedBefore)
+			sentQuery.put("updated_after", updatedAfter)
+			return new Pages<Milestone>(self.wire, "/projects/{segment(self.id)}/milestones", sentQuery)
+		}
+
+		// update: Update a milestone.
+		// PUT /api/v4/projects/{id}/milestones/{milestone_id}
+		// Fails as Client's calls do.
+		def update(milestoneId int, title ?string = none, description ?string = none, dueDate ?string = none, startDate ?string = none, stateEvent ?string = none) !Milestone {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("title", title)
+			sentBody.put("description", description)
+			sentBody.put("due_date", dueDate)
+			sentBody.put("start_date", startDate)
+			sentBody.put("state_event", stateEvent)
+			let answer = Milestone{}
+			try self.wire.call(http.Method.PUT, "/projects/{segment(self.id)}/milestones/{segment(milestoneId)}", sentQuery, sentBody, answer)
+			return answer
 		}
 	}
 

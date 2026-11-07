@@ -37,6 +37,28 @@ partial module adm.dev.gitlab {
 			return items
 		}
 
+		// ifChanged returns a page as `page` does, with the ETag GitLab
+		// gave it, unless the list is as it was when `etag` was given: then
+		// none, GitLab answering 304 with no body (If-None-Match), which
+		// counts against no rate limit. A sync that re-reads a list every
+		// round keeps the ETag of the last answer and asks with it.
+		//
+		// ```
+		// let fresh = try project.labels.list().ifChanged(lastEtag)
+		// if !(fresh is none) {
+		//     lastEtag = fresh.etag
+		//     labels = fresh.items
+		// }
+		// ```
+		//
+		// Fails as Client's calls do.
+		def ifChanged(etag string, number int = 1, size int = 20) !?PageUpdate<T> {
+			let (data, res) = try link.exchange(http.Method.GET, urlOf(number, size), none, "application/json", etag)
+			return none when res.status == 304
+			let items = try itemsOf(data, urlOf(number, size))
+			return PageUpdate<T>{items: items, etag: res.header("ETag")}
+		}
+
 		// all walks every page, fetching the next as the iteration reaches
 		// it (the answer's `Link: rel="next"`); at most `limit` objects when
 		// above 0. The first page is read at once.
@@ -60,13 +82,27 @@ partial module adm.dev.gitlab {
 		// Fails as Client's calls do.
 		def fetch(target string) !(T[], string, int) {
 			let (data, res) = try link.exchange(http.Method.GET, target, none)
+			let items = try itemsOf(data, target)
+			let total = res.header("X-Total")
+			return (items, nextLink(res.header("Link")), total.isNumeric() ?? (total.toInt<int>(), -1))
+		}
+
+		// The objects of a page's body.
+		// Fails with ErrorKind.Protocol when the body is not a list of them.
+		internal def itemsOf(data byte[], target string) !T[] {
 			let items T[] = []
 			new JSON().decode(data, items) onerror (err error) {
 				fail errorOf(ErrorKind.Protocol, "gitlab: GET {target}: the page is not a list: {err.message}", cause = err)
 			}
-			let total = res.header("X-Total")
-			return (items, nextLink(res.header("Link")), total.isNumeric() ?? (total.toInt<int>(), -1))
+			return items
 		}
+	}
+
+	// PageUpdate is a page `Pages.ifChanged` found changed: its objects and
+	// the ETag to ask with next time.
+	struct PageUpdate<T> {
+		items T[]
+		etag  string
 	}
 
 	// PageStream is every object of a list, fetched a page at a time as

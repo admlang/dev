@@ -47,7 +47,7 @@ partial module adm.dev.gitlab {
 			paths.push("{method} {path}")
 			bodies.push(try ctx.text())
 			let picked map<string, string> = {}
-			for let name in ["PRIVATE-TOKEN", "JOB-TOKEN", "Authorization", "Content-Type", "User-Agent"] {
+			for let name in ["PRIVATE-TOKEN", "JOB-TOKEN", "Authorization", "Content-Type", "User-Agent", "If-None-Match"] {
 				picked[name] = ctx.header(name) unless ctx.header(name) == ""
 			}
 			headers.push(picked)
@@ -103,6 +103,28 @@ partial module adm.dev.gitlab {
 	}
 
 	check "Client" {
+		// A page asked for with the ETag of the answer before comes back
+		// as none when GitLab answers 304, the request carrying If-None-Match.
+		@test()
+		def TestConditionalPages() !none {
+			let fake = new FakeGitLab()
+			fake.answer("GET /api/v4/projects/g%2Fp/labels", 200, `[{"id":1,"name":"bug","color":"#ff0000"}]`, {"ETag": `W/"v1"`})
+			fake.answer("GET /api/v4/projects/g%2Fp/labels", 304, "")
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
+			let labels = gl.project("g/p").labels.list()
+			let fresh = try labels.ifChanged("")
+			assert !(fresh is none)
+			if fresh is PageUpdate<Label> {
+				assert fresh.items.len() == 1 && fresh.items[0].name == "bug" && fresh.etag == `W/"v1"`
+				let again = try labels.ifChanged(fresh.etag)
+				assert again is none
+			}
+			assert !fake.headers[0].hasKey("If-None-Match") && fake.headers[1]["If-None-Match"] == `W/"v1"`
+			return none
+		}
+
 		@test()
 		def TestRequestsAndErrors() !none {
 			let fake = new FakeGitLab()

@@ -1,7 +1,8 @@
 # Endpoints of GitLab's REST API that its OpenAPI document (doc/api/openapi/openapi_v2.yaml)
 # does not describe yet, or describes otherwise than the API answers, written from the API
 # documentation (docs.gitlab.com/api/users, /api/notes, /api/discussions, /api/search,
-# /api/repository_files, /api/project_level_variables) in the document's own form;
+# /api/repository_files, /api/project_level_variables, /api/labels, /api/milestones) in the
+# document's own form;
 # tools/generate.py takes an operation from here over the document's. Entities named
 # API_Entities_* are the document's.
 paths:
@@ -368,9 +369,137 @@ paths:
         - {name: page, in: query, type: integer}
       responses:
         "200": {description: The variables, schema: {type: array, items: {$ref: "#/definitions/API_Entities_Ci_Variable"}}}
+  /api/v4/projects/{id}/labels:
+    get:
+      summary: List the labels of a project
+      tags: [labels]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: with_counts, in: query, type: boolean, description: Add the counts of open and closed issues and open merge requests.}
+        - {name: include_ancestor_groups, in: query, type: boolean, description: Include the labels of the project's groups (true by default).}
+        - {name: search, in: query, type: string, description: Labels whose name or description contains this.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The labels, schema: {type: array, items: {$ref: "#/definitions/Label"}}}
+    post:
+      summary: Create a label
+      tags: [labels]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: name, in: formData, required: true, type: string, description: The label's name.}
+        - {name: color, in: formData, required: true, type: string, description: "The colour, `#RRGGBB` or a CSS colour name."}
+        - {name: description, in: formData, type: string, description: The label's description.}
+        - {name: priority, in: formData, type: integer, description: The priority among the project's labels; none for no priority.}
+      responses:
+        "201": {description: The label, schema: {$ref: "#/definitions/Label"}}
+  /api/v4/projects/{id}/labels/{label_id}:
+    get:
+      summary: Get a label
+      tags: [labels]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: label_id, in: path, required: true, type: string, description: The label's ID or name.}
+        - {name: include_ancestor_groups, in: query, type: boolean, description: Look among the project's groups' labels too (true by default).}
+      responses:
+        "200": {description: The label, schema: {$ref: "#/definitions/Label"}}
+    put:
+      summary: Update a label
+      tags: [labels]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: label_id, in: path, required: true, type: string, description: The label's ID or name.}
+        - {name: new_name, in: formData, type: string, description: The new name.}
+        - {name: color, in: formData, type: string, description: "The new colour, `#RRGGBB` or a CSS colour name."}
+        - {name: description, in: formData, type: string, description: The new description.}
+        - {name: priority, in: formData, type: integer, description: The new priority.}
+      responses:
+        "200": {description: The label, schema: {$ref: "#/definitions/Label"}}
+    delete:
+      summary: Delete a label
+      tags: [labels]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: label_id, in: path, required: true, type: string, description: The label's ID or name.}
+      responses:
+        "204": {description: Deleted.}
+  /api/v4/projects/{id}/milestones:
+    get:
+      summary: List the milestones of a project
+      tags: [milestones]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: "iids[]", in: query, type: array, items: {type: integer}, description: Only the milestones with these IIDs.}
+        - {name: state, in: query, type: string, description: active or closed.}
+        - {name: title, in: query, type: string, description: Only the milestone with this title.}
+        - {name: search, in: query, type: string, description: Milestones whose title or description contains this.}
+        - {name: include_ancestors, in: query, type: boolean, description: Include the milestones of the project's groups.}
+        - {name: updated_before, in: query, type: string, format: date-time, description: Only milestones updated before this time.}
+        - {name: updated_after, in: query, type: string, format: date-time, description: Only milestones updated after this time.}
+        - {name: per_page, in: query, type: integer}
+        - {name: page, in: query, type: integer}
+      responses:
+        "200": {description: The milestones, schema: {type: array, items: {$ref: "#/definitions/API_Entities_Milestone"}}}
+    post:
+      summary: Create a milestone
+      tags: [milestones]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: title, in: formData, required: true, type: string, description: The milestone's title.}
+        - {name: description, in: formData, type: string, description: The milestone's description.}
+        - {name: due_date, in: formData, type: string, description: The due date, YYYY-MM-DD.}
+        - {name: start_date, in: formData, type: string, description: The start date, YYYY-MM-DD.}
+      responses:
+        "201": {description: The milestone, schema: {$ref: "#/definitions/API_Entities_Milestone"}}
+  /api/v4/projects/{id}/milestones/{milestone_id}:
+    get:
+      summary: Get a milestone
+      tags: [milestones]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: milestone_id, in: path, required: true, type: integer, description: The milestone's ID.}
+      responses:
+        "200": {description: The milestone, schema: {$ref: "#/definitions/API_Entities_Milestone"}}
+    put:
+      summary: Update a milestone
+      tags: [milestones]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: milestone_id, in: path, required: true, type: integer, description: The milestone's ID.}
+        - {name: title, in: formData, type: string, description: The new title.}
+        - {name: description, in: formData, type: string, description: The new description.}
+        - {name: due_date, in: formData, type: string, description: The new due date, YYYY-MM-DD.}
+        - {name: start_date, in: formData, type: string, description: The new start date, YYYY-MM-DD.}
+        - {name: state_event, in: formData, type: string, description: close or activate.}
+      responses:
+        "200": {description: The milestone, schema: {$ref: "#/definitions/API_Entities_Milestone"}}
+    delete:
+      summary: Delete a milestone
+      tags: [milestones]
+      parameters:
+        - {$ref: "#/parameters/ProjectId"}
+        - {name: milestone_id, in: path, required: true, type: integer, description: The milestone's ID.}
+      responses:
+        "204": {description: Deleted.}
 parameters:
   ProjectId: {name: id, in: path, required: true, type: string, description: The project's ID or path (group/project).}
 definitions:
+  Label:
+    type: object
+    description: A label of a project or one of its groups.
+    properties:
+      id: {type: integer, description: The label's ID.}
+      name: {type: string, description: The label's name.}
+      color: {type: string, description: "The colour, `#RRGGBB`."}
+      text_color: {type: string, description: "The colour of text on it, `#RRGGBB`."}
+      description: {type: string, description: The label's description.}
+      description_html: {type: string, description: The description rendered as HTML.}
+      open_issues_count: {type: integer, description: Open issues with the label, with `with_counts`.}
+      closed_issues_count: {type: integer, description: Closed issues with the label, with `with_counts`.}
+      open_merge_requests_count: {type: integer, description: Open merge requests with the label, with `with_counts`.}
+      subscribed: {type: boolean, description: Whether the caller is subscribed to the label.}
+      priority: {type: integer, description: The priority among the project's labels; null for none.}
+      is_project_label: {type: boolean, description: Whether the label is the project's own rather than a group's.}
   FileCommit:
     type: object
     description: A file a commit made or changed.

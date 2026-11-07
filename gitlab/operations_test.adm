@@ -687,6 +687,21 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").jobs.trace(1)
 			assert fake.last("GET", "/api/v4/projects/*/jobs/*/trace")
+			fake.body = "{}"
+			try gl.project("g/p").labels.create("x", "x")
+			assert fake.last("POST", "/api/v4/projects/*/labels")
+			fake.body = "{}"
+			try gl.project("g/p").labels.delete("x")
+			assert fake.last("DELETE", "/api/v4/projects/*/labels/*")
+			fake.body = "{}"
+			try gl.project("g/p").labels.get("x")
+			assert fake.last("GET", "/api/v4/projects/*/labels/*")
+			fake.body = "[]"
+			try gl.project("g/p").labels.list().page(1)
+			assert fake.last("GET", "/api/v4/projects/*/labels")
+			fake.body = "{}"
+			try gl.project("g/p").labels.update("x")
+			assert fake.last("PUT", "/api/v4/projects/*/labels/*")
 			fake.body = "[]"
 			try gl.project("g/p").members.all().page(1)
 			assert fake.last("GET", "/api/v4/projects/*/members/all")
@@ -744,6 +759,15 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").mergeRequests.createApproval(1, 1)
 			assert fake.last("POST", "/api/v4/projects/*/merge_requests/*/approvals")
+			return none
+		}
+
+		@test()
+		def TestOperations5() !none {
+			let fake = new FakeGitLab()
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
 			fake.body = "{}"
 			try gl.project("g/p").mergeRequests.createAwardEmoji(1, "x")
 			assert fake.last("POST", "/api/v4/projects/*/merge_requests/*/award_emoji")
@@ -759,15 +783,6 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").mergeRequests.createDraftNote(1, "x")
 			assert fake.last("POST", "/api/v4/projects/*/merge_requests/*/draft_notes")
-			return none
-		}
-
-		@test()
-		def TestOperations5() !none {
-			let fake = new FakeGitLab()
-			let server = try fakeGitLab(fake)
-			defer server.close()
-			let gl = try fakeClient(server)
 			fake.body = "{}"
 			try gl.project("g/p").mergeRequests.createNote(1, "x")
 			assert fake.last("POST", "/api/v4/projects/*/merge_requests/*/notes")
@@ -904,6 +919,21 @@ partial module adm.dev.gitlab {
 			try gl.project("g/p").mergeRequests.versions(1).page(1)
 			assert fake.last("GET", "/api/v4/projects/*/merge_requests/*/versions")
 			fake.body = "{}"
+			try gl.project("g/p").milestones.create("x")
+			assert fake.last("POST", "/api/v4/projects/*/milestones")
+			fake.body = "{}"
+			try gl.project("g/p").milestones.delete(1)
+			assert fake.last("DELETE", "/api/v4/projects/*/milestones/*")
+			fake.body = "{}"
+			try gl.project("g/p").milestones.get(1)
+			assert fake.last("GET", "/api/v4/projects/*/milestones/*")
+			fake.body = "[]"
+			try gl.project("g/p").milestones.list().page(1)
+			assert fake.last("GET", "/api/v4/projects/*/milestones")
+			fake.body = "{}"
+			try gl.project("g/p").milestones.update(1)
+			assert fake.last("PUT", "/api/v4/projects/*/milestones/*")
+			fake.body = "{}"
 			try gl.project("g/p").packages.createProtectionRule("x", "x")
 			assert fake.last("POST", "/api/v4/projects/*/packages/protection/rules")
 			fake.body = "{}"
@@ -918,6 +948,15 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").packages.get(1)
 			assert fake.last("GET", "/api/v4/projects/*/packages/*")
+			return none
+		}
+
+		@test()
+		def TestOperations6() !none {
+			let fake = new FakeGitLab()
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
 			fake.body = "[]"
 			try gl.project("g/p").packages.list().page(1)
 			assert fake.last("GET", "/api/v4/projects/*/packages")
@@ -948,15 +987,6 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").pipelineSchedules.deleteVariable(1, "x")
 			assert fake.last("DELETE", "/api/v4/projects/*/pipeline_schedules/*/variables/*")
-			return none
-		}
-
-		@test()
-		def TestOperations6() !none {
-			let fake = new FakeGitLab()
-			let server = try fakeGitLab(fake)
-			defer server.close()
-			let gl = try fakeClient(server)
 			fake.body = "{}"
 			try gl.project("g/p").pipelineSchedules.get(1)
 			assert fake.last("GET", "/api/v4/projects/*/pipeline_schedules/*")
@@ -1107,6 +1137,15 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").releases.update("x")
 			assert fake.last("PUT", "/api/v4/projects/*/releases/*")
+			return none
+		}
+
+		@test()
+		def TestOperations7() !none {
+			let fake = new FakeGitLab()
+			let server = try fakeGitLab(fake)
+			defer server.close()
+			let gl = try fakeClient(server)
 			fake.body = "{}"
 			try gl.project("g/p").releases.updateAssetsLink("x", 1)
 			assert fake.last("PUT", "/api/v4/projects/*/releases/*/assets/links/*")
@@ -1137,15 +1176,6 @@ partial module adm.dev.gitlab {
 			fake.body = "{}"
 			try gl.project("g/p").snippets.createAwardEmoji(1, "x")
 			assert fake.last("POST", "/api/v4/projects/*/snippets/*/award_emoji")
-			return none
-		}
-
-		@test()
-		def TestOperations7() !none {
-			let fake = new FakeGitLab()
-			let server = try fakeGitLab(fake)
-			defer server.close()
-			let gl = try fakeClient(server)
 			fake.body = "{}"
 			try gl.project("g/p").snippets.createNotesAwardEmoji(1, 1, "x")
 			assert fake.last("POST", "/api/v4/projects/*/snippets/*/notes/*/award_emoji")
