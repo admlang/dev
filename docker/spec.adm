@@ -14,97 +14,149 @@ partial module adm.dev.docker {
 	// }, name = "web")
 	// ```
 	struct ContainerSpec {
-		image             string
+		image                string
 		// The command and its arguments; empty runs the image's.
-		cmd               string[]
-		entrypoint        string[]
-		env               map<string, string>
-		labels            map<string, string>
-		workingDir        string
+		cmd                  string[]
+		entrypoint           string[]
+		env                  map<string, string>
+		labels               map<string, string>
+		workingDir           string
 		// `user`, `user:group`, `uid:gid`.
-		user              string
-		hostname          string
-		domainname        string
+		user                 string
+		hostname             string
+		domainname           string
 		// Give the process a terminal: its output is one stream, not
 		// stdout and stderr apart.
-		tty               bool
+		tty                  bool
 		// Keep the standard input open for `attach`.
-		openStdin         bool
+		openStdin            bool
 		// Close the standard input when the first attached client leaves.
-		stdinOnce         bool
+		stdinOnce            bool
 		// Ports the container listens on, `"8080/tcp"`, beyond the image's.
-		exposedPorts      string[]
+		exposedPorts         string[]
 		// The signal `stop` sends; "" takes the image's (SIGTERM).
-		stopSignal        string
+		stopSignal           string
 		// How long `stop` waits before it kills; none takes the engine's
 		// (10 s).
-		stopTimeout       ?duration
-		healthcheck       ?HealthCheck
+		stopTimeout          ?duration
+		healthcheck          ?HealthCheck
 		// Anonymous volumes, by the path they are mounted on.
-		volumes           string[]
+		volumes              string[]
 		// The shell of the image's `RUN`, `CMD` and `ENTRYPOINT` in shell
 		// form.
-		shell             string[]
+		shell                string[]
 		// Container ports published on the host: `{"5432/tcp": 5432}`; a
 		// port without a protocol is TCP. `portBindings` names host
 		// addresses too.
-		ports             map<string, int>
-		portBindings      map<string, PortBinding[]>
+		ports                map<string, int>
+		portBindings         map<string, PortBinding[]>
 		// Publish every exposed port on a random host port.
-		publishAll        bool
-		mounts            Mount[]
+		publishAll           bool
+		mounts               Mount[]
 		// Mounts in the short form, `/host/path:/container/path:ro`.
-		binds             string[]
-		restart           ?RestartPolicy
+		binds                string[]
+		restart              ?RestartPolicy
 		// `bridge`, `host`, `none`, `container:<name>`, or a network's
 		// name; "" is the engine's default bridge.
-		network           string
+		network              string
 		// Networks to join besides, with this container's settings in each.
-		networks          map<string, NetworkEndpoint>
+		networks             map<string, NetworkEndpoint>
 		// Bytes of memory the container may use; 0 for no limit.
-		memory            int
+		memory               int
 		// Memory and swap together; -1 for unlimited swap.
-		memorySwap        int
-		memoryReservation int
+		memorySwap           int
+		memoryReservation    int
 		// CPUs as a fraction: 1.5 is one and a half.
-		cpus              float
+		cpus                 float
 		// The relative weight against other containers (1024 by default).
-		cpuShares         int
+		cpuShares            int
 		// The CPUs the container may run on: `0-3`, `0,2`.
-		cpusetCpus        string
+		cpusetCpus           string
 		// How many processes it may hold; 0 for no limit.
-		pidsLimit         int
-		ulimits           Ulimit[]
-		devices           DeviceMapping[]
+		pidsLimit            int
+		ulimits              Ulimit[]
+		devices              DeviceMapping[]
 		// GPUs and other devices a driver hands out: `[DeviceRequest{driver:
 		// "nvidia", count: -1, capabilities: [["gpu"]]}]` for every GPU.
-		deviceRequests    DeviceRequest[]
-		capAdd            string[]
-		capDrop           string[]
-		privileged        bool
-		readonlyRootfs    bool
-		securityOpt       string[]
+		deviceRequests       DeviceRequest[]
+		capAdd               string[]
+		capDrop              string[]
+		privileged           bool
+		readonlyRootfs       bool
+		securityOpt          string[]
 		// Remove the container when it exits.
-		autoRemove        bool
+		autoRemove           bool
 		// Run an init process that reaps zombies and forwards signals.
-		init              bool
+		init                 bool
 		// Lines added to `/etc/hosts`: `host:ip`.
-		extraHosts        string[]
-		dns               string[]
-		dnsSearch         string[]
-		dnsOptions        string[]
+		extraHosts           string[]
+		dns                  string[]
+		dnsSearch            string[]
+		dnsOptions           string[]
 		// tmpfs mounts by path, with their mount options.
-		tmpfs             map<string, string>
+		tmpfs                map<string, string>
 		// Bytes of `/dev/shm`; 0 takes the engine's (64 MiB).
-		shmSize           int
-		sysctls           map<string, string>
-		ipcMode           string
-		pidMode           string
-		usernsMode        string
-		groupAdd          string[]
+		shmSize              int
+		sysctls              map<string, string>
+		ipcMode              string
+		pidMode              string
+		usernsMode           string
+		groupAdd             string[]
 		// The runtime, `runc` by default.
-		runtime           string
-		logConfig         ?LogConfig
+		runtime              string
+		logConfig            ?LogConfig
+		// Volumes taken over from other containers: `name` or `name:ro`.
+		volumesFrom          string[]
+		// Legacy links to other containers: `name:alias`.
+		links                string[]
+		// The cgroup the container's own is made under.
+		cgroupParent         string
+		// `private` or `host`.
+		cgroupnsMode         string
+		// The OOM killer's preference for the process, -1000 to 1000.
+		oomScoreAdj          int
+		oomKillDisable       bool
+		// How readily the kernel swaps the container's memory, 0 to 100;
+		// none takes the engine's.
+		memorySwappiness     ?int
+		// Block I/O weight against other containers, 10 to 1000; 0 for the
+		// engine's.
+		blkioWeight          int
+		blkioWeightDevice    WeightDevice[]
+		blkioDeviceReadBps   ThrottleDevice[]
+		blkioDeviceWriteBps  ThrottleDevice[]
+		blkioDeviceReadIOps  ThrottleDevice[]
+		blkioDeviceWriteIOps ThrottleDevice[]
+		// CFS period and quota in microseconds; 0 for the engine's.
+		cpuPeriod            int
+		cpuQuota             int
+		cpuRealtimePeriod    int
+		cpuRealtimeRuntime   int
+		// CPUs and the share of them, on Windows.
+		cpuCount             int
+		cpuPercent           int
+		// Device cgroup rules, `c 13:* rwm`.
+		deviceCgroupRules    string[]
+		// Storage driver options, `size: 120G`.
+		storageOpt           map<string, string>
+		// `host` shares the host's UTS namespace.
+		utsMode              string
+		// Isolation technology on Windows: `default`, `process`, `hyperv`.
+		isolation            string
+		// Arbitrary notes the runtime is given (API 1.43 or later).
+		annotations          map<string, string>
+	}
+
+	// WeightDevice is a block I/O weight for one device.
+	struct WeightDevice {
+		path   string
+		weight int
+	}
+
+	// ThrottleDevice is a byte or operation rate per second for one device.
+	struct ThrottleDevice {
+		path string
+		rate int
 	}
 
 	// PortBinding is a host address and port a container port is published
@@ -172,11 +224,18 @@ partial module adm.dev.docker {
 
 	// NetworkEndpoint is a container's settings in one network.
 	struct NetworkEndpoint {
-		aliases     string[]
-		ipv4Address string
-		ipv6Address string
-		links       string[]
-		driverOpts  map<string, string>
+		aliases      string[]
+		ipv4Address  string
+		ipv6Address  string
+		// Link-local addresses of the endpoint.
+		linkLocalIPs string[]
+		links        string[]
+		driverOpts   map<string, string>
+		// The endpoint's MAC address (API 1.44 or later).
+		macAddress   string
+		// The order the container's default gateway is chosen in (API 1.48
+		// or later); 0 leaves it to the engine.
+		gwPriority   int
 	}
 
 	// Ulimit is a resource limit: `nofile` with its soft and hard values.

@@ -136,9 +136,9 @@ internal partial module adm.dev.docker.api {
 	// API names these in lower case.
 	struct AuthBody {
 		@json("username")
-		username      string
+		username string
 		@json("password")
-		password      string
+		password string
 		@json("serveraddress")
 		serveraddress string
 		@json("identitytoken")

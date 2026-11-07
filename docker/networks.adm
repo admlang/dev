@@ -19,21 +19,19 @@ partial module adm.dev.docker {
 
 		// create makes a network and returns it. `subnets` gives it address
 		// ranges (`Subnet{subnet: "10.20.0.0/16", gateway: "10.20.0.1"}`);
-		// none lets the engine pick. `internalOnly` keeps it from the outside,
-		// `attachable` lets standalone containers join a swarm network.
+		// none lets the engine pick; `ipamDriver` and `ipamOptions` are the
+		// address manager they go to (`default` without). `internalOnly`
+		// keeps it from the outside, `attachable` lets standalone containers
+		// join a swarm network, `enableIPv4` false makes an IPv6-only network
+		// (API 1.48 or later; none leaves it to the engine).
 		// Fails as the type says, with ErrorKind.Conflict when the name is
-		// taken.
-		def create(name string, driver string = "bridge", internalOnly bool = false, attachable bool = false, enableIPv6 bool = false, labels map<string, string> = {}, options map<string, string> = {}, subnets Subnet[] = []) !NetworkInfo {
-			let body = NetworkBody{name: name, driver: driver, internalOnly: internalOnly, attachable: attachable, enableIPv6: enableIPv6, labels: labels, options: options}
-			if subnets.len() > 0 {
-				let ranges SubnetBody[] = []
-				for let range in subnets {
-					ranges.push(SubnetBody{subnet: range.subnet, ipRange: range.ipRange, gateway: range.gateway, auxiliaryAddresses: range.auxiliaryAddresses})
-				}
-				body.ipam = IpamBody{driver: "default", config: ranges}
-			}
+		// taken and ErrorKind.Argument for `enableIPv4` on an older engine.
+		def create(name string, driver string = "bridge", internalOnly bool = false, attachable bool = false, enableIPv6 bool = false, labels map<string, string> = {}, options map<string, string> = {}, subnets Subnet[] = [], ipamDriver string = "default", ipamOptions map<string, string> = {}, enableIPv4 ?bool = none) !NetworkInfo {
+			let link = try core.wire()
+			fail errorOf(ErrorKind.Argument, "docker: enableIPv4 needs API 1.48, the engine speaks {link.version}") unless enableIPv4 is none || versionHas(link.version, "1.48")
+			let body = networkBody(name, driver, internalOnly, attachable, enableIPv6, labels, options, subnets, ipamDriver, ipamOptions, enableIPv4)
 			let reply = CreatedReply{}
-			try (try core.wire()).call(http.Method.POST, "/networks/create", body = body, target = reply)
+			try link.call(http.Method.POST, "/networks/create", body = body, target = reply)
 			return try inspect(reply.id)
 		}
 
@@ -92,6 +90,21 @@ partial module adm.dev.docker {
 			try (try core.wire()).call(http.Method.POST, "/networks/{url.pathEscape(network)}/disconnect", body = DisconnectBody{container: container, force: force})
 			return none
 		}
+	}
+
+	// networkBody is the create request of a network: the address manager
+	// goes along when a subnet, a driver other than the default or an
+	// option names it.
+	internal def networkBody(name string, driver string, internalOnly bool, attachable bool, enableIPv6 bool, labels map<string, string>, options map<string, string>, subnets Subnet[], ipamDriver string, ipamOptions map<string, string>, enableIPv4 ?bool) NetworkBody {
+		let body = NetworkBody{name: name, driver: driver, internalOnly: internalOnly, attachable: attachable, enableIPv6: enableIPv6, enableIPv4: enableIPv4, labels: labels, options: options}
+		if subnets.len() > 0 || ipamDriver != "default" || ipamOptions.len() > 0 {
+			let ranges SubnetBody[] = []
+			for let range in subnets {
+				ranges.push(SubnetBody{subnet: range.subnet, ipRange: range.ipRange, gateway: range.gateway, auxiliaryAddresses: range.auxiliaryAddresses})
+			}
+			body.ipam = IpamBody{driver: ipamDriver == "" ?? ("default", ipamDriver), config: ranges, options: ipamOptions}
+		}
+		return body
 	}
 
 	// Subnet is an address range of a network.

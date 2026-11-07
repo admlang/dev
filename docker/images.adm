@@ -82,42 +82,47 @@ partial module adm.dev.docker {
 		// build builds an image from a folder with a Dockerfile, as `docker
 		// build` does with the classic builder, and returns the image's id.
 		// The folder goes to the engine less what its `.dockerignore` leaves
-		// out. `output` hears each line the build prints.
+		// out; `dockerfileText` is the Dockerfile itself, sent under
+		// `dockerfile` in place of any file of that name in the folder.
+		// `output` hears each line the build prints. `cacheFrom` names
+		// images whose layers may serve as cache, `extraHosts` adds
+		// `host:ip` lines to the build's `/etc/hosts`, `networkMode`,
+		// `shmSize` (bytes), `ulimits` and `isolation` apply to the build's
+		// containers. A `build` handle made beforehand stops the build from
+		// another task (`ImageBuild.cancel`).
 		//
 		// ```
 		// let id = try engine.images.build("./api", tags = ["acme/api:dev"], buildArgs = {"VERSION": "1.4"})
 		// ```
 		//
 		// Fails as the type says, with ErrorKind.Argument when the folder
-		// cannot be read and ErrorKind.Server when a step fails.
-		def build(context string, tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none) !string {
-			let tar = try packContext(context, dockerfile)
-			return try build(tar, tags, dockerfile, buildArgs, target, labels, noCache, pull, platform, output)
+		// cannot be read, ErrorKind.Server when a step fails and
+		// ErrorKind.Closed when the build was cancelled.
+		def build(context string, tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none, dockerfileText string = "", cacheFrom string[] = [], extraHosts string[] = [], networkMode string = "", shmSize int = 0, ulimits Ulimit[] = [], isolation string = "", build ?ImageBuild = none) !string {
+			let tar = try packContext(context, dockerfile, dockerfileText)
+			return try build(tar, tags, dockerfile, buildArgs, target, labels, noCache, pull, platform, output, cacheFrom, extraHosts, networkMode, shmSize, ulimits, isolation, build)
 		}
 
 		// build builds an image from a build context packed as tar; see the
 		// folder overload.
 		// Fails as the folder overload does.
-		def build(contextTar byte[], tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none) !string {
-			let query = new url.Values()
-			for let tag in tags {
-				query.add("t", tag)
-			}
-			query.set("dockerfile", dockerfile)
-			query.set("buildargs", string(new encoding.JSON().encode(buildArgs))) when buildArgs.len() > 0
-			query.set("labels", string(new encoding.JSON().encode(labels))) when labels.len() > 0
-			query.set("target", target) unless target == ""
-			query.set("nocache", "true") when noCache
-			query.set("pull", "true") when pull
-			query.set("platform", platform) unless platform == ""
-			query.set("rm", "true")
-			query.set("version", "1")
+		def build(contextTar byte[], tags string[] = [], dockerfile string = "Dockerfile", buildArgs map<string, string> = {}, target string = "", labels map<string, string> = {}, noCache bool = false, pull bool = false, platform string = "", output ?def (line string) = none, cacheFrom string[] = [], extraHosts string[] = [], networkMode string = "", shmSize int = 0, ulimits Ulimit[] = [], isolation string = "", build ?ImageBuild = none) !string {
+			let query = buildQuery(tags, dockerfile, buildArgs, target, labels, noCache, pull, platform, cacheFrom, extraHosts, networkMode, shmSize, ulimits, isolation)
 			let headers = {"X-Registry-Config": registryConfigHeader(core)}
+			fail errorOf(ErrorKind.Closed, "docker: the build was cancelled") when !(build is none) && build.cancelled()
 			let res = try (try core.wire()).send(http.Method.POST, "/build", query, new bytes.Reader(contextTar), "application/x-tar", headers, false)
+			if !(build is none) && !build.attach(res) {
+				res.close() onerror recover none
+				fail errorOf(ErrorKind.Closed, "docker: the build was cancelled")
+			}
 			let lines = new BuildLines(output)
-			let id = try followProgress(res, "building", def (update Progress) {
+			let id = followProgress(res, "building", def (update Progress) {
 				lines.hear(update)
-			})
+			}) onerror (err error) {
+				fail errorOf(ErrorKind.Closed, "docker: the build was cancelled") when !(build is none) && build.cancelled()
+				fail err
+			}
+			build.detach() unless build is none
 			fail errorOf(ErrorKind.Protocol, "docker: the build ended without an image id") when id == ""
 			return id
 		}
@@ -313,5 +318,78 @@ partial module adm.dev.docker {
 	struct ImageRemoval {
 		untagged string
 		deleted  string
+	}
+
+	// buildQuery is the query of a classic build: the lists the engine
+	// takes as JSON (`buildargs`, `labels`, `cachefrom`, `extrahosts`,
+	// `ulimits`) are encoded so, the rest as text.
+	internal def buildQuery(tags string[], dockerfile string, buildArgs map<string, string>, target string, labels map<string, string>, noCache bool, pull bool, platform string, cacheFrom string[], extraHosts string[], networkMode string, shmSize int, ulimits Ulimit[], isolation string) url.Values {
+		let query = new url.Values()
+		for let tag in tags {
+			query.add("t", tag)
+		}
+		query.set("dockerfile", dockerfile)
+		query.set("buildargs", string(new encoding.JSON().encode(buildArgs))) when buildArgs.len() > 0
+		query.set("labels", string(new encoding.JSON().encode(labels))) when labels.len() > 0
+		query.set("target", target) unless target == ""
+		query.set("nocache", "true") when noCache
+		query.set("pull", "true") when pull
+		query.set("platform", platform) unless platform == ""
+		query.set("cachefrom", string(new encoding.JSON().encode(cacheFrom))) when cacheFrom.len() > 0
+		query.set("extrahosts", string(new encoding.JSON().encode(extraHosts))) when extraHosts.len() > 0
+		query.set("networkmode", networkMode) unless networkMode == ""
+		query.set("shmsize", shmSize.str()) when shmSize > 0
+		query.set("ulimits", string(encodeBody(ulimits))) when ulimits.len() > 0
+		query.set("isolation", isolation) unless isolation == ""
+		query.set("rm", "true")
+		query.set("version", "1")
+		return query
+	}
+
+	// ImageBuild is a handle on a build in progress, for stopping it: make
+	// one, pass it to `Images.build` as `build`, and `cancel()` from another
+	// task ends the engine's stream, after which the build fails with
+	// ErrorKind.Closed. A handle serves one build.
+	//
+	// ```
+	// let job = new docker.ImageBuild()
+	// let building = async engine.images.build("./api", build = job)
+	// job.cancel()
+	// ```
+	type ImageBuild {
+		internal response       ?http.Response = none
+		internal atomic stopped bool           = false
+
+		def new() {}
+
+		// Whether `cancel` was called.
+		def cancelled() bool {
+			return stopped
+		}
+
+		// Stops the build: the engine's stream is closed, and a build not
+		// yet sent fails before it is.
+		atomic def cancel() {
+			stopped = true
+			let held = response
+			response = none
+			if !(held is none) {
+				held.close() onerror recover none
+			}
+		}
+
+		// attach keeps the stream of the build under way, or reports false
+		// when the build was cancelled already; `Images.build` calls it.
+		atomic def attach(res http.Response) bool {
+			return false when stopped
+			response = res
+			return true
+		}
+
+		// detach forgets the stream once the build has ended; `Images.build`
+		// calls it.
+		atomic def detach() {
+			response = none
+		}
 	}
 }

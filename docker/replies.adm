@@ -173,6 +173,8 @@ internal partial module adm.dev.docker.api {
 		attachable bool
 		@json("EnableIPv6")
 		enableIPv6 bool
+		@json("EnableIPv4", omitempty = true)
+		enableIPv4 ?bool
 		@json(omitempty = true)
 		labels map<string, string>
 		@json(omitempty = true)
@@ -183,7 +185,10 @@ internal partial module adm.dev.docker.api {
 
 	struct IpamBody {
 		driver string
+		@json(omitempty = true)
 		config SubnetBody[]
+		@json(omitempty = true)
+		options map<string, string>
 	}
 
 	struct SubnetBody {

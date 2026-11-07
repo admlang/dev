@@ -139,6 +139,54 @@ internal partial module adm.dev.docker.api {
 		devices DeviceMapping[]
 		@json(omitempty = true)
 		deviceRequests DeviceRequestBody[]
+		@json(omitempty = true)
+		volumesFrom string[]
+		@json(omitempty = true)
+		links string[]
+		@json(omitempty = true)
+		cgroupParent string
+		@json(omitempty = true)
+		cgroupnsMode string
+		@json(omitempty = true)
+		oomScoreAdj int
+		@json(omitempty = true)
+		oomKillDisable bool
+		@json(omitempty = true)
+		memorySwappiness ?int
+		@json(omitempty = true)
+		blkioWeight int
+		@json(omitempty = true)
+		blkioWeightDevice WeightDevice[]
+		@json(omitempty = true)
+		blkioDeviceReadBps ThrottleDevice[]
+		@json(omitempty = true)
+		blkioDeviceWriteBps ThrottleDevice[]
+		@json(omitempty = true)
+		blkioDeviceReadIOps ThrottleDevice[]
+		@json(omitempty = true)
+		blkioDeviceWriteIOps ThrottleDevice[]
+		@json(omitempty = true)
+		cpuPeriod int
+		@json(omitempty = true)
+		cpuQuota int
+		@json(omitempty = true)
+		cpuRealtimePeriod int
+		@json(omitempty = true)
+		cpuRealtimeRuntime int
+		@json(omitempty = true)
+		cpuCount int
+		@json(omitempty = true)
+		cpuPercent int
+		@json(omitempty = true)
+		deviceCgroupRules string[]
+		@json(omitempty = true)
+		storageOpt map<string, string>
+		@json("UTSMode", omitempty = true)
+		utsMode string
+		@json(omitempty = true)
+		isolation string
+		@json(omitempty = true)
+		annotations map<string, string>
 	}
 
 	struct MountBody {
@@ -208,6 +256,10 @@ internal partial module adm.dev.docker.api {
 		links string[]
 		@json(omitempty = true)
 		driverOpts map<string, string>
+		@json(omitempty = true)
+		macAddress string
+		@json(omitempty = true)
+		gwPriority int
 	}
 
 	struct EndpointAddresses {
@@ -215,10 +267,15 @@ internal partial module adm.dev.docker.api {
 		ipv4Address string
 		@json("IPv6Address", omitempty = true)
 		ipv6Address string
+		@json("LinkLocalIPs", omitempty = true)
+		linkLocalIPs string[]
 	}
 
 	// The body of a container create.
-	def createBody(spec ContainerSpec) CreateBody {
+	// createBody is the create request for `spec` on an engine speaking
+	// `apiVersion` ("" for the newest the client knows): a field the version
+	// predates is left out.
+	def createBody(spec ContainerSpec, apiVersion string = "") CreateBody {
 		let body = CreateBody{image: spec.image, cmd: spec.cmd, entrypoint: spec.entrypoint, labels: spec.labels, workingDir: spec.workingDir, user: spec.user, hostname: spec.hostname, domainname: spec.domainname, tty: spec.tty, openStdin: spec.openStdin, stdinOnce: spec.stdinOnce, attachStdin: spec.openStdin, stopSignal: spec.stopSignal, shell: spec.shell}
 		for let (name, value) in spec.env {
 			body.env.push("{name}={value}")
@@ -236,7 +293,8 @@ internal partial module adm.dev.docker.api {
 			anonymous.set(path, new map<string, string>())
 		}
 		body.volumes = anonymous
-		let host = HostBody{binds: spec.binds, networkMode: spec.network, restartPolicy: spec.restart, autoRemove: spec.autoRemove, capAdd: spec.capAdd, capDrop: spec.capDrop, dns: spec.dns, dnsOptions: spec.dnsOptions, dnsSearch: spec.dnsSearch, extraHosts: spec.extraHosts, groupAdd: spec.groupAdd, ipcMode: spec.ipcMode, pidMode: spec.pidMode, privileged: spec.privileged, publishAllPorts: spec.publishAll, readonlyRootfs: spec.readonlyRootfs, securityOpt: spec.securityOpt, tmpfs: spec.tmpfs, usernsMode: spec.usernsMode, shmSize: spec.shmSize, sysctls: spec.sysctls, runtime: spec.runtime, init: spec.init, logConfig: spec.logConfig, memory: spec.memory, memorySwap: spec.memorySwap, memoryReservation: spec.memoryReservation, nanoCpus: int(spec.cpus * 1000000000.0), cpuShares: spec.cpuShares, cpusetCpus: spec.cpusetCpus, pidsLimit: spec.pidsLimit, ulimits: spec.ulimits, devices: spec.devices}
+		let host = HostBody{binds: spec.binds, networkMode: spec.network, restartPolicy: spec.restart, autoRemove: spec.autoRemove, capAdd: spec.capAdd, capDrop: spec.capDrop, dns: spec.dns, dnsOptions: spec.dnsOptions, dnsSearch: spec.dnsSearch, extraHosts: spec.extraHosts, groupAdd: spec.groupAdd, ipcMode: spec.ipcMode, pidMode: spec.pidMode, privileged: spec.privileged, publishAllPorts: spec.publishAll, readonlyRootfs: spec.readonlyRootfs, securityOpt: spec.securityOpt, tmpfs: spec.tmpfs, usernsMode: spec.usernsMode, shmSize: spec.shmSize, sysctls: spec.sysctls, runtime: spec.runtime, init: spec.init, logConfig: spec.logConfig, memory: spec.memory, memorySwap: spec.memorySwap, memoryReservation: spec.memoryReservation, nanoCpus: int(spec.cpus * 1000000000.0), cpuShares: spec.cpuShares, cpusetCpus: spec.cpusetCpus, pidsLimit: spec.pidsLimit, ulimits: spec.ulimits, devices: spec.devices, volumesFrom: spec.volumesFrom, links: spec.links, cgroupParent: spec.cgroupParent, cgroupnsMode: spec.cgroupnsMode, oomScoreAdj: spec.oomScoreAdj, oomKillDisable: spec.oomKillDisable, memorySwappiness: spec.memorySwappiness, blkioWeight: spec.blkioWeight, blkioWeightDevice: spec.blkioWeightDevice, blkioDeviceReadBps: spec.blkioDeviceReadBps, blkioDeviceWriteBps: spec.blkioDeviceWriteBps, blkioDeviceReadIOps: spec.blkioDeviceReadIOps, blkioDeviceWriteIOps: spec.blkioDeviceWriteIOps, cpuPeriod: spec.cpuPeriod, cpuQuota: spec.cpuQuota, cpuRealtimePeriod: spec.cpuRealtimePeriod, cpuRealtimeRuntime: spec.cpuRealtimeRuntime, cpuCount: spec.cpuCount, cpuPercent: spec.cpuPercent, deviceCgroupRules: spec.deviceCgroupRules, storageOpt: spec.storageOpt, utsMode: spec.utsMode, isolation: spec.isolation}
+		host.annotations = spec.annotations when versionHas(apiVersion, "1.43")
 		let bindings = new map<string, PortBinding[]>()
 		for let (port, hostPort) in spec.ports {
 			let key = withProtocol(port)
@@ -260,7 +318,7 @@ internal partial module adm.dev.docker.api {
 		if spec.networks.len() > 0 {
 			let endpoints = new map<string, EndpointBody>()
 			for let (name, endpoint) in spec.networks {
-				endpoints.set(name, endpointBody(endpoint))
+				endpoints.set(name, endpointBody(endpoint, apiVersion))
 			}
 			body.networkingConfig = NetworkingBody{endpointsConfig: endpoints}
 		}
@@ -290,9 +348,17 @@ internal partial module adm.dev.docker.api {
 		return out
 	}
 
-	def endpointBody(endpoint NetworkEndpoint) EndpointBody {
+	// versionHas reports whether an engine speaking `apiVersion` knows a
+	// field `since` introduced; "" stands for the newest version.
+	def versionHas(apiVersion string, since string) bool {
+		return apiVersion == "" || !olderThan(apiVersion, since)
+	}
+
+	def endpointBody(endpoint NetworkEndpoint, apiVersion string = "") EndpointBody {
 		let out = EndpointBody{aliases: endpoint.aliases, links: endpoint.links, driverOpts: endpoint.driverOpts}
-		out.ipamConfig = EndpointAddresses{ipv4Address: endpoint.ipv4Address, ipv6Address: endpoint.ipv6Address} unless endpoint.ipv4Address == "" && endpoint.ipv6Address == ""
+		out.ipamConfig = EndpointAddresses{ipv4Address: endpoint.ipv4Address, ipv6Address: endpoint.ipv6Address, linkLocalIPs: endpoint.linkLocalIPs} unless endpoint.ipv4Address == "" && endpoint.ipv6Address == "" && endpoint.linkLocalIPs.len() == 0
+		out.macAddress = endpoint.macAddress when versionHas(apiVersion, "1.44")
+		out.gwPriority = endpoint.gwPriority when versionHas(apiVersion, "1.48")
 		return out
 	}
 }

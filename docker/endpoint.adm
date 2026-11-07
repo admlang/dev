@@ -132,7 +132,10 @@ internal partial module adm.dev.docker.api {
 				socket = "/var/run/docker.sock" when socket == "" || socket == "/"
 				let who = parsed.user
 				let user = who is none ?? ("", who.username)
-				return Endpoint{name: host, path: socket, sshHost: "{parsed.hostname()}:{sshPort}", sshUser: user}
+				// An IPv6 address keeps its brackets, so the port stays apart from it.
+				let server = parsed.hostname()
+				server = "[{server}]" when server.contains(":")
+				return Endpoint{name: host, path: socket, sshHost: "{server}:{sshPort}", sshUser: user}
 			case "npipe":
 				fail errorOf(ErrorKind.Argument, "docker: '{host}': Windows named pipes are not reached by this client; use a tcp:// host")
 			default:

@@ -5,6 +5,7 @@ internal partial module adm.dev.docker.api {
 		std.bytes
 		std.formats.archive
 		std.os
+		std.time
 		adm.dev.docker::*
 	)
 
@@ -130,10 +131,12 @@ internal partial module adm.dev.docker.api {
 
 	// packContext packs a folder as a build context: every file and folder
 	// `.dockerignore` keeps, symbolic links as links, with the Dockerfile
-	// and `.dockerignore` sent even when it leaves them out.
+	// and `.dockerignore` sent even when it leaves them out. With
+	// `dockerfileText` the Dockerfile is that text, written into the archive
+	// under `dockerfile` in place of any file of that name in the folder.
 	// Fails with ErrorKind.Argument when the folder or a file in it cannot
 	// be read.
-	def packContext(dir string, dockerfile string) !byte[] {
+	def packContext(dir string, dockerfile string, dockerfileText string = "") !byte[] {
 		let root = dir
 		for root.len() > 1 && root.endsWith("/") {
 			root = root.slice(0, root.len() - 1)
@@ -159,7 +162,16 @@ internal partial module adm.dev.docker.api {
 		for let rule in rules {
 			mayTakeBack = true when rule.exclusion
 		}
-		packFolder(writer, root, "", rules, keep, mayTakeBack) onerror (err error) {
+		let skip string[] = []
+		if dockerfileText != "" {
+			skip.push(dockerfile)
+			let text = dockerfileText.bytes()
+			let entry = archive.Entry{name: dockerfile, mode: os.FileMode(0o644), size: uint64(text.len()), modTime: time.now()}
+			writer.add(entry, new bytes.Reader(text)) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "docker: the build context {dir} cannot be packed: {err.message}")
+			}
+		}
+		packFolder(writer, root, "", rules, keep, skip, mayTakeBack) onerror (err error) {
 			fail errorOf(ErrorKind.Argument, "docker: the build context {dir} cannot be packed: {err.message}")
 		}
 		writer.close() onerror (err error) {
@@ -168,7 +180,7 @@ internal partial module adm.dev.docker.api {
 		return out.bytes()
 	}
 
-	def packFolder(writer archive.ArchiveWriter, root string, relative string, rules IgnoreRule[], keep string[], mayTakeBack bool) !none {
+	def packFolder(writer archive.ArchiveWriter, root string, relative string, rules IgnoreRule[], keep string[], skip string[], mayTakeBack bool) !none {
 		let folder = relative == "" ?? (root, "{root}/{relative}")
 		let children = try os.readDir(folder, 0)
 		children.sort((a, b) => a.path < b.path)
@@ -191,9 +203,9 @@ internal partial module adm.dev.docker.api {
 					let entry = archive.Entry{name: path + "/", mode: os.FileMode(int(os.FileMode.Dir) | (mode & 0o777)), modTime: info.modTime}
 					try writer.add(entry, new bytes.Reader(byte[]))
 				}
-				try packFolder(writer, root, path, rules, keep, mayTakeBack)
+				try packFolder(writer, root, path, rules, keep, skip, mayTakeBack)
 			} else {
-				continue when left
+				continue when left || skip.includes(path)
 				let file = try os.open(child.path)
 				let entry = archive.Entry{name: path, mode: os.FileMode(mode & 0o777), size: uint64(info.size), modTime: info.modTime}
 				let failure ?error = none

@@ -40,7 +40,8 @@ partial module adm.dev.docker {
 			query.set("name", name) unless name == ""
 			query.set("platform", platform) unless platform == ""
 			let reply = CreatedReply{}
-			try (try core.wire()).call(http.Method.POST, "/containers/create", query, createBody(spec), reply)
+			let link = try core.wire()
+			try link.call(http.Method.POST, "/containers/create", query, createBody(spec, link.version), reply)
 			return new Container(core, reply.id, name)
 		}
 

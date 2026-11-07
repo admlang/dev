@@ -6,8 +6,12 @@ partial module adm.dev.docker {
 		std.bytes
 		std.crypto.hash::(SHA256)
 		std.data.encoding
+		std.formats.archive
+		std.io
 		std.net.http
 		std.net.http.httptest
+		std.net.url
+		std.os
 		std.testing
 		std.time
 		adm.dev.docker.api::*
@@ -128,6 +132,8 @@ EMiG4y/BqDABVNdoeLbZDwJx9ItsFKMFgzfSBB0/kliKoLameC3XwAi/
 			assert overSsh.sshHost == "build:22" && overSsh.sshUser == "me" && overSsh.path == "/var/run/docker.sock"
 			let podmanSsh = try locate("ssh://build.internal:2222/run/podman/podman.sock", none, nothingSet)
 			assert podmanSsh.sshHost == "build.internal:2222" && podmanSsh.sshUser == "" && podmanSsh.path == "/run/podman/podman.sock"
+			let six = try locate("ssh://sy@[::1]:2299", none, nothingSet)
+			assert six.sshHost == "[::1]:2299" && six.sshUser == "sy"
 			assert locateFails("ssh:///var/run/docker.sock", nothingSet) == ErrorKind.Argument
 			assert locateFails("npipe:////./pipe/docker_engine", nothingSet) == ErrorKind.Argument
 			assert locateFails("ftp://x", nothingSet) == ErrorKind.Argument
@@ -280,6 +286,73 @@ EMiG4y/BqDABVNdoeLbZDwJx9ItsFKMFgzfSBB0/kliKoLameC3XwAi/
 			assert full.contains(`"DeviceRequests":[{"Driver":"nvidia","Count":-1,"DeviceIDs":["0"],"Capabilities":[["gpu"]]}]`)
 			assert full.contains(`"NetworkingConfig":{"EndpointsConfig":{"back":{"IPAMConfig":{"IPv4Address":"10.1.0.5"},"Aliases":["api"]}}}`)
 			assert full.contains(`"NetworkMode":"back"`)
+			// The host settings Compose's service spec reaches, and the
+			// fields an engine's API version predates left out.
+			let spec = ContainerSpec{image: "app", volumesFrom: ["data:ro"], links: ["db:postgres"], cgroupParent: "/apps", cgroupnsMode: "private", oomScoreAdj: -500, oomKillDisable: true, memorySwappiness: 0, blkioWeight: 300, blkioWeightDevice: [WeightDevice{path: "/dev/sda", weight: 200}], blkioDeviceReadBps: [ThrottleDevice{path: "/dev/sda", rate: 1048576}], cpuPeriod: 100000, cpuQuota: 50000, cpuCount: 2, deviceCgroupRules: ["c 13:* rwm"], storageOpt: {"size": "120G"}, utsMode: "host", isolation: "process", annotations: {"com.example": "yes"}, networks: {"back": NetworkEndpoint{macAddress: "02:42:ac:11:00:02", linkLocalIPs: ["169.254.1.2"], gwPriority: 10}}}
+			let newest = encoded(spec)
+			assert newest.contains(`"VolumesFrom":["data:ro"]`) && newest.contains(`"Links":["db:postgres"]`) && newest.contains(`"CgroupParent":"/apps"`) && newest.contains(`"CgroupnsMode":"private"`)
+			assert newest.contains(`"OomScoreAdj":-500`) && newest.contains(`"OomKillDisable":true`) && newest.contains(`"MemorySwappiness":0`)
+			assert newest.contains(`"BlkioWeight":300`) && newest.contains(`"BlkioWeightDevice":[{"Path":"/dev/sda","Weight":200}]`) && newest.contains(`"BlkioDeviceReadBps":[{"Path":"/dev/sda","Rate":1048576}]`)
+			assert newest.contains(`"CpuPeriod":100000`) && newest.contains(`"CpuQuota":50000`) && newest.contains(`"CpuCount":2`) && !newest.contains(`"CpuPercent"`)
+			assert newest.contains(`"DeviceCgroupRules":["c 13:* rwm"]`) && newest.contains(`"StorageOpt":{"size":"120G"}`) && newest.contains(`"UTSMode":"host"`) && newest.contains(`"Isolation":"process"`)
+			assert newest.contains(`"Annotations":{"com.example":"yes"}`)
+			assert newest.contains(`"IPAMConfig":{"LinkLocalIPs":["169.254.1.2"]}`) && newest.contains(`"MacAddress":"02:42:ac:11:00:02"`) && newest.contains(`"GwPriority":10`)
+			let old = string(encodeBody(createBody(spec, "1.42")))
+			assert !old.contains(`"Annotations"`) && !old.contains(`"MacAddress"`) && !old.contains(`"GwPriority"`) && old.contains(`"LinkLocalIPs"`)
+			let mid = string(encodeBody(createBody(spec, "1.44")))
+			assert mid.contains(`"Annotations"`) && mid.contains(`"MacAddress"`) && !mid.contains(`"GwPriority"`)
+		}
+
+		@test()
+		def TestNetworkBody() {
+			let plain = string(encodeBody(networkBody("back", "bridge", false, false, false, {}, {}, [], "default", {}, none)))
+			assert !plain.contains(`"IPAM"`) && !plain.contains(`"EnableIPv4"`)
+			let managed = string(encodeBody(networkBody("back", "bridge", false, false, true, {}, {}, [Subnet{subnet: "10.20.0.0/16"}], "custom", {"pool": "a"}, false)))
+			assert managed.contains(`"IPAM":{"Driver":"custom","Config":[{"Subnet":"10.20.0.0/16"}],"Options":{"pool":"a"}}`)
+			assert managed.contains(`"EnableIPv6":true`) && managed.contains(`"EnableIPv4":false`)
+		}
+
+		// The query value under `key`, "" when there is none.
+		internal def queryValue(query url.Values, key string) string {
+			let value = query.get(key)
+			return value is none ?? ("", value)
+		}
+
+		@test()
+		def TestBuildQuery() {
+			let query = buildQuery(["a:1"], "Dockerfile", {}, "", {}, false, false, "", ["acme/api:cache"], ["db:10.0.0.2"], "host", 67108864, [Ulimit{name: "nofile", soft: 1024, hard: 2048}], "process")
+			assert queryValue(query, "cachefrom") == `["acme/api:cache"]`
+			assert queryValue(query, "extrahosts") == `["db:10.0.0.2"]`
+			assert queryValue(query, "networkmode") == "host" && queryValue(query, "shmsize") == "67108864" && queryValue(query, "isolation") == "process"
+			assert queryValue(query, "ulimits") == `[{"Name":"nofile","Soft":1024,"Hard":2048}]`
+			let bare = buildQuery([], "Dockerfile", {}, "", {}, false, false, "", [], [], "", 0, [], "")
+			assert queryValue(bare, "cachefrom") == "" && queryValue(bare, "ulimits") == "" && queryValue(bare, "version") == "1"
+		}
+
+		// An inline Dockerfile stands in for the folder's.
+		@test()
+		def TestPackContextWithDockerfileText() !none {
+			let here = "{os.tempDir()}/adm-docker-inline-{time.now().unixNs()}"
+			try os.mkdir(here, parents = true)
+			try os.writeFile("{here}/Dockerfile", "FROM scratch\n".bytes())
+			try os.writeFile("{here}/app.txt", "payload".bytes())
+			try os.writeFile("{here}/.dockerignore", "ignored.txt\n".bytes())
+			try os.writeFile("{here}/ignored.txt", "left out".bytes())
+			let packed = try packContext(here, "Dockerfile", "FROM alpine\nCOPY app.txt /\n")
+			let tar = try new archive.Tar().open(new bytes.Reader(packed))
+			let names string[] = []
+			let dockerfiles = 0
+			for let entry in tar.entries() {
+				names.push(entry.name)
+				if entry.name == "Dockerfile" {
+					dockerfiles++
+					assert string(try io.readAll(try tar.open(entry))) == "FROM alpine\nCOPY app.txt /\n"
+				}
+			}
+			assert dockerfiles == 1
+			assert names.includes("app.txt") && names.includes(".dockerignore") && !names.includes("ignored.txt")
+			try os.remove(here, recursive = true)
+			return none
 		}
 
 		@test()

@@ -62,9 +62,12 @@ let all = try engine.containers.list(all = true, filters = {"label": ["app=web"]
 ```
 
 `ContainerSpec` holds everything a container is created with: command, environment, labels,
-ports, mounts, networks, restart policy, health check, resources (memory, CPUs, PIDs, ulimits,
-devices, GPUs through `deviceRequests`), capabilities and security options, DNS, tmpfs,
-logging. A `Container` then starts, stops (with a timeout and a signal), restarts, kills,
+ports, mounts, networks (with each endpoint's addresses, link-local addresses, MAC address and
+gateway priority), restart policy, health check, resources (memory and swappiness, CPUs, CFS
+period and quota, PIDs, ulimits, block I/O weights and rates, devices and device cgroup rules,
+GPUs through `deviceRequests`), capabilities and security options, cgroup parent and namespace,
+OOM settings, DNS, tmpfs, storage options, UTS mode, isolation, annotations, legacy links and
+`volumesFrom`, logging. A field the engine's API version predates is left out of the request. A `Container` then starts, stops (with a timeout and a signal), restarts, kills,
 pauses, unpauses, renames, updates its resources, resizes its terminal, waits for its exit
 code, and is removed. `top`, `changes` and `stats` (once, or `statsStream` each second) report
 on it; `cpuPercent()` and `memoryUsed()` read a reading as `docker stats` does.
@@ -114,7 +117,10 @@ try engine.images.push("registry.acme.com/api:dev")
 ```
 
 `build` sends the folder less what its `.dockerignore` leaves out, as the CLI does, and runs the
-classic builder. `list`, `inspect`, `history`, `tag`, `remove`, `prune`, `save` (to a writer)
+classic builder; `dockerfileText` sends a Dockerfile written in code in place of the folder's,
+`cacheFrom`, `extraHosts`, `networkMode`, `shmSize`, `ulimits` and `isolation` shape the build,
+and a `docker.ImageBuild` handle passed as `build` stops it from another task (`cancel()`; the
+build then fails with `ErrorKind.Closed`). `list`, `inspect`, `history`, `tag`, `remove`, `prune`, `save` (to a writer)
 and `load` cover the rest.
 
 Pulls and pushes take their registry credentials from the `auth` argument, else
@@ -128,7 +134,7 @@ checks credentials as `docker login` does.
 
 ```adm
 let data = try engine.volumes.create("pgdata", labels = {"app": "db"})
-let back = try engine.networks.create("back", subnets = [docker.Subnet{subnet: "10.20.0.0/16"}])
+let back = try engine.networks.create("back", subnets = [docker.Subnet{subnet: "10.20.0.0/16"}])   // ipamDriver, ipamOptions, enableIPv4 too
 try engine.networks.connect("back", "db", aliases = ["postgres"])
 
 for let event in try engine.events(filters = {"type": ["container"], "event": ["die"]}) {
