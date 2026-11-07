@@ -5,6 +5,7 @@
 partial module adm.dev.docker {
 	use (
 		std.net.http
+		std.net.ssh
 		std.net.tls
 		std.net.url
 		std.time
@@ -30,6 +31,11 @@ partial module adm.dev.docker {
 		// TLS settings for a TCP host; none uses those `DOCKER_CERT_PATH` or
 		// the context names, or none at all for a plain `tcp://` host.
 		tls        ?tls.Config = none
+		// The SSH client an `ssh://` host is reached through, for its keys,
+		// known hosts, host key policy and timeout; none makes one that logs
+		// in with the agent's keys and trusts `~/.ssh/known_hosts`. It is
+		// connected by `connect` and closed by `close`.
+		ssh        ?ssh.Client = none
 		// The API version to speak; "" takes the engine's when it is older
 		// than the client's (1.47), down to 1.41. Holds the version in use
 		// once connected.
@@ -66,18 +72,22 @@ partial module adm.dev.docker {
 
 		// connect finds the engine and agrees on an API version with it.
 		// `host` is `unix:///var/run/docker.sock`, `tcp://host:2376`,
-		// `https://...`; "" looks where the Docker CLI does: `DOCKER_HOST`
-		// (with `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH`), the context
-		// `DOCKER_CONTEXT` or the CLI's configuration names, then the local
-		// sockets of Docker, Docker Desktop and Podman.
+		// `https://...`, or `ssh://user@host:port` for the engine's socket on
+		// an SSH server (`/var/run/docker.sock`, or the path the host ends
+		// in), reached as the Docker CLI reaches it, through `ssh`; "" looks
+		// where the Docker CLI does: `DOCKER_HOST` (with `DOCKER_TLS_VERIFY`
+		// and `DOCKER_CERT_PATH`), the context `DOCKER_CONTEXT` or the CLI's
+		// configuration names, then the local sockets of Docker, Docker
+		// Desktop and Podman.
 		// Fails with a DockerError: ErrorKind.Argument for a host or context
 		// the client cannot read or an engine already connected,
-		// ErrorKind.Connection when no engine answers, ErrorKind.Protocol
+		// ErrorKind.Connection when no engine answers (an SSH server that
+		// refuses the login or the socket included), ErrorKind.Protocol
 		// when it speaks an API older than 1.41.
 		def connect(host string = "") !none {
 			fail errorOf(ErrorKind.Argument, "docker: the engine is already connected") unless core.link is none
 			let endpoint = try locate(host, tls, core.context)
-			let made = new Link(endpoint, timeout)
+			let made = new Link(endpoint, timeout, ssh)
 			made.negotiate(apiVersion) onerror (err error) {
 				made.close()
 				fail err

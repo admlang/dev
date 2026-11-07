@@ -124,7 +124,11 @@ EMiG4y/BqDABVNdoeLbZDwJx9ItsFKMFgzfSBB0/kliKoLameC3XwAi/
 			assert secure.port == 2376 && secure.secure
 			let given = try locate("tcp://10.0.0.5:2376", none, nothingSet)
 			assert given.port == 2376 && given.host == "10.0.0.5"
-			assert locateFails("ssh://me@build", nothingSet) == ErrorKind.Argument
+			let overSsh = try locate("ssh://me@build", none, nothingSet)
+			assert overSsh.sshHost == "build:22" && overSsh.sshUser == "me" && overSsh.path == "/var/run/docker.sock"
+			let podmanSsh = try locate("ssh://build.internal:2222/run/podman/podman.sock", none, nothingSet)
+			assert podmanSsh.sshHost == "build.internal:2222" && podmanSsh.sshUser == "" && podmanSsh.path == "/run/podman/podman.sock"
+			assert locateFails("ssh:///var/run/docker.sock", nothingSet) == ErrorKind.Argument
 			assert locateFails("npipe:////./pipe/docker_engine", nothingSet) == ErrorKind.Argument
 			assert locateFails("ftp://x", nothingSet) == ErrorKind.Argument
 			assert locateFails("unix://", nothingSet) == ErrorKind.Argument

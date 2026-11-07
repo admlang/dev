@@ -25,7 +25,13 @@ try pg.remove(volumes = true)
 ## Connecting
 
 `docker.connect(host)` takes `unix:///var/run/docker.sock`, `tcp://host:2375`,
-`tcp://host:2376` or `https://...` for TLS. Without a host it looks where the Docker CLI looks:
+`tcp://host:2376` or `https://...` for TLS, and `ssh://user@host:port` for the engine's socket
+on an SSH server (`/var/run/docker.sock`, or the path the host ends in, as
+`ssh://build/run/podman/podman.sock`): the client logs in as the Docker CLI would, with the
+agent's keys and `~/.ssh/known_hosts`, and carries each request through the connection to the
+socket (`engine.ssh` takes an `ssh.Client` of your own for other keys, host key policy or
+timeout; the `ssh` host's user is the local one when none is given). Without a host it looks
+where the Docker CLI looks:
 
 1. `DOCKER_HOST`, with `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` (`ca.pem`, `cert.pem`,
    `key.pem`) for TLS,

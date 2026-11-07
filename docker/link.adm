@@ -8,6 +8,7 @@ internal partial module adm.dev.docker.api {
 		std.io
 		std.net
 		std.net.http
+		std.net.ssh
 		std.net.url
 		std.time
 		adm.dev.docker::*
@@ -62,6 +63,52 @@ internal partial module adm.dev.docker.api {
 		}
 	}
 
+	// Dials the engine's Unix socket on an SSH server: the first dial logs
+	// in and has the client listen on a local port whose connections the
+	// server carries to the socket (`ssh.Client.forward`, a
+	// direct-streamlocal channel each); every request then dials that
+	// port, so the HTTP connection pool works as over TCP.
+	type SshDialer {
+		endpoint         Endpoint
+		timeout          duration
+		client           ssh.Client
+		internal forward ?ssh.Forward = none
+
+		def new(endpoint Endpoint, timeout duration, client ?ssh.Client) {
+			self.endpoint = endpoint
+			self.timeout = timeout
+			let given = client
+			self.client = given is none ?? (new ssh.Client(timeout), given)
+		}
+
+		// The local address the socket is reached at, logging in first.
+		// Fails as `ssh.Client.connect` and `forward` do.
+		atomic def local() !string {
+			let held = forward
+			return held.address.str() unless held is none
+			try client.connect(endpoint.sshHost, endpoint.sshUser)
+			let made = try client.forward("127.0.0.1:0", endpoint.path)
+			forward = made
+			return made.address.str()
+		}
+
+		// Implements http.Dialer.
+		def dial(network string, addr string, timeout duration) !net.Connection {
+			let at = try local()
+			return try net.dialStream(at, timeout)
+		}
+
+		// Ends the forward and the SSH connection.
+		atomic def close() {
+			let held = forward
+			forward = none
+			if !(held is none) {
+				held.close() onerror recover none
+			}
+			client.close() onerror recover none
+		}
+	}
+
 	// Link sends requests to one engine.
 	type Link {
 		endpoint      Endpoint
@@ -74,14 +121,21 @@ internal partial module adm.dev.docker.api {
 		// How long a request that does not stream may take.
 		timeout       duration
 		atomic closed bool
+		// The SSH connection carrying the requests, for an `ssh://` host.
+		ssh           ?SshDialer     = none
 
-		def new(endpoint Endpoint, timeout duration) {
+		def new(endpoint Endpoint, timeout duration, sshClient ?ssh.Client = none) {
 			self.endpoint = endpoint
 			self.timeout = timeout
 			transport = new http.Transport()
 			transport.http2 = false
 			transport.maxIdlePerHost = 8
-			if endpoint.path != "" {
+			if endpoint.sshHost != "" {
+				let over = new SshDialer(endpoint, timeout, sshClient)
+				ssh = over
+				transport.dialer = over
+				base = "http://docker"
+			} else if endpoint.path != "" {
 				transport.dialer = new SocketDialer(endpoint.path)
 				base = "http://docker"
 			} else {
@@ -210,6 +264,8 @@ internal partial module adm.dev.docker.api {
 		def close() {
 			closed = true
 			transport.closeIdle()
+			let over = ssh
+			over.close() unless over is none
 		}
 	}
 

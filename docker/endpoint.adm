@@ -52,12 +52,18 @@ internal partial module adm.dev.docker.api {
 	struct Endpoint {
 		// The host as it was given or found, for messages.
 		name      string
-		// The path of a Unix socket; "" for TCP.
+		// The path of a Unix socket, here or (with `sshHost`) on the server;
+		// "" for TCP.
 		path      string
 		host      string
 		port      int
 		secure    bool
 		tlsConfig ?tls.Config
+		// The SSH server (`host:port`) the socket at `path` is reached
+		// through, and the user to log in as ("" for the local user); ""
+		// for an engine reached directly.
+		sshHost   string
+		sshUser   string
 	}
 
 	// The folder of the Docker CLI's configuration: `DOCKER_CONFIG`, else
@@ -116,11 +122,21 @@ internal partial module adm.dev.docker.api {
 				return Endpoint{name: host, path: parsed.path}
 			case "tcp", "http", "https":
 			case "ssh":
-				fail errorOf(ErrorKind.Argument, "docker: '{host}': engines over ssh are not reached by this client; forward the socket (ssh -L) and give the local end")
+				// `ssh://[user@]host[:port][/socket]`, as the Docker CLI takes it:
+				// the engine's socket on the server, `/var/run/docker.sock`
+				// unless the path names another.
+				fail errorOf(ErrorKind.Argument, "docker: '{host}' names no server") when parsed.hostname() == ""
+				let sshPort = parsed.port()
+				sshPort = 22 when sshPort <= 0
+				let socket = parsed.path
+				socket = "/var/run/docker.sock" when socket == "" || socket == "/"
+				let who = parsed.user
+				let user = who is none ?? ("", who.username)
+				return Endpoint{name: host, path: socket, sshHost: "{parsed.hostname()}:{sshPort}", sshUser: user}
 			case "npipe":
 				fail errorOf(ErrorKind.Argument, "docker: '{host}': Windows named pipes are not reached by this client; use a tcp:// host")
 			default:
-				fail errorOf(ErrorKind.Argument, "docker: the scheme of '{host}' is not unix, tcp, http or https")
+				fail errorOf(ErrorKind.Argument, "docker: the scheme of '{host}' is not unix, tcp, http, https or ssh")
 		}
 		let secure = parsed.scheme == "https" || !(given is none) || certs != ""
 		let port = parsed.port()
