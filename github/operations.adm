@@ -675,11 +675,12 @@ partial module adm.dev.github {
 		// update: Update a gist.
 		// PATCH /gists/{gist_id} (https://docs.github.com/rest/gists/gists#update-a-gist)
 		// Fails as the type's calls do.
-		def update(gistId string, description ?string = none, files any = none) !GistSimple {
+		def update(gistId string, description ?string = none, files any = none, clearFiles bool = false) !GistSimple {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("description", description)
 			sentBody.put("files", files)
+			sentBody.putNull("files") when clearFiles
 			let answer = GistSimple{}
 			try link.call(http.Method.PATCH, "/gists/{segment(gistId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -783,9 +784,10 @@ partial module adm.dev.github {
 		// listForAuthenticatedUser: List notifications for the authenticated user.
 		// GET /notifications (https://docs.github.com/rest/activity/notifications#list-notifications-for-the-authenticated-user)
 		// Fails when the first page is read: see Pages.
-		def listForAuthenticatedUser(all ?bool = none, participating ?bool = none, since ?time.Time = none, before ?time.Time = none) Pages<Thread> {
+		def listForAuthenticatedUser(all ?bool = none, isDone ?bool = none, participating ?bool = none, since ?time.Time = none, before ?time.Time = none) Pages<Thread> {
 			let sentQuery = new Params()
 			sentQuery.put("all", all)
+			sentQuery.put("is_done", isDone)
 			sentQuery.put("participating", participating)
 			sentQuery.put("since", since)
 			sentQuery.put("before", before)
@@ -1160,7 +1162,7 @@ partial module adm.dev.github {
 		// updateLegacy: Update a team (Legacy).
 		// PATCH /teams/{team_id} (https://docs.github.com/rest/teams/teams#update-a-team-legacy)
 		// Fails as the type's calls do.
-		def updateLegacy(teamId int, name string, description ?string = none, privacy ?string = none, notificationSetting ?string = none, permission ?string = none, parentTeamId ?int = none, parentTeamSlug ?string = none) !TeamFull {
+		def updateLegacy(teamId int, name string, description ?string = none, privacy ?string = none, notificationSetting ?string = none, permission ?string = none, parentTeamId ?int = none, parentTeamSlug ?string = none, clearParentTeamId bool = false, clearParentTeamSlug bool = false) !TeamFull {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -1170,6 +1172,8 @@ partial module adm.dev.github {
 			sentBody.put("permission", permission)
 			sentBody.put("parent_team_id", parentTeamId)
 			sentBody.put("parent_team_slug", parentTeamSlug)
+			sentBody.putNull("parent_team_id") when clearParentTeamId
+			sentBody.putNull("parent_team_slug") when clearParentTeamSlug
 			let answer = TeamFull{}
 			try link.call(http.Method.PATCH, "/teams/{segment(teamId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -1404,7 +1408,7 @@ partial module adm.dev.github {
 		// update: Update the authenticated user.
 		// PATCH /user (https://docs.github.com/rest/users/users#update-the-authenticated-user)
 		// Fails as the type's calls do.
-		def update(name ?string = none, email ?string = none, blog ?string = none, twitterUsername ?string = none, company ?string = none, location ?string = none, hireable ?bool = none, bio ?string = none) !PrivateUser {
+		def update(name ?string = none, email ?string = none, blog ?string = none, twitterUsername ?string = none, company ?string = none, location ?string = none, hireable ?bool = none, bio ?string = none, clearTwitterUsername bool = false) !PrivateUser {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -1415,6 +1419,7 @@ partial module adm.dev.github {
 			sentBody.put("location", location)
 			sentBody.put("hireable", hireable)
 			sentBody.put("bio", bio)
+			sentBody.putNull("twitter_username") when clearTwitterUsername
 			let answer = PrivateUser{}
 			try link.call(http.Method.PATCH, "/user", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -2529,7 +2534,7 @@ partial module adm.dev.github {
 		// update: Update a GitHub-hosted runner for an organization.
 		// PATCH /orgs/{org}/actions/hosted-runners/{hosted_runner_id} (https://docs.github.com/rest/actions/hosted-runners#update-a-github-hosted-runner-for-an-organization)
 		// Fails as the type's calls do.
-		def update(hostedRunnerId int, name ?string = none, runnerGroupId ?int = none, maximumRunners ?int = none, enableStaticIp ?bool = none, size ?string = none, imageSource ?string = none, imageId ?string = none, imageVersion ?string = none, imageGen ?bool = none) !ActionsHostedRunner {
+		def update(hostedRunnerId int, name ?string = none, runnerGroupId ?int = none, maximumRunners ?int = none, enableStaticIp ?bool = none, size ?string = none, imageSource ?string = none, imageId ?string = none, imageVersion ?string = none, imageGen ?bool = none, clearImageVersion bool = false) !ActionsHostedRunner {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -2541,6 +2546,7 @@ partial module adm.dev.github {
 			sentBody.put("image_id", imageId)
 			sentBody.put("image_version", imageVersion)
 			sentBody.put("image_gen", imageGen)
+			sentBody.putNull("image_version") when clearImageVersion
 			let answer = ActionsHostedRunner{}
 			try link.call(http.Method.PATCH, "/orgs/{segment(self.org)}/actions/hosted-runners/{segment(hostedRunnerId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -3016,7 +3022,7 @@ partial module adm.dev.github {
 		// updateSelfHosted: Update a self-hosted runner group for an organization.
 		// PATCH /orgs/{org}/actions/runner-groups/{runner_group_id} (https://docs.github.com/rest/actions/self-hosted-runner-groups#update-a-self-hosted-runner-group-for-an-organization)
 		// Fails as the type's calls do.
-		def updateSelfHosted(runnerGroupId int, name string, visibility ?string = none, allowsPublicRepositories ?bool = none, restrictedToWorkflows ?bool = none, selectedWorkflows string[] = [], networkConfigurationId ?string = none) !RunnerGroupsOrg {
+		def updateSelfHosted(runnerGroupId int, name string, visibility ?string = none, allowsPublicRepositories ?bool = none, restrictedToWorkflows ?bool = none, selectedWorkflows string[] = [], networkConfigurationId ?string = none, clearNetworkConfigurationId bool = false) !RunnerGroupsOrg {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -3025,6 +3031,7 @@ partial module adm.dev.github {
 			sentBody.put("restricted_to_workflows", restrictedToWorkflows)
 			sentBody.put("selected_workflows", selectedWorkflows)
 			sentBody.put("network_configuration_id", networkConfigurationId)
+			sentBody.putNull("network_configuration_id") when clearNetworkConfigurationId
 			let answer = RunnerGroupsOrg{}
 			try link.call(http.Method.PATCH, "/orgs/{segment(self.org)}/actions/runner-groups/{segment(runnerGroupId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -3824,7 +3831,7 @@ partial module adm.dev.github {
 		// create: Create issue field for an organization.
 		// POST /orgs/{org}/issue-fields (https://docs.github.com/rest/orgs/issue-fields#create-issue-field-for-an-organization)
 		// Fails as the type's calls do.
-		def create(name string, dataType string, description ?string = none, visibility ?string = none, options any = none) !IssueField {
+		def create(name string, dataType string, description ?string = none, visibility ?string = none, options any = none, clearDescription bool = false, clearOptions bool = false) !IssueField {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -3832,6 +3839,8 @@ partial module adm.dev.github {
 			sentBody.put("description", description)
 			sentBody.put("visibility", visibility)
 			sentBody.put("options", options)
+			sentBody.putNull("description") when clearDescription
+			sentBody.putNull("options") when clearOptions
 			let answer = IssueField{}
 			try link.call(http.Method.POST, "/orgs/{segment(self.org)}/issue-fields", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -3859,13 +3868,14 @@ partial module adm.dev.github {
 		// update: Update issue field for an organization.
 		// PATCH /orgs/{org}/issue-fields/{issue_field_id} (https://docs.github.com/rest/orgs/issue-fields#update-issue-field-for-an-organization)
 		// Fails as the type's calls do.
-		def update(issueFieldId int, name ?string = none, description ?string = none, visibility ?string = none, options any = none) !IssueField {
+		def update(issueFieldId int, name ?string = none, description ?string = none, visibility ?string = none, options any = none, clearDescription bool = false) !IssueField {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
 			sentBody.put("description", description)
 			sentBody.put("visibility", visibility)
 			sentBody.put("options", options)
+			sentBody.putNull("description") when clearDescription
 			let answer = IssueField{}
 			try link.call(http.Method.PATCH, "/orgs/{segment(self.org)}/issue-fields/{segment(issueFieldId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -3885,13 +3895,15 @@ partial module adm.dev.github {
 		// create: Create issue type for an organization.
 		// POST /orgs/{org}/issue-types (https://docs.github.com/rest/orgs/issue-types#create-issue-type-for-an-organization)
 		// Fails as the type's calls do.
-		def create(name string, isEnabled bool, description ?string = none, color ?string = none) !IssueType {
+		def create(name string, isEnabled bool, description ?string = none, color ?string = none, clearDescription bool = false, clearColor bool = false) !IssueType {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
 			sentBody.put("is_enabled", isEnabled)
 			sentBody.put("description", description)
 			sentBody.put("color", color)
+			sentBody.putNull("description") when clearDescription
+			sentBody.putNull("color") when clearColor
 			let answer = IssueType{}
 			try link.call(http.Method.POST, "/orgs/{segment(self.org)}/issue-types", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -3919,13 +3931,15 @@ partial module adm.dev.github {
 		// update: Update issue type for an organization.
 		// PUT /orgs/{org}/issue-types/{issue_type_id} (https://docs.github.com/rest/orgs/issue-types#update-issue-type-for-an-organization)
 		// Fails as the type's calls do.
-		def update(issueTypeId int, name string, isEnabled bool, description ?string = none, color ?string = none) !IssueType {
+		def update(issueTypeId int, name string, isEnabled bool, description ?string = none, color ?string = none, clearDescription bool = false, clearColor bool = false) !IssueType {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
 			sentBody.put("is_enabled", isEnabled)
 			sentBody.put("description", description)
 			sentBody.put("color", color)
+			sentBody.putNull("description") when clearDescription
+			sentBody.putNull("color") when clearColor
 			let answer = IssueType{}
 			try link.call(http.Method.PUT, "/orgs/{segment(self.org)}/issue-types/{segment(issueTypeId)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -4282,11 +4296,12 @@ partial module adm.dev.github {
 		// personal access token.
 		// POST /orgs/{org}/personal-access-token-requests/{pat_request_id} (https://docs.github.com/rest/orgs/personal-access-tokens#review-a-request-to-access-organization-resources-with-a-fine-grained-personal-access-token)
 		// Fails as the type's calls do.
-		def reviewPatGrant(patRequestId int, action string, reason ?string = none) !none {
+		def reviewPatGrant(patRequestId int, action string, reason ?string = none, clearReason bool = false) !none {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("action", action)
 			sentBody.put("reason", reason)
+			sentBody.putNull("reason") when clearReason
 			try link.call(http.Method.POST, "/orgs/{segment(self.org)}/personal-access-token-requests/{segment(patRequestId)}", sentQuery, sentBody.json(), none, "application/json", "")
 			return none
 		}
@@ -4295,12 +4310,13 @@ partial module adm.dev.github {
 		// fine-grained personal access tokens.
 		// POST /orgs/{org}/personal-access-token-requests (https://docs.github.com/rest/orgs/personal-access-tokens#review-requests-to-access-organization-resources-with-fine-grained-personal-access-tokens)
 		// Fails as the type's calls do.
-		def reviewPatGrantInBulk(action string, patRequestIds int[] = [], reason ?string = none) !map<string, any> {
+		def reviewPatGrantInBulk(action string, patRequestIds int[] = [], reason ?string = none, clearReason bool = false) !map<string, any> {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("action", action)
 			sentBody.put("pat_request_ids", patRequestIds)
 			sentBody.put("reason", reason)
+			sentBody.putNull("reason") when clearReason
 			let answered = try link.fetch(http.Method.POST, "/orgs/{segment(self.org)}/personal-access-token-requests", sentQuery, sentBody.json(), "application/json", "")
 			return try parseObject(answered)
 		}
@@ -4382,7 +4398,7 @@ partial module adm.dev.github {
 		// for an organization.
 		// PUT /orgs/{org}/properties/schema/{custom_property_name} (https://docs.github.com/rest/orgs/custom-properties#create-or-update-a-custom-property-for-an-organization)
 		// Fails as the type's calls do.
-		def customForReposCreateOrUpdateOrganizationDefinition(customPropertyName string, valueType string, required ?bool = none, defaultValue ?string = none, description ?string = none, allowedValues string[] = [], valuesEditableBy ?string = none, requireExplicitValues ?bool = none) !CustomProperty {
+		def customForReposCreateOrUpdateOrganizationDefinition(customPropertyName string, valueType string, required ?bool = none, defaultValue any = none, description ?string = none, allowedValues string[] = [], valuesEditableBy ?string = none, regex ?string = none, requireExplicitValues ?bool = none, clearDefaultValue bool = false, clearDescription bool = false, clearAllowedValues bool = false, clearValuesEditableBy bool = false, clearRegex bool = false) !CustomProperty {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("value_type", valueType)
@@ -4391,7 +4407,13 @@ partial module adm.dev.github {
 			sentBody.put("description", description)
 			sentBody.put("allowed_values", allowedValues)
 			sentBody.put("values_editable_by", valuesEditableBy)
+			sentBody.put("regex", regex)
 			sentBody.put("require_explicit_values", requireExplicitValues)
+			sentBody.putNull("default_value") when clearDefaultValue
+			sentBody.putNull("description") when clearDescription
+			sentBody.putNull("allowed_values") when clearAllowedValues
+			sentBody.putNull("values_editable_by") when clearValuesEditableBy
+			sentBody.putNull("regex") when clearRegex
 			let answer = CustomProperty{}
 			try link.call(http.Method.PUT, "/orgs/{segment(self.org)}/properties/schema/{segment(customPropertyName)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -4872,7 +4894,7 @@ partial module adm.dev.github {
 		// update: Update a team.
 		// PATCH /orgs/{org}/teams/{team_slug} (https://docs.github.com/rest/teams/teams#update-a-team)
 		// Fails as the type's calls do.
-		def update(name ?string = none, description ?string = none, privacy ?string = none, notificationSetting ?string = none, permission ?string = none, parentTeamId ?int = none, parentTeamSlug ?string = none) !TeamFull {
+		def update(name ?string = none, description ?string = none, privacy ?string = none, notificationSetting ?string = none, permission ?string = none, parentTeamId ?int = none, parentTeamSlug ?string = none, clearParentTeamId bool = false, clearParentTeamSlug bool = false) !TeamFull {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -4882,6 +4904,8 @@ partial module adm.dev.github {
 			sentBody.put("permission", permission)
 			sentBody.put("parent_team_id", parentTeamId)
 			sentBody.put("parent_team_slug", parentTeamSlug)
+			sentBody.putNull("parent_team_id") when clearParentTeamId
+			sentBody.putNull("parent_team_slug") when clearParentTeamSlug
 			let answer = TeamFull{}
 			try link.call(http.Method.PATCH, "/orgs/{segment(self.org)}/teams/{segment(self.slug)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -5206,13 +5230,15 @@ partial module adm.dev.github {
 		// createCommitStatus: Create a commit status.
 		// POST /repos/{owner}/{repo}/statuses/{sha} (https://docs.github.com/rest/commits/statuses#create-a-commit-status)
 		// Fails as the type's calls do.
-		def createCommitStatus(sha string, state string, targetUrl ?string = none, description ?string = none, context ?string = none) !Status {
+		def createCommitStatus(sha string, state string, targetUrl ?string = none, description ?string = none, context ?string = none, clearTargetUrl bool = false, clearDescription bool = false) !Status {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("state", state)
 			sentBody.put("target_url", targetUrl)
 			sentBody.put("description", description)
 			sentBody.put("context", context)
+			sentBody.putNull("target_url") when clearTargetUrl
+			sentBody.putNull("description") when clearDescription
 			let answer = Status{}
 			try link.call(http.Method.POST, "/repos/{segment(self.owner)}/{segment(self.name)}/statuses/{segment(sha)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -5397,9 +5423,10 @@ partial module adm.dev.github {
 		// authenticated user.
 		// GET /repos/{owner}/{repo}/notifications (https://docs.github.com/rest/activity/notifications#list-repository-notifications-for-the-authenticated-user)
 		// Fails when the first page is read: see Pages.
-		def listRepoNotificationsForAuthenticatedUser(all ?bool = none, participating ?bool = none, since ?time.Time = none, before ?time.Time = none) Pages<Thread> {
+		def listRepoNotificationsForAuthenticatedUser(all ?bool = none, isDone ?bool = none, participating ?bool = none, since ?time.Time = none, before ?time.Time = none) Pages<Thread> {
 			let sentQuery = new Params()
 			sentQuery.put("all", all)
+			sentQuery.put("is_done", isDone)
 			sentQuery.put("participating", participating)
 			sentQuery.put("since", since)
 			sentQuery.put("before", before)
@@ -5529,7 +5556,7 @@ partial module adm.dev.github {
 		// update: Update a repository.
 		// PATCH /repos/{owner}/{repo} (https://docs.github.com/rest/repos/repos#update-a-repository)
 		// Fails as the type's calls do.
-		def update(name ?string = none, description ?string = none, homepage ?string = none, private ?bool = none, visibility ?string = none, securityAndAnalysis any = none, hasIssues ?bool = none, hasProjects ?bool = none, hasWiki ?bool = none, hasPullRequests ?bool = none, pullRequestCreationPolicy ?string = none, isTemplate ?bool = none, defaultBranch ?string = none, allowSquashMerge ?bool = none, allowMergeCommit ?bool = none, allowRebaseMerge ?bool = none, allowAutoMerge ?bool = none, deleteBranchOnMerge ?bool = none, allowUpdateBranch ?bool = none, useSquashPrTitleAsDefault ?bool = none, squashMergeCommitTitle ?string = none, squashMergeCommitMessage ?string = none, mergeCommitTitle ?string = none, mergeCommitMessage ?string = none, archived ?bool = none, allowForking ?bool = none, webCommitSignoffRequired ?bool = none) !FullRepository {
+		def update(name ?string = none, description ?string = none, homepage ?string = none, private ?bool = none, visibility ?string = none, securityAndAnalysis any = none, hasIssues ?bool = none, hasProjects ?bool = none, hasWiki ?bool = none, hasPullRequests ?bool = none, pullRequestCreationPolicy ?string = none, isTemplate ?bool = none, defaultBranch ?string = none, allowSquashMerge ?bool = none, allowMergeCommit ?bool = none, allowRebaseMerge ?bool = none, allowAutoMerge ?bool = none, deleteBranchOnMerge ?bool = none, allowUpdateBranch ?bool = none, useSquashPrTitleAsDefault ?bool = none, squashMergeCommitTitle ?string = none, squashMergeCommitMessage ?string = none, mergeCommitTitle ?string = none, mergeCommitMessage ?string = none, archived ?bool = none, allowForking ?bool = none, webCommitSignoffRequired ?bool = none, clearSecurityAndAnalysis bool = false) !FullRepository {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("name", name)
@@ -5559,6 +5586,7 @@ partial module adm.dev.github {
 			sentBody.put("archived", archived)
 			sentBody.put("allow_forking", allowForking)
 			sentBody.put("web_commit_signoff_required", webCommitSignoffRequired)
+			sentBody.putNull("security_and_analysis") when clearSecurityAndAnalysis
 			let answer = FullRepository{}
 			try link.call(http.Method.PATCH, "/repos/{segment(self.owner)}/{segment(self.name)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -7208,7 +7236,7 @@ partial module adm.dev.github {
 		// updateProtection: Update branch protection.
 		// PUT /repos/{owner}/{repo}/branches/{branch}/protection (https://docs.github.com/rest/branches/branch-protection#update-branch-protection)
 		// Fails as the type's calls do.
-		def updateProtection(branch string, requiredStatusChecks any, enforceAdmins bool, requiredPullRequestReviews any, restrictions any, requiredLinearHistory ?bool = none, allowForcePushes ?bool = none, allowDeletions ?bool = none, blockCreations ?bool = none, requiredConversationResolution ?bool = none, lockBranch ?bool = none, allowForkSyncing ?bool = none) !ProtectedBranch {
+		def updateProtection(branch string, requiredStatusChecks any, enforceAdmins bool, requiredPullRequestReviews any, restrictions any, requiredLinearHistory ?bool = none, allowForcePushes ?bool = none, allowDeletions ?bool = none, blockCreations ?bool = none, requiredConversationResolution ?bool = none, lockBranch ?bool = none, allowForkSyncing ?bool = none, clearAllowForcePushes bool = false) !ProtectedBranch {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("required_status_checks", requiredStatusChecks)
@@ -7222,6 +7250,7 @@ partial module adm.dev.github {
 			sentBody.put("required_conversation_resolution", requiredConversationResolution)
 			sentBody.put("lock_branch", lockBranch)
 			sentBody.put("allow_fork_syncing", allowForkSyncing)
+			sentBody.putNull("allow_force_pushes") when clearAllowForcePushes
 			let answer = ProtectedBranch{}
 			try link.call(http.Method.PUT, "/repos/{segment(self.owner)}/{segment(self.name)}/branches/{segment(branch)}/protection", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -7751,7 +7780,7 @@ partial module adm.dev.github {
 		// create: Create a deployment.
 		// POST /repos/{owner}/{repo}/deployments (https://docs.github.com/rest/deployments/deployments#create-a-deployment)
 		// Fails as the type's calls do.
-		def create(ref string, task ?string = none, autoMerge ?bool = none, requiredContexts string[] = [], payload any = none, environment ?string = none, description ?string = none, transientEnvironment ?bool = none, productionEnvironment ?bool = none) !Deployment {
+		def create(ref string, task ?string = none, autoMerge ?bool = none, requiredContexts string[] = [], payload any = none, environment ?string = none, description ?string = none, transientEnvironment ?bool = none, productionEnvironment ?bool = none, clearDescription bool = false) !Deployment {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("ref", ref)
@@ -7763,6 +7792,7 @@ partial module adm.dev.github {
 			sentBody.put("description", description)
 			sentBody.put("transient_environment", transientEnvironment)
 			sentBody.put("production_environment", productionEnvironment)
+			sentBody.putNull("description") when clearDescription
 			let answer = Deployment{}
 			try link.call(http.Method.POST, "/repos/{segment(self.owner)}/{segment(self.name)}/deployments", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -7895,13 +7925,15 @@ partial module adm.dev.github {
 		// createOrUpdate: Create or update an environment.
 		// PUT /repos/{owner}/{repo}/environments/{environment_name} (https://docs.github.com/rest/deployments/environments#create-or-update-an-environment)
 		// Fails as the type's calls do.
-		def createOrUpdate(environmentName string, waitTimer ?int = none, preventSelfReview ?bool = none, reviewers any = none, deploymentBranchPolicy any = none) !Environment {
+		def createOrUpdate(environmentName string, waitTimer ?int = none, preventSelfReview ?bool = none, reviewers any = none, deploymentBranchPolicy any = none, clearReviewers bool = false, clearDeploymentBranchPolicy bool = false) !Environment {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("wait_timer", waitTimer)
 			sentBody.put("prevent_self_review", preventSelfReview)
 			sentBody.put("reviewers", reviewers)
 			sentBody.put("deployment_branch_policy", deploymentBranchPolicy)
+			sentBody.putNull("reviewers") when clearReviewers
+			sentBody.putNull("deployment_branch_policy") when clearDeploymentBranchPolicy
 			let answer = Environment{}
 			try link.call(http.Method.PUT, "/repos/{segment(self.owner)}/{segment(self.name)}/environments/{segment(environmentName)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
@@ -8500,6 +8532,11 @@ partial module adm.dev.github {
 		internal owner string
 		internal name  string
 
+		artifacts RepoIssuesArtifacts {
+			def get() RepoIssuesArtifacts {
+				return new RepoIssuesArtifacts(link, owner, name)
+			}
+		}
 		assignees RepoIssuesAssignees {
 			def get() RepoIssuesAssignees {
 				return new RepoIssuesAssignees(link, owner, name)
@@ -8560,7 +8597,7 @@ partial module adm.dev.github {
 		// create: Create an issue.
 		// POST /repos/{owner}/{repo}/issues (https://docs.github.com/rest/issues/issues#create-an-issue)
 		// Fails as the type's calls do.
-		def create(title any, body ?string = none, assignee ?string = none, milestone ?string = none, labels any = none, assignees string[] = [], issueFieldValues any = none, typeName ?string = none, parentIssueId ?int = none) !Issue {
+		def create(title any, body ?string = none, assignee ?string = none, milestone any = none, labels any = none, assignees string[] = [], issueFieldValues any = none, typeName ?string = none, parentIssueId ?int = none, clearAssignee bool = false, clearMilestone bool = false, clearType bool = false) !Issue {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("title", title)
@@ -8572,6 +8609,9 @@ partial module adm.dev.github {
 			sentBody.put("issue_field_values", issueFieldValues)
 			sentBody.put("type", typeName)
 			sentBody.put("parent_issue_id", parentIssueId)
+			sentBody.putNull("assignee") when clearAssignee
+			sentBody.putNull("milestone") when clearMilestone
+			sentBody.putNull("type") when clearType
 			let answer = new Issue()
 			try link.call(http.Method.POST, "/repos/{segment(self.owner)}/{segment(self.name)}/issues", sentQuery, sentBody.json(), answer, "application/json", "")
 			answer.origin = RepoRef{link: link, owner: self.owner, name: self.name}
@@ -8666,7 +8706,7 @@ partial module adm.dev.github {
 		// update: Update an issue.
 		// PATCH /repos/{owner}/{repo}/issues/{issue_number} (https://docs.github.com/rest/issues/issues#update-an-issue)
 		// Fails as the type's calls do.
-		def update(issueNumber int, title ?string = none, body ?string = none, assignee ?string = none, state ?State = none, stateReason ?string = none, duplicateIssueId ?int = none, milestone ?string = none, labels any = none, assignees any = none, issueFieldValues any = none, typeName ?string = none) !IssuesUpdateResponse {
+		def update(issueNumber int, title any = none, body ?string = none, assignee ?string = none, state ?State = none, stateReason ?string = none, duplicateIssueId ?int = none, milestone any = none, labels any = none, assignees any = none, issueFieldValues any = none, typeName any = none, clearTitle bool = false, clearBody bool = false, clearAssignee bool = false, clearStateReason bool = false, clearMilestone bool = false, clearType bool = false) !IssuesUpdateResponse {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("title", title)
@@ -8680,8 +8720,82 @@ partial module adm.dev.github {
 			sentBody.put("assignees", assignees)
 			sentBody.put("issue_field_values", issueFieldValues)
 			sentBody.put("type", typeName)
+			sentBody.putNull("title") when clearTitle
+			sentBody.putNull("body") when clearBody
+			sentBody.putNull("assignee") when clearAssignee
+			sentBody.putNull("state_reason") when clearStateReason
+			sentBody.putNull("milestone") when clearMilestone
+			sentBody.putNull("type") when clearType
 			let answer = IssuesUpdateResponse{}
 			try link.call(http.Method.PATCH, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}", sentQuery, sentBody.json(), answer, "application/json", "")
+			return answer
+		}
+	}
+
+	// The issues artifacts of a repo.
+	type RepoIssuesArtifacts {
+		internal link  Link
+		internal owner string
+		internal name  string
+
+		def new(link Link, owner string, name string) {
+			self.link = link
+			self.owner = owner
+			self.name = name
+		}
+
+		// create: Create an issue artifact.
+		// POST /repos/{owner}/{repo}/issues/{issue_number}/artifacts (https://docs.github.com/rest/issues/artifacts#create-an-issue-artifact)
+		// Fails as the type's calls do.
+		def create(issueNumber int, name string, body string, typeName ?string = none) !IssueArtifact {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("name", name)
+			sentBody.put("body", body)
+			sentBody.put("type", typeName)
+			let answer = IssueArtifact{}
+			try link.call(http.Method.POST, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}/artifacts", sentQuery, sentBody.json(), answer, "application/json", "")
+			return answer
+		}
+
+		// delete: Delete an issue artifact.
+		// DELETE /repos/{owner}/{repo}/issues/{issue_number}/artifacts/{artifact_number} (https://docs.github.com/rest/issues/artifacts#delete-an-issue-artifact)
+		// Fails as the type's calls do.
+		def delete(issueNumber int, artifactNumber int) !none {
+			let sentQuery = new Params()
+			try link.call(http.Method.DELETE, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}/artifacts/{segment(artifactNumber)}", sentQuery, none, none, "application/json", "")
+			return none
+		}
+
+		// get: Get an issue artifact.
+		// GET /repos/{owner}/{repo}/issues/{issue_number}/artifacts/{artifact_number} (https://docs.github.com/rest/issues/artifacts#get-an-issue-artifact)
+		// Fails as the type's calls do.
+		def get(issueNumber int, artifactNumber int) !IssuesGetIssueArtifactResponse {
+			let sentQuery = new Params()
+			let answer = IssuesGetIssueArtifactResponse{}
+			try link.call(http.Method.GET, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}/artifacts/{segment(artifactNumber)}", sentQuery, none, answer, "application/json", "")
+			return answer
+		}
+
+		// list: List issue artifacts.
+		// GET /repos/{owner}/{repo}/issues/{issue_number}/artifacts (https://docs.github.com/rest/issues/artifacts#list-issue-artifacts)
+		// Fails when the first page is read: see Pages.
+		def list(issueNumber int, typeName ?string = none) Pages<IssueArtifact> {
+			let sentQuery = new Params()
+			sentQuery.put("type", typeName)
+			return new Pages<IssueArtifact>(link, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}/artifacts", sentQuery, "")
+		}
+
+		// update: Update an issue artifact.
+		// PATCH /repos/{owner}/{repo}/issues/{issue_number}/artifacts/{artifact_number} (https://docs.github.com/rest/issues/artifacts#update-an-issue-artifact)
+		// Fails as the type's calls do.
+		def update(issueNumber int, artifactNumber int, name ?string = none, body ?string = none) !IssueArtifact {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("name", name)
+			sentBody.put("body", body)
+			let answer = IssueArtifact{}
+			try link.call(http.Method.PATCH, "/repos/{segment(self.owner)}/{segment(self.name)}/issues/{segment(issueNumber)}/artifacts/{segment(artifactNumber)}", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
 		}
 	}
@@ -9588,13 +9702,14 @@ partial module adm.dev.github {
 		// updateInformationAboutSite: Update information about a GitHub Pages site.
 		// PUT /repos/{owner}/{repo}/pages (https://docs.github.com/rest/pages/pages#update-information-about-a-apiname-pages-site)
 		// Fails as the type's calls do.
-		def updateInformationAboutSite(cname ?string = none, httpsEnforced ?bool = none, buildType ?string = none, source any = none) !none {
+		def updateInformationAboutSite(cname ?string = none, httpsEnforced ?bool = none, buildType ?string = none, source any = none, clearCname bool = false) !none {
 			let sentQuery = new Params()
 			let sentBody = new Params()
 			sentBody.put("cname", cname)
 			sentBody.put("https_enforced", httpsEnforced)
 			sentBody.put("build_type", buildType)
 			sentBody.put("source", source)
+			sentBody.putNull("cname") when clearCname
 			try link.call(http.Method.PUT, "/repos/{segment(self.owner)}/{segment(self.name)}/pages", sentQuery, sentBody.json(), none, "application/json", "")
 			return none
 		}
@@ -9932,6 +10047,18 @@ partial module adm.dev.github {
 			sentBody.put("team_reviewers", teamReviewers)
 			let answer = PullRequestSimple{}
 			try link.call(http.Method.DELETE, "/repos/{segment(self.owner)}/{segment(self.name)}/pulls/{segment(pullNumber)}/requested_reviewers", sentQuery, sentBody.json(), answer, "application/json", "")
+			return answer
+		}
+
+		// requestCopilotCodeReview: Request a Copilot code review for a pull request.
+		// POST /repos/{owner}/{repo}/pulls/{pull_number}/copilot-code-review (https://docs.github.com/rest/pulls/copilot-code-review#request-a-copilot-code-review-for-a-pull-request)
+		// Fails as the type's calls do.
+		def requestCopilotCodeReview(pullNumber int, reviewEffort ?string = none) !CopilotCodeReviewRequest {
+			let sentQuery = new Params()
+			let sentBody = new Params()
+			sentBody.put("review_effort", reviewEffort)
+			let answer = CopilotCodeReviewRequest{}
+			try link.call(http.Method.POST, "/repos/{segment(self.owner)}/{segment(self.name)}/pulls/{segment(pullNumber)}/copilot-code-review", sentQuery, sentBody.json(), answer, "application/json", "")
 			return answer
 		}
 

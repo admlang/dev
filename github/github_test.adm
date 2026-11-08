@@ -145,6 +145,18 @@ GzU/+SlU9pU2QLIsT419aE9a1OmKSAm+46gPXHLqi7hwhaZ5gFs=
 -----END RSA PRIVATE KEY-----`
 
 	check "Client" {
+		// A member put as null is sent as JSON null, where `put` with none
+		// leaves it out: how an issue's milestone is cleared.
+		@test()
+		def TestParamsNull() {
+			let params = new Params()
+			params.put("title", "x")
+			let absent ?string = none
+			params.put("body", absent)
+			params.putNull("milestone")
+			assert string(params.json()) == `{"title":"x","milestone":null}`
+		}
+
 		@test()
 		def TestRequestsAndErrors() !none {
 			let fake = new FakeGitHub()

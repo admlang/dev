@@ -660,6 +660,20 @@ def write_operations(document, model, operations, folder):
     write_operations_test(tests, folder)
 
 
+def clears_with_null(model, schema):
+    """Whether the API removes a body field's value when it is sent as JSON
+    null: the schema is nullable (itself or an alternative of its oneOf), or
+    its description says so (GitHub writes "use `null` to remove")."""
+    resolved = model.resolve(schema)
+    if model.is_nullable(resolved):
+        return True
+    for alt in resolved.get("oneOf", []) + resolved.get("anyOf", []):
+        if model.is_nullable(model.resolve(alt)):
+            return True
+    texts = [resolved.get("description", "")] + [model.resolve(alt).get("description", "") for alt in resolved.get("oneOf", []) + resolved.get("anyOf", [])]
+    return any("null" in text for text in texts)
+
+
 def method_text(document, model, op, holder, holder_fields):
     params = parameters_of(document, op.raw)
     path_params = [p for p in params if p["in"] == "path" and p["name"] not in holder_fields]
@@ -704,6 +718,15 @@ def method_text(document, model, op, holder, holder_fields):
         signature.append(f"{name} {kind}")
     for name, kind, _, _ in named:
         signature.append(f"{name} ?{kind} = none" if not kind.endswith("[]") and kind != "any" else f"{name} {kind} = []" if kind.endswith("[]") else f"{name} any = none")
+    # A body field the API clears with JSON null (a nullable schema, or one
+    # whose description says so) gets a `clear<Field>` flag: an optional
+    # parameter left at none is not sent, so none cannot mean "remove".
+    clears = []
+    for name, kind, p, where in named:
+        if where == "body" and clears_with_null(model, p["schema"]):
+            flag = local("clear_" + p["name"])
+            clears.append((flag, p["name"], name))
+            signature.append(f"{flag} bool = false")
     schema, status = success_schema(document, op)
     listing = is_list(op) and op.verb == "get" and schema is not None
     result = "none"
@@ -749,6 +772,8 @@ def method_text(document, model, op, holder, holder_fields):
         for name, kind, p, where in positional + named:
             if where == "body":
                 lines.append(f"\t\t\tsentBody.put(\"{p['name']}\", {name})\n")
+        for flag, field, _ in clears:
+            lines.append(f"\t\t\tsentBody.putNull(\"{field}\") when {flag}\n")
     servers = op.raw.get("servers")
     base = "uploads" if servers else ""
     payload = "sentBody.json()" if body_props else ("data" if raw_body and raw_body[0] == "bytes" else "encodeBody(data)" if raw_body else "none")
@@ -824,7 +849,9 @@ def write_events(document, model, folder):
     """One payload type per event name, the properties of all its actions
     merged, and an accessor on Event for it."""
     by_name = {}
-    for key, entry in document.get("webhooks", {}).items():
+    # The description carried its webhook payloads under `webhooks` and
+    # carries them under `x-webhooks` since late 2026.
+    for key, entry in (document.get("webhooks") or document.get("x-webhooks") or {}).items():
         post = entry.get("post", {})
         event = None
         for param in post.get("parameters", []):

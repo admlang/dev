@@ -2119,6 +2119,21 @@ partial module adm.dev.github {
 			try gh.repo("o", "r").issues.update(1)
 			assert fake.last("PATCH", "/repos/*/*/issues/*")
 			fake.body = "{}"
+			try gh.repo("o", "r").issues.artifacts.create(1, "x", "x")
+			assert fake.last("POST", "/repos/*/*/issues/*/artifacts")
+			fake.body = "{}"
+			try gh.repo("o", "r").issues.artifacts.delete(1, 1)
+			assert fake.last("DELETE", "/repos/*/*/issues/*/artifacts/*")
+			fake.body = "{}"
+			try gh.repo("o", "r").issues.artifacts.get(1, 1)
+			assert fake.last("GET", "/repos/*/*/issues/*/artifacts/*")
+			fake.body = "[]"
+			try gh.repo("o", "r").issues.artifacts.list(1).page(1)
+			assert fake.last("GET", "/repos/*/*/issues/*/artifacts")
+			fake.body = "{}"
+			try gh.repo("o", "r").issues.artifacts.update(1, 1)
+			assert fake.last("PATCH", "/repos/*/*/issues/*/artifacts/*")
+			fake.body = "{}"
 			try gh.repo("o", "r").issues.assignees.add(1)
 			assert fake.last("POST", "/repos/*/*/issues/*/assignees")
 			fake.body = "{}"
@@ -2256,6 +2271,15 @@ partial module adm.dev.github {
 			fake.body = "[]"
 			try gh.repo("o", "r").keys.list().page(1)
 			assert fake.last("GET", "/repos/*/*/keys")
+			return none
+		}
+
+		@test()
+		def TestOperations13() !none {
+			let fake = new FakeGitHub()
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
 			fake.body = "{}"
 			try gh.repo("o", "r").labels.create("x")
 			assert fake.last("POST", "/repos/*/*/labels")
@@ -2271,15 +2295,6 @@ partial module adm.dev.github {
 			fake.body = "{}"
 			try gh.repo("o", "r").labels.update("x")
 			assert fake.last("PATCH", "/repos/*/*/labels/*")
-			return none
-		}
-
-		@test()
-		def TestOperations13() !none {
-			let fake = new FakeGitHub()
-			let server = try fakeGitHub(fake)
-			defer server.close()
-			let gh = try fakeClient(server)
 			fake.body = "{}"
 			try gh.repo("o", "r").milestones.create("x")
 			assert fake.last("POST", "/repos/*/*/milestones")
@@ -2416,6 +2431,9 @@ partial module adm.dev.github {
 			try gh.repo("o", "r").pullRequests.removeRequestedReviewers(1, [])
 			assert fake.last("DELETE", "/repos/*/*/pulls/*/requested_reviewers")
 			fake.body = "{}"
+			try gh.repo("o", "r").pullRequests.requestCopilotCodeReview(1)
+			assert fake.last("POST", "/repos/*/*/pulls/*/copilot-code-review")
+			fake.body = "{}"
 			try gh.repo("o", "r").pullRequests.requestReviewers(1)
 			assert fake.last("POST", "/repos/*/*/pulls/*/requested_reviewers")
 			fake.body = "{}"
@@ -2442,6 +2460,15 @@ partial module adm.dev.github {
 			fake.body = "{}"
 			try gh.repo("o", "r").pullRequests.updateReviewComment(1, "x")
 			assert fake.last("PATCH", "/repos/*/*/pulls/comments/*")
+			return none
+		}
+
+		@test()
+		def TestOperations14() !none {
+			let fake = new FakeGitHub()
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
 			fake.body = "{}"
 			try gh.repo("o", "r").releases.asset(1)
 			assert fake.last("GET", "/repos/*/*/releases/assets/*")
@@ -2460,15 +2487,6 @@ partial module adm.dev.github {
 			fake.body = "{}"
 			try gh.repo("o", "r").releases.deleteReleaseReaction(1, 1)
 			assert fake.last("DELETE", "/repos/*/*/releases/*/reactions/*")
-			return none
-		}
-
-		@test()
-		def TestOperations14() !none {
-			let fake = new FakeGitHub()
-			let server = try fakeGitHub(fake)
-			defer server.close()
-			let gh = try fakeClient(server)
 			fake.body = "{}"
 			try gh.repo("o", "r").releases.generateNotes("x")
 			assert fake.last("POST", "/repos/*/*/releases/generate-notes")
@@ -2631,6 +2649,15 @@ partial module adm.dev.github {
 			fake.body = "[]"
 			try gh.user("u").listSshSigningKeys().page(1)
 			assert fake.last("GET", "/users/*/ssh_signing_keys")
+			return none
+		}
+
+		@test()
+		def TestOperations15() !none {
+			let fake = new FakeGitHub()
+			let server = try fakeGitHub(fake)
+			defer server.close()
+			let gh = try fakeClient(server)
 			fake.body = "{}"
 			try gh.user("u").userInstallation()
 			assert fake.last("GET", "/users/*/installation")
@@ -2649,15 +2676,6 @@ partial module adm.dev.github {
 			fake.body = "{}"
 			try gh.user("u").attestations.listBulk([])
 			assert fake.last("POST", "/users/*/attestations/bulk-list")
-			return none
-		}
-
-		@test()
-		def TestOperations15() !none {
-			let fake = new FakeGitHub()
-			let server = try fakeGitHub(fake)
-			defer server.close()
-			let gh = try fakeClient(server)
 			fake.body = "[]"
 			try gh.user("u").events.listForAuthenticatedUser().page(1)
 			assert fake.last("GET", "/users/*/events")

@@ -274,8 +274,9 @@ partial module adm.dev.github {
 		// The unique identifier of the group that the hosted runner belongs to.
 		@json("runner_group_id", omitempty = true)
 		runnerGroupId int = 0
+		// Provides details of a hosted runner image
 		@json("image_details", omitempty = true)
-		imageDetails ?ActionsHostedRunnerPoolImage
+		imageDetails ?NullableActionsHostedRunnerPoolImage
 		// Provides details of a particular machine spec.
 		@json("machine_size_details", omitempty = true)
 		machineSizeDetails ActionsHostedRunnerMachineSpec = ActionsHostedRunnerMachineSpec{}
@@ -399,25 +400,6 @@ partial module adm.dev.github {
 		// The available SSD storage for the machine spec.
 		@json("storage_gb", omitempty = true)
 		storageGb int = 0
-	}
-
-	// Provides details of a hosted runner image
-	struct ActionsHostedRunnerPoolImage {
-		// The ID of the image.
-		@json(omitempty = true)
-		id string = ""
-		// Image size in GB.
-		@json("size_gb", omitempty = true)
-		sizeGb int = 0
-		// Display name for this image.
-		@json("display_name", omitempty = true)
-		displayName string = ""
-		// The image provider.
-		@json(omitempty = true)
-		source string = ""
-		// The image version of the hosted runner pool.
-		@json(omitempty = true)
-		version string = ""
 	}
 
 	// ActionsListConcurrencyGroupsForRepositoryItem
@@ -798,6 +780,7 @@ partial module adm.dev.github {
 		// The type of the activity that was performed.
 		@json("activity_type", omitempty = true)
 		activityType string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		actor ?SimpleUser
 	}
@@ -884,6 +867,10 @@ partial module adm.dev.github {
 		githubEnterpriseImporter string[] = []
 		@json(omitempty = true)
 		web string[] = []
+		// Public destination IP ranges in CIDR notation for shared GitHub-managed ingress
+		// infrastructure.
+		@json("shared_ingress", omitempty = true)
+		sharedIngress string[] = []
 		@json(omitempty = true)
 		api string[] = []
 		@json(omitempty = true)
@@ -1308,6 +1295,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
@@ -1475,6 +1463,8 @@ partial module adm.dev.github {
 		// Whether to allow rebase merges for pull requests.
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		// Whether to allow squash merges for pull requests.
@@ -1569,6 +1559,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
@@ -1736,6 +1727,8 @@ partial module adm.dev.github {
 		// Whether to allow rebase merges for pull requests.
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		// Whether to allow squash merges for pull requests.
@@ -1939,10 +1932,11 @@ partial module adm.dev.github {
 		createdAt time.Time = time.Time{}
 		@json(omitempty = true)
 		fingerprint ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
-		installation ?ScopedInstallation
+		installation ?NullableScopedInstallation
 		@json("expires_at", omitempty = true)
 		expiresAt ?time.Time
 	}
@@ -2022,6 +2016,7 @@ partial module adm.dev.github {
 		comments int = 0
 		@json("comments_enabled", omitempty = true)
 		commentsEnabled bool = false
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("comments_url", omitempty = true)
@@ -2584,6 +2579,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("check_suite", omitempty = true)
 		checkSuite ?CheckRunCheckSuite
+		// GitHub apps are a new way to extend GitHub.
 		@json(omitempty = true)
 		app ?Integration
 		// Pull requests that are open with a `head_sha` or `head_branch` that matches the check.
@@ -2733,6 +2729,7 @@ partial module adm.dev.github {
 		after ?string
 		@json("pull_requests", omitempty = true)
 		pullRequests PullRequestMinimal[] = []
+		// GitHub apps are a new way to extend GitHub.
 		@json(omitempty = true)
 		app ?Integration
 		// Minimal Repository
@@ -3512,6 +3509,7 @@ partial module adm.dev.github {
 		line ?int
 		@json("commit_id", omitempty = true)
 		commitId string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("created_at", omitempty = true)
@@ -3666,8 +3664,10 @@ partial module adm.dev.github {
 	struct CommitCommit {
 		@json(omitempty = true)
 		url string = ""
+		// Metaproperties for Git author/committer information.
 		@json(omitempty = true)
 		author ?GitUser
+		// Metaproperties for Git author/committer information.
 		@json(omitempty = true)
 		committer ?GitUser
 		@json(omitempty = true)
@@ -3742,8 +3742,10 @@ partial module adm.dev.github {
 		commentsUrl string = ""
 		@json(omitempty = true)
 		commit CommitSearchResultItemCommit = CommitSearchResultItemCommit{}
+		// A GitHub user.
 		@json(omitempty = true)
 		author ?SimpleUser
+		// Metaproperties for Git author/committer information.
 		@json(omitempty = true)
 		committer ?GitUser
 		@json(omitempty = true)
@@ -3763,6 +3765,7 @@ partial module adm.dev.github {
 	struct CommitSearchResultItemCommit {
 		@json(omitempty = true)
 		author CommitSearchResultItemCommitAuthor = CommitSearchResultItemCommitAuthor{}
+		// Metaproperties for Git author/committer information.
 		@json(omitempty = true)
 		committer ?GitUser
 		@json("comment_count", omitempty = true)
@@ -3815,14 +3818,6 @@ partial module adm.dev.github {
 		total int = 0
 	}
 
-	// Community Health File
-	struct CommunityHealthFile {
-		@json(omitempty = true)
-		url string = ""
-		@json("html_url", omitempty = true)
-		htmlUrl string = ""
-	}
-
 	// Community Profile
 	struct CommunityProfile {
 		@json("health_percentage", omitempty = true)
@@ -3841,20 +3836,22 @@ partial module adm.dev.github {
 
 	// CommunityProfileFiles
 	struct CommunityProfileFiles {
+		// Code of Conduct Simple
 		@json("code_of_conduct", omitempty = true)
 		codeOfConduct ?CodeOfConductSimple
 		@json("code_of_conduct_file", omitempty = true)
-		codeOfConductFile ?CommunityHealthFile
+		codeOfConductFile ?NullableCommunityHealthFile
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
-		contributing ?CommunityHealthFile
+		contributing ?NullableCommunityHealthFile
 		@json(omitempty = true)
-		readme ?CommunityHealthFile
+		readme ?NullableCommunityHealthFile
 		@json("issue_template", omitempty = true)
-		issueTemplate ?CommunityHealthFile
+		issueTemplate ?NullableCommunityHealthFile
 		@json("pull_request_template", omitempty = true)
-		pullRequestTemplate ?CommunityHealthFile
+		pullRequestTemplate ?NullableCommunityHealthFile
 	}
 
 	// A concurrency group with the workflow runs and jobs that are either currently holding or
@@ -4008,6 +4005,7 @@ partial module adm.dev.github {
 
 	// Contributor Activity
 	struct ContributorActivity {
+		// A GitHub user.
 		@json(omitempty = true)
 		author ?SimpleUser
 		@json(omitempty = true)
@@ -4026,6 +4024,16 @@ partial module adm.dev.github {
 		d int = 0
 		@json(omitempty = true)
 		c int = 0
+	}
+
+	// A request for Copilot to review a pull request.
+	struct CopilotCodeReviewRequest {
+		// The global node ID of the review request.
+		@json("node_id", omitempty = true)
+		nodeId string = ""
+		// The current state of the review request.
+		@json(omitempty = true)
+		state string = ""
 	}
 
 	// CreateEvent
@@ -4108,6 +4116,9 @@ partial module adm.dev.github {
 		// Who can edit the values of the property
 		@json("values_editable_by", omitempty = true)
 		valuesEditableBy ?string
+		// A regular expression (RE2 syntax) that values of the property must match.
+		@json(omitempty = true)
+		regex ?string
 		// Whether setting properties values is mandatory
 		@json("require_explicit_values", omitempty = true)
 		requireExplicitValues bool = false
@@ -4259,6 +4270,7 @@ partial module adm.dev.github {
 		// The time that the alert was dismissed in ISO 8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 		@json("dismissed_at", omitempty = true)
 		dismissedAt ?time.Time
+		// A GitHub user.
 		@json("dismissed_by", omitempty = true)
 		dismissedBy ?SimpleUser
 		// The reason that the alert was dismissed.
@@ -4280,6 +4292,10 @@ partial module adm.dev.github {
 		// The users assigned to this alert.
 		@json(omitempty = true)
 		assignees SimpleUser[] = []
+		// The reachability result for the vulnerability that triggered the alert, indicating
+		// whether a vulnerable function is reachable from the repository's own code.
+		@json(omitempty = true)
+		reachability ?DependabotAlertReachability
 	}
 
 	// Details for the vulnerable dependency.
@@ -4363,6 +4379,17 @@ partial module adm.dev.github {
 		// The unique package name within its ecosystem.
 		@json(omitempty = true)
 		name string = ""
+	}
+
+	// The reachability result for the vulnerability that triggered the alert, indicating whether a
+	// vulnerable function is reachable from the repository's own code.
+	struct DependabotAlertReachability {
+		// The reachability verdict for the alert.
+		@json(omitempty = true)
+		verdict string = ""
+		// The reason for the reachability verdict.
+		@json(omitempty = true)
+		reason string = ""
 	}
 
 	// Details for the GitHub Security Advisory.
@@ -4550,6 +4577,7 @@ partial module adm.dev.github {
 		environment string = ""
 		@json(omitempty = true)
 		description ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		creator ?SimpleUser
 		@json("created_at", omitempty = true)
@@ -4566,6 +4594,7 @@ partial module adm.dev.github {
 		// Specifies if the given environment is one that end-users directly interact with.
 		@json("production_environment", omitempty = true)
 		productionEnvironment bool = false
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 	}
@@ -5407,6 +5436,7 @@ partial module adm.dev.github {
 		// The URL to review the deployment protection rule.
 		@json("deployment_callback_url", omitempty = true)
 		deploymentCallbackUrl string = ""
+		// A request for a specific ref(branch,sha,tag) to be deployed
 		@json(omitempty = true)
 		deployment ?Deployment
 		@json("pull_requests", omitempty = true)
@@ -6028,6 +6058,7 @@ partial module adm.dev.github {
 		// Specifies if the given environment is one that end-users directly interact with.
 		@json("production_environment", omitempty = true)
 		productionEnvironment bool = false
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 	}
@@ -6043,6 +6074,7 @@ partial module adm.dev.github {
 		// The state of the status.
 		@json(omitempty = true)
 		state string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		creator ?SimpleUser
 		// A short description of the status.
@@ -6068,6 +6100,7 @@ partial module adm.dev.github {
 		// The URL to associate with this status.
 		@json("log_url", omitempty = true)
 		logUrl string = ""
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 	}
@@ -7694,6 +7727,7 @@ partial module adm.dev.github {
 		// Unique identifier of the enterprise to which this team belongs
 		@json("enterprise_id", omitempty = true)
 		enterpriseId int = 0
+		// Groups of organization members that gives permissions on specified repositories.
 		@json(omitempty = true)
 		parent ?TeamSimple
 	}
@@ -8358,8 +8392,11 @@ partial module adm.dev.github {
 		permissions ?FullRepositoryPermissions
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// A repository on GitHub.
 		@json("template_repository", omitempty = true)
 		templateRepository ?Repository
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken ?string
 		@json("allow_squash_merge", omitempty = true)
@@ -8396,8 +8433,10 @@ partial module adm.dev.github {
 		subscribersCount int = 0
 		@json("network_count", omitempty = true)
 		networkCount int = 0
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
+		// A GitHub user.
 		@json(omitempty = true)
 		organization ?SimpleUser
 		// A repository on GitHub.
@@ -8452,6 +8491,7 @@ partial module adm.dev.github {
 		// The comment text.
 		@json(omitempty = true)
 		body string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("created_at", omitempty = true)
@@ -8469,6 +8509,7 @@ partial module adm.dev.github {
 		url string = ""
 		@json(omitempty = true)
 		version string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("change_status", omitempty = true)
@@ -8489,6 +8530,7 @@ partial module adm.dev.github {
 
 	// Gist History
 	struct GistHistory {
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
@@ -8614,10 +8656,12 @@ partial module adm.dev.github {
 		comments int = 0
 		@json("comments_enabled", omitempty = true)
 		commentsEnabled bool = false
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("comments_url", omitempty = true)
 		commentsUrl string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		owner ?SimpleUser
 		@json(omitempty = true)
@@ -9211,6 +9255,7 @@ partial module adm.dev.github {
 		singleFilePaths string[] = []
 		@json("app_slug", omitempty = true)
 		appSlug string = ""
+		// A GitHub user.
 		@json("suspended_by", omitempty = true)
 		suspendedBy ?SimpleUser
 		@json("suspended_at", omitempty = true)
@@ -9725,6 +9770,7 @@ partial module adm.dev.github {
 		// Contents of the issue
 		@json(omitempty = true)
 		body ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		// Labels to associate with this issue; pass one or more label names to replace the set of
@@ -9732,10 +9778,12 @@ partial module adm.dev.github {
 		// the labels are silently dropped for users without push access to the repository
 		@json(omitempty = true)
 		labels any[] = []
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
 		@json(omitempty = true)
 		assignees SimpleUser[] = []
+		// A collection of related issues and pull requests.
 		@json(omitempty = true)
 		milestone ?Milestone
 		@json(omitempty = true)
@@ -9754,6 +9802,7 @@ partial module adm.dev.github {
 		updatedAt time.Time = time.Time{}
 		@json(omitempty = true)
 		draft bool = false
+		// A GitHub user.
 		@json("closed_by", omitempty = true)
 		closedBy ?SimpleUser
 		@json("body_html", omitempty = true)
@@ -9768,6 +9817,7 @@ partial module adm.dev.github {
 		// A repository on GitHub.
 		@json(omitempty = true)
 		repository ?Repository
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		// How the author is associated with the repository.
@@ -9780,6 +9830,7 @@ partial module adm.dev.github {
 		// URL to get the parent issue of this issue, if it is a sub-issue
 		@json("parent_issue_url", omitempty = true)
 		parentIssueUrl ?string
+		// Comments provide a way for people to collaborate on an issue.
 		@json("pinned_comment", omitempty = true)
 		pinnedComment ?IssueComment
 		@json("issue_dependencies_summary", omitempty = true)
@@ -9790,6 +9841,63 @@ partial module adm.dev.github {
 		// call the API about.
 		@json(ignore = true)
 		internal origin ?RepoRef = none
+	}
+
+	// Issue artifacts are named, typed pieces of content attached to an issue.
+	struct IssueArtifact {
+		// The globally unique identifier of the artifact.
+		@json(omitempty = true)
+		id int = 0
+		// The canonical browser URL for the artifact in its issue context.
+		@json("html_url", omitempty = true)
+		htmlUrl string = ""
+		// The artifact number within the issue.
+		@json(omitempty = true)
+		number int = 0
+		// The artifact type.
+		@json("type", omitempty = true)
+		typeName string = ""
+		// The human-readable name of the artifact.
+		@json(omitempty = true)
+		name string = ""
+		// The artifact content.
+		@json(omitempty = true)
+		body string = ""
+		// The artifact content rendered as HTML, or `null` if rendering times out or is skipped to
+		// protect the response's time budget.
+		@json("body_html", omitempty = true)
+		bodyHtml ?string
+		// A short, generated summary of the artifact.
+		@json(omitempty = true)
+		description string = ""
+		// The user or integration that created the artifact.
+		@json(omitempty = true)
+		creator ?IssueArtifactCreator
+		// The user or integration that most recently updated the artifact.
+		@json("updated_by_actor", omitempty = true)
+		updatedByActor ?IssueArtifactUpdatedByActor
+		// The time the artifact was created.
+		@json("created_at", omitempty = true)
+		createdAt ?time.Time
+		// The time the artifact was last updated.
+		@json("updated_at", omitempty = true)
+		updatedAt ?time.Time
+	}
+
+	// The user or integration that created the artifact.
+	struct IssueArtifactCreator {
+		@json(omitempty = true)
+		login string = ""
+		@json(omitempty = true)
+		id int = 0
+	}
+
+	// The user or integration that most recently updated the artifact.
+	struct IssueArtifactUpdatedByActor {
+		@json(omitempty = true)
+		login string = ""
+		@json(omitempty = true)
+		id int = 0
 	}
 
 	// Comments provide a way for people to collaborate on an issue.
@@ -9811,6 +9919,7 @@ partial module adm.dev.github {
 		bodyHtml string = ""
 		@json("html_url", omitempty = true)
 		htmlUrl string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json("created_at", omitempty = true)
@@ -9822,14 +9931,17 @@ partial module adm.dev.github {
 		// How the author is associated with the repository.
 		@json("author_association", omitempty = true)
 		authorAssociation string = ""
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		@json(omitempty = true)
 		reactions ?ReactionRollup
+		// Context around who pinned an issue comment and when it was pinned.
 		@json(omitempty = true)
-		pin ?PinnedIssueComment
+		pin ?NullablePinnedIssueComment
+		// Details about why an issue comment was minimized.
 		@json(omitempty = true)
-		minimized ?IssueCommentMinimized
+		minimized ?NullableIssueCommentMinimized
 	}
 
 	// IssueCommentEvent
@@ -9881,6 +9993,7 @@ partial module adm.dev.github {
 		issueUrl string = ""
 		@json("node_id", omitempty = true)
 		nodeId string = ""
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		@json(omitempty = true)
@@ -9890,10 +10003,12 @@ partial module adm.dev.github {
 		// URL for the issue comment
 		@json(omitempty = true)
 		url string = ""
+		// Context around who pinned an issue comment and when it was pinned.
 		@json(omitempty = true)
-		pin ?PinnedIssueComment
+		pin ?NullablePinnedIssueComment
+		// Details about why an issue comment was minimized.
 		@json(omitempty = true)
-		minimized ?IssueCommentMinimized
+		minimized ?NullableIssueCommentMinimized
 		@json(omitempty = true)
 		user ?IssueCommentEventCommentUser
 	}
@@ -10491,13 +10606,6 @@ partial module adm.dev.github {
 		userViewType string = ""
 	}
 
-	// Details about why an issue comment was minimized.
-	struct IssueCommentMinimized {
-		// The reason the comment was minimized.
-		@json(omitempty = true)
-		reason ?string
-	}
-
 	// IssueDependenciesEvent
 	struct IssueDependenciesEvent {
 		@json(omitempty = true)
@@ -10554,6 +10662,7 @@ partial module adm.dev.github {
 		nodeId string = ""
 		@json(omitempty = true)
 		url string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		actor ?SimpleUser
 		@json(omitempty = true)
@@ -10564,17 +10673,22 @@ partial module adm.dev.github {
 		commitUrl ?string
 		@json("created_at", omitempty = true)
 		createdAt time.Time = time.Time{}
+		// Issues are a great way to keep track of tasks, enhancements, and bugs for your projects.
 		@json(omitempty = true)
 		issue ?Issue
 		// Issue Event Label
 		@json(omitempty = true)
 		label ?IssueEventLabel
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
+		// A GitHub user.
 		@json(omitempty = true)
 		assigner ?SimpleUser
+		// A GitHub user.
 		@json("review_requester", omitempty = true)
 		reviewRequester ?SimpleUser
+		// A GitHub user.
 		@json("requested_reviewer", omitempty = true)
 		requestedReviewer ?SimpleUser
 		// Groups of organization members that gives permissions on specified repositories.
@@ -10597,21 +10711,27 @@ partial module adm.dev.github {
 		// The type of issue.
 		@json("prev_issue_type", omitempty = true)
 		prevIssueType ?IssueTypeWebhook
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("sub_issue", omitempty = true)
 		subIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("parent_issue", omitempty = true)
 		parentIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("blocked_by", omitempty = true)
 		blockedBy ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json(omitempty = true)
 		blocking ?IssueReference
+		// The intent behind an agent's action on an issue, including the rationale and confidence.
 		@json(omitempty = true)
-		intent ?IssueEventIntent
+		intent ?NullableIssueEventIntent
 		// How the author is associated with the repository.
 		@json("author_association", omitempty = true)
 		authorAssociation string = ""
 		@json("lock_reason", omitempty = true)
 		lockReason ?string
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 	}
@@ -10647,12 +10767,14 @@ partial module adm.dev.github {
 		commitUrl ?string
 		@json("created_at", omitempty = true)
 		createdAt string = ""
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		@json(omitempty = true)
 		label ?IssueEventForIssueLabel
+		// The intent behind an agent's action on an issue, including the rationale and confidence.
 		@json(omitempty = true)
-		intent ?IssueEventIntent
+		intent ?NullableIssueEventIntent
 		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
@@ -10684,12 +10806,16 @@ partial module adm.dev.github {
 		// The type of issue.
 		@json("prev_issue_type", omitempty = true)
 		prevIssueType ?IssueTypeWebhook
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("sub_issue", omitempty = true)
 		subIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("parent_issue", omitempty = true)
 		parentIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("blocked_by", omitempty = true)
 		blockedBy ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json(omitempty = true)
 		blocking ?IssueReference
 	}
@@ -10742,16 +10868,6 @@ partial module adm.dev.github {
 		from string = ""
 		@json(omitempty = true)
 		to string = ""
-	}
-
-	// The intent behind an agent's action on an issue, including the rationale and confidence.
-	struct IssueEventIntent {
-		// The reasoning the agent provided for the change.
-		@json(omitempty = true)
-		rationale ?string
-		// The confidence level the agent had when performing this action.
-		@json(omitempty = true)
-		confidence ?string
 	}
 
 	// Issue Event Label
@@ -11009,6 +11125,7 @@ partial module adm.dev.github {
 		activeLockReason ?string
 		@json(omitempty = true)
 		assignees SimpleUser[] = []
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
@@ -11023,8 +11140,10 @@ partial module adm.dev.github {
 		state string = ""
 		@json("state_reason", omitempty = true)
 		stateReason ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
+		// A collection of related issues and pull requests.
 		@json(omitempty = true)
 		milestone ?Milestone
 		@json(omitempty = true)
@@ -11060,8 +11179,10 @@ partial module adm.dev.github {
 		// The type assigned to the issue.
 		@json("type", omitempty = true)
 		typeName ?IssueType
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
+		// Comments provide a way for people to collaborate on an issue.
 		@json("pinned_comment", omitempty = true)
 		pinnedComment ?IssueComment
 		@json(omitempty = true)
@@ -11365,6 +11486,106 @@ partial module adm.dev.github {
 		description ?string
 	}
 
+	// Issue artifacts are named, typed pieces of content attached to an issue.
+	struct IssuesGetIssueArtifactResponse {
+		// The globally unique identifier of the artifact.
+		@json(omitempty = true)
+		id int = 0
+		// The canonical browser URL for the artifact in its issue context.
+		@json("html_url", omitempty = true)
+		htmlUrl string = ""
+		// The artifact number within the issue.
+		@json(omitempty = true)
+		number int = 0
+		// The artifact type.
+		@json("type", omitempty = true)
+		typeName string = ""
+		// The human-readable name of the artifact.
+		@json(omitempty = true)
+		name string = ""
+		// The artifact content.
+		@json(omitempty = true)
+		body string = ""
+		// The artifact content rendered as HTML, or `null` if rendering times out or is skipped to
+		// protect the response's time budget.
+		@json("body_html", omitempty = true)
+		bodyHtml ?string
+		// A short, generated summary of the artifact.
+		@json(omitempty = true)
+		description string = ""
+		// The user or integration that created the artifact.
+		@json(omitempty = true)
+		creator ?IssuesGetIssueArtifactResponseCreator
+		// The user or integration that most recently updated the artifact.
+		@json("updated_by_actor", omitempty = true)
+		updatedByActor ?IssuesGetIssueArtifactResponseUpdatedByActor
+		// The time the artifact was created.
+		@json("created_at", omitempty = true)
+		createdAt ?time.Time
+		// The time the artifact was last updated.
+		@json("updated_at", omitempty = true)
+		updatedAt ?time.Time
+		// Issue artifacts are named, typed pieces of content attached to an issue.
+		@json(omitempty = true)
+		artifact ?IssueArtifact
+		// Whether another page of retained versions is available.
+		@json("has_next_page", omitempty = true)
+		hasNextPage bool = false
+		// The number of retained artifact versions.
+		@json("total_count", omitempty = true)
+		totalCount int = 0
+		// The artifact version history, ordered from newest to oldest.
+		@json(omitempty = true)
+		versions IssuesGetIssueArtifactResponseVersionsItem[] = []
+	}
+
+	// The user or integration that created the artifact.
+	struct IssuesGetIssueArtifactResponseCreator {
+		@json(omitempty = true)
+		login string = ""
+		@json(omitempty = true)
+		id int = 0
+	}
+
+	// The user or integration that most recently updated the artifact.
+	struct IssuesGetIssueArtifactResponseUpdatedByActor {
+		@json(omitempty = true)
+		login string = ""
+		@json(omitempty = true)
+		id int = 0
+	}
+
+	// IssuesGetIssueArtifactResponseVersionsItem
+	struct IssuesGetIssueArtifactResponseVersionsItem {
+		// The sequential version number.
+		@json(omitempty = true)
+		version int = 0
+		// The artifact name at this version.
+		@json(omitempty = true)
+		name string = ""
+		// The artifact content at this version.
+		@json(omitempty = true)
+		body string = ""
+		// The artifact content at this version rendered as HTML, or `null` if rendering times out
+		// or is skipped to protect the response's time budget.
+		@json("body_html", omitempty = true)
+		bodyHtml ?string
+		// The time this version was created.
+		@json("created_at", omitempty = true)
+		createdAt ?time.Time
+		// The user or integration that created this version.
+		@json(omitempty = true)
+		actor ?IssuesGetIssueArtifactResponseVersionsItemActor
+	}
+
+	// The user or integration that created this version.
+	struct IssuesGetIssueArtifactResponseVersionsItemActor {
+		@json(omitempty = true)
+		login string = ""
+		@json(omitempty = true)
+		id int = 0
+	}
+
 	// Issues are a great way to keep track of tasks, enhancements, and bugs for your projects.
 	struct IssuesUpdateResponse {
 		@json(omitempty = true)
@@ -11399,6 +11620,7 @@ partial module adm.dev.github {
 		// Contents of the issue
 		@json(omitempty = true)
 		body ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		// Labels to associate with this issue; pass one or more label names to replace the set of
@@ -11406,10 +11628,12 @@ partial module adm.dev.github {
 		// the labels are silently dropped for users without push access to the repository
 		@json(omitempty = true)
 		labels any[] = []
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
 		@json(omitempty = true)
 		assignees SimpleUser[] = []
+		// A collection of related issues and pull requests.
 		@json(omitempty = true)
 		milestone ?Milestone
 		@json(omitempty = true)
@@ -11428,6 +11652,7 @@ partial module adm.dev.github {
 		updatedAt ?time.Time
 		@json(omitempty = true)
 		draft bool = false
+		// A GitHub user.
 		@json("closed_by", omitempty = true)
 		closedBy ?SimpleUser
 		@json("body_html", omitempty = true)
@@ -11442,6 +11667,7 @@ partial module adm.dev.github {
 		// A repository on GitHub.
 		@json(omitempty = true)
 		repository ?Repository
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		// How the author is associated with the repository.
@@ -11454,6 +11680,7 @@ partial module adm.dev.github {
 		// URL to get the parent issue of this issue, if it is a sub-issue
 		@json("parent_issue_url", omitempty = true)
 		parentIssueUrl ?string
+		// Comments provide a way for people to collaborate on an issue.
 		@json("pinned_comment", omitempty = true)
 		pinnedComment ?IssueComment
 		@json("issue_dependencies_summary", omitempty = true)
@@ -12264,6 +12491,7 @@ partial module adm.dev.github {
 		// A GitHub organization.
 		@json(omitempty = true)
 		organization ?OrganizationSimpleWebhooks
+		// The repository on GitHub where the event occurred.
 		@json(omitempty = true)
 		repository ?RepositoryWebhooks
 		// A GitHub user.
@@ -12326,6 +12554,7 @@ partial module adm.dev.github {
 		title string = ""
 		@json(omitempty = true)
 		description ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		creator ?SimpleUser
 		@json("open_issues", omitempty = true)
@@ -12559,6 +12788,8 @@ partial module adm.dev.github {
 		permissions ?MinimalRepositoryPermissions
 		@json("role_name", omitempty = true)
 		roleName string = ""
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		@json("delete_branch_on_merge", omitempty = true)
@@ -12615,6 +12846,80 @@ partial module adm.dev.github {
 		triage bool = false
 		@json(omitempty = true)
 		pull bool = false
+	}
+
+	// Provides details of a hosted runner image
+	struct NullableActionsHostedRunnerPoolImage {
+		// The ID of the image.
+		@json(omitempty = true)
+		id string = ""
+		// Image size in GB.
+		@json("size_gb", omitempty = true)
+		sizeGb int = 0
+		// Display name for this image.
+		@json("display_name", omitempty = true)
+		displayName string = ""
+		// The image provider.
+		@json(omitempty = true)
+		source string = ""
+		// The image version of the hosted runner pool.
+		@json(omitempty = true)
+		version string = ""
+	}
+
+	// Community Health File
+	struct NullableCommunityHealthFile {
+		@json(omitempty = true)
+		url string = ""
+		@json("html_url", omitempty = true)
+		htmlUrl string = ""
+	}
+
+	// Details about why an issue comment was minimized.
+	struct NullableIssueCommentMinimized {
+		// The reason the comment was minimized.
+		@json(omitempty = true)
+		reason ?string
+	}
+
+	// The intent behind an agent's action on an issue, including the rationale and confidence.
+	struct NullableIssueEventIntent {
+		// The reasoning the agent provided for the change.
+		@json(omitempty = true)
+		rationale ?string
+		// The confidence level the agent had when performing this action.
+		@json(omitempty = true)
+		confidence ?string
+	}
+
+	// Context around who pinned an issue comment and when it was pinned.
+	struct NullablePinnedIssueComment {
+		@json("pinned_at", omitempty = true)
+		pinnedAt time.Time = time.Time{}
+		// A GitHub user.
+		@json("pinned_by", omitempty = true)
+		pinnedBy ?SimpleUser
+	}
+
+	// Scoped Installation
+	struct NullableScopedInstallation {
+		// The permissions granted to the fine-grained access token.
+		@json(omitempty = true)
+		permissions AppPermissions = AppPermissions{}
+		// Describe whether all repositories have been selected or there's a selection involved
+		@json("repository_selection", omitempty = true)
+		repositorySelection string = ""
+		@json("single_file_name", omitempty = true)
+		singleFileName ?string
+		@json("has_multiple_single_files", omitempty = true)
+		hasMultipleSingleFiles bool = false
+		@json("single_file_paths", omitempty = true)
+		singleFilePaths string[] = []
+		@json("repositories_url", omitempty = true)
+		repositoriesUrl string = ""
+		// A GitHub user.
+		@json(omitempty = true)
+		account SimpleUser = SimpleUser{}
 	}
 
 	// Actions OIDC subject customization for a repository
@@ -12716,6 +13021,7 @@ partial module adm.dev.github {
 		// A GitHub organization.
 		@json(omitempty = true)
 		organization OrganizationSimple = OrganizationSimple{}
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
@@ -13233,6 +13539,7 @@ partial module adm.dev.github {
 		// A list of permissions included in this role.
 		@json(omitempty = true)
 		permissions string[] = []
+		// A GitHub user.
 		@json(omitempty = true)
 		organization ?SimpleUser
 		// The date and time the role was created.
@@ -13523,8 +13830,10 @@ partial module adm.dev.github {
 		versionCount int = 0
 		@json(omitempty = true)
 		visibility string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		owner ?SimpleUser
+		// Minimal Repository
 		@json(omitempty = true)
 		repository ?MinimalRepository
 		@json("created_at", omitempty = true)
@@ -14063,6 +14372,7 @@ partial module adm.dev.github {
 		status string = ""
 		@json(omitempty = true)
 		error PageBuildError = PageBuildError{}
+		// A GitHub user.
 		@json(omitempty = true)
 		pusher ?SimpleUser
 		@json(omitempty = true)
@@ -14481,6 +14791,7 @@ partial module adm.dev.github {
 		// Unique identifier of the enterprise to which this team belongs
 		@json("enterprise_id", omitempty = true)
 		enterpriseId int = 0
+		// Groups of organization members that gives permissions on specified repositories.
 		@json(omitempty = true)
 		parent ?TeamSimple
 	}
@@ -14689,14 +15000,6 @@ partial module adm.dev.github {
 		// The URL to which the payloads will be delivered.
 		@json(omitempty = true)
 		url string = ""
-	}
-
-	// Context around who pinned an issue comment and when it was pinned.
-	struct PinnedIssueComment {
-		@json("pinned_at", omitempty = true)
-		pinnedAt time.Time = time.Time{}
-		@json("pinned_by", omitempty = true)
-		pinnedBy ?SimpleUser
 	}
 
 	// Private User
@@ -15112,11 +15415,13 @@ partial module adm.dev.github {
 		// The time when the project was deleted.
 		@json("deleted_at", omitempty = true)
 		deletedAt ?time.Time
+		// A GitHub user.
 		@json("deleted_by", omitempty = true)
 		deletedBy ?SimpleUser
 		// The current state of the project.
 		@json(omitempty = true)
 		state string = ""
+		// An status update belonging to a project
 		@json("latest_status_update", omitempty = true)
 		latestStatusUpdate ?ProjectsV2StatusUpdate
 		// Whether this project is a template
@@ -15584,6 +15889,7 @@ partial module adm.dev.github {
 		body ?string
 		@json(omitempty = true)
 		labels PullRequestLabelsItem[] = []
+		// A collection of related issues and pull requests.
 		@json(omitempty = true)
 		milestone ?Milestone
 		@json("active_lock_reason", omitempty = true)
@@ -15598,6 +15904,7 @@ partial module adm.dev.github {
 		mergedAt ?time.Time
 		@json("merge_commit_sha", omitempty = true)
 		mergeCommitSha ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
 		@json(omitempty = true)
@@ -15632,6 +15939,7 @@ partial module adm.dev.github {
 		rebaseable ?bool
 		@json("mergeable_state", omitempty = true)
 		mergeableState string = ""
+		// A GitHub user.
 		@json("merged_by", omitempty = true)
 		mergedBy ?SimpleUser
 		@json(omitempty = true)
@@ -17408,6 +17716,7 @@ partial module adm.dev.github {
 		id int = 0
 		@json("node_id", omitempty = true)
 		nodeId string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		// The text of the review.
@@ -17415,6 +17724,13 @@ partial module adm.dev.github {
 		body string = ""
 		@json(omitempty = true)
 		state string = ""
+		// Whether this review was produced by Copilot code review.
+		@json("is_copilot_code_review", omitempty = true)
+		isCopilotCodeReview bool = false
+		// The persisted effective effort used to produce this Copilot code review, or null if
+		// unavailable.
+		@json("copilot_code_review_effort", omitempty = true)
+		copilotCodeReviewEffort ?string
 		@json("html_url", omitempty = true)
 		htmlUrl string = ""
 		@json("pull_request_url", omitempty = true)
@@ -17437,6 +17753,12 @@ partial module adm.dev.github {
 
 	// Pull Request Review Comments are comments on a portion of the Pull Request's diff.
 	struct PullRequestReviewComment {
+		// Whether this comment was produced by Copilot code review.
+		@json("is_copilot_code_review", omitempty = true)
+		isCopilotCodeReview bool = false
+		// Sources reported as contributing to this comment; may be incomplete.
+		@json("copilot_code_review_sources", omitempty = true)
+		copilotCodeReviewSources PullRequestReviewCommentCopilotCodeReviewSourcesItem[] = []
 		// URL for the pull request review comment
 		@json(omitempty = true)
 		url string = ""
@@ -17470,6 +17792,7 @@ partial module adm.dev.github {
 		// The comment ID to reply to.
 		@json("in_reply_to_id", omitempty = true)
 		inReplyToId int = 0
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		// The text of the comment.
@@ -17517,6 +17840,19 @@ partial module adm.dev.github {
 		bodyHtml string = ""
 		@json("body_text", omitempty = true)
 		bodyText string = ""
+	}
+
+	// PullRequestReviewCommentCopilotCodeReviewSourcesItem
+	struct PullRequestReviewCommentCopilotCodeReviewSourcesItem {
+		// The kind of contributing source.
+		@json(omitempty = true)
+		kind string = ""
+		// The reported source name, or "custom instructions" for CUSTOM_INSTRUCTIONS.
+		@json(omitempty = true)
+		name string = ""
+		// The validated repository-relative source path, if available.
+		@json(omitempty = true)
+		path string = ""
 	}
 
 	// PullRequestReviewCommentEvent
@@ -22208,12 +22544,14 @@ partial module adm.dev.github {
 		locked bool = false
 		@json(omitempty = true)
 		title string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
 		body ?string
 		@json(omitempty = true)
 		labels PullRequestSimpleLabelsItem[] = []
+		// A collection of related issues and pull requests.
 		@json(omitempty = true)
 		milestone ?Milestone
 		@json("active_lock_reason", omitempty = true)
@@ -22228,6 +22566,7 @@ partial module adm.dev.github {
 		mergedAt ?time.Time
 		@json("merge_commit_sha", omitempty = true)
 		mergeCommitSha ?string
+		// A GitHub user.
 		@json(omitempty = true)
 		assignee ?SimpleUser
 		@json(omitempty = true)
@@ -22267,6 +22606,7 @@ partial module adm.dev.github {
 		repo Repository = Repository{}
 		@json(omitempty = true)
 		sha string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 	}
@@ -22282,6 +22622,7 @@ partial module adm.dev.github {
 		repo Repository = Repository{}
 		@json(omitempty = true)
 		sha string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 	}
@@ -22950,6 +23291,7 @@ partial module adm.dev.github {
 		id int = 0
 		@json("node_id", omitempty = true)
 		nodeId string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		// The reaction to use
@@ -23507,6 +23849,7 @@ partial module adm.dev.github {
 		createdAt time.Time = time.Time{}
 		@json("updated_at", omitempty = true)
 		updatedAt time.Time = time.Time{}
+		// A GitHub user.
 		@json(omitempty = true)
 		uploader ?SimpleUser
 	}
@@ -23597,6 +23940,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		owner ?SimpleUser
 		@json(omitempty = true)
@@ -23750,12 +24094,15 @@ partial module adm.dev.github {
 		// The repository visibility: public, private, or internal.
 		@json(omitempty = true)
 		visibility string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
 		permissions ?RepoSearchResultItemPermissions
 		@json("text_matches", omitempty = true)
 		textMatches SearchResultTextMatchesItem[] = []
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		@json("allow_merge_commit", omitempty = true)
@@ -23924,6 +24271,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
@@ -24091,6 +24439,8 @@ partial module adm.dev.github {
 		// Whether to allow rebase merges for pull requests.
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		// Whether to allow squash merges for pull requests.
@@ -24587,6 +24937,7 @@ partial module adm.dev.github {
 		permission string = ""
 		@json("role_name", omitempty = true)
 		roleName string = ""
+		// Collaborator
 		@json(omitempty = true)
 		user ?Collaborator
 	}
@@ -24715,8 +25066,10 @@ partial module adm.dev.github {
 		// Minimal Repository
 		@json(omitempty = true)
 		repository MinimalRepository = MinimalRepository{}
+		// A GitHub user.
 		@json(omitempty = true)
 		invitee ?SimpleUser
+		// A GitHub user.
 		@json(omitempty = true)
 		inviter ?SimpleUser
 		// The permission associated with the invitation.
@@ -25062,8 +25415,10 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
+		// A GitHub user.
 		@json(omitempty = true)
 		organization ?SimpleUser
 		@json(omitempty = true)
@@ -25236,6 +25591,8 @@ partial module adm.dev.github {
 		allowRebaseMerge bool = false
 		@json("template_repository", omitempty = true)
 		templateRepository ?RepositoryWebhooksTemplateRepository
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		// Whether to allow squash merges for pull requests.
@@ -25458,6 +25815,8 @@ partial module adm.dev.github {
 		permissions ?RepositoryWebhooksTemplateRepositoryPermissions
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		@json("allow_squash_merge", omitempty = true)
@@ -25548,6 +25907,12 @@ partial module adm.dev.github {
 
 	// Legacy Review Comment
 	struct ReviewComment {
+		// Whether this comment was produced by Copilot code review.
+		@json("is_copilot_code_review", omitempty = true)
+		isCopilotCodeReview bool = false
+		// Sources reported as contributing to this comment; may be incomplete.
+		@json("copilot_code_review_sources", omitempty = true)
+		copilotCodeReviewSources ReviewCommentCopilotCodeReviewSourcesItem[] = []
 		@json(omitempty = true)
 		url string = ""
 		@json("pull_request_review_id", omitempty = true)
@@ -25570,6 +25935,7 @@ partial module adm.dev.github {
 		originalCommitId string = ""
 		@json("in_reply_to_id", omitempty = true)
 		inReplyToId int = 0
+		// A GitHub user.
 		@json(omitempty = true)
 		user ?SimpleUser
 		@json(omitempty = true)
@@ -25614,6 +25980,19 @@ partial module adm.dev.github {
 		// The level at which the comment is targeted, can be a diff line or a file.
 		@json("subject_type", omitempty = true)
 		subjectType string = ""
+	}
+
+	// ReviewCommentCopilotCodeReviewSourcesItem
+	struct ReviewCommentCopilotCodeReviewSourcesItem {
+		// The kind of contributing source.
+		@json(omitempty = true)
+		kind string = ""
+		// The reported source name, or "custom instructions" for CUSTOM_INSTRUCTIONS.
+		@json(omitempty = true)
+		name string = ""
+		// The validated repository-relative source path, if available.
+		@json(omitempty = true)
+		path string = ""
 	}
 
 	// ReviewCommentLinks
@@ -26055,27 +26434,6 @@ partial module adm.dev.github {
 		typeName string = ""
 	}
 
-	// Scoped Installation
-	struct ScopedInstallation {
-		// The permissions granted to the fine-grained access token.
-		@json(omitempty = true)
-		permissions AppPermissions = AppPermissions{}
-		// Describe whether all repositories have been selected or there's a selection involved
-		@json("repository_selection", omitempty = true)
-		repositorySelection string = ""
-		@json("single_file_name", omitempty = true)
-		singleFileName ?string
-		@json("has_multiple_single_files", omitempty = true)
-		hasMultipleSingleFiles bool = false
-		@json("single_file_paths", omitempty = true)
-		singleFilePaths string[] = []
-		@json("repositories_url", omitempty = true)
-		repositoriesUrl string = ""
-		// A GitHub user.
-		@json(omitempty = true)
-		account SimpleUser = SimpleUser{}
-	}
-
 	// SearchIssuesAndPullRequestsResponse
 	struct SearchIssuesAndPullRequestsResponse {
 		@json("total_count", omitempty = true)
@@ -26181,6 +26539,7 @@ partial module adm.dev.github {
 		// The time that the alert was created in ISO 8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 		@json("created_at", omitempty = true)
 		createdAt ?time.Time
+		// The time that the alert was last updated in ISO 8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 		@json("updated_at", omitempty = true)
 		updatedAt ?time.Time
 		// The REST API URL of the alert resource.
@@ -26198,6 +26557,7 @@ partial module adm.dev.github {
 		// The time that the alert was resolved in ISO 8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 		@json("resolved_at", omitempty = true)
 		resolvedAt ?time.Time
+		// A GitHub user.
 		@json("resolved_by", omitempty = true)
 		resolvedBy ?SimpleUser
 		// An optional comment to resolve an alert.
@@ -26224,11 +26584,13 @@ partial module adm.dev.github {
 		// Whether push protection was bypassed for the detected secret.
 		@json("push_protection_bypassed", omitempty = true)
 		pushProtectionBypassed ?bool
+		// A GitHub user.
 		@json("push_protection_bypassed_by", omitempty = true)
 		pushProtectionBypassedBy ?SimpleUser
 		// The time that push protection was bypassed in ISO 8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 		@json("push_protection_bypassed_at", omitempty = true)
 		pushProtectionBypassedAt ?time.Time
+		// A GitHub user.
 		@json("push_protection_bypass_request_reviewer", omitempty = true)
 		pushProtectionBypassRequestReviewer ?SimpleUser
 		// An optional comment when reviewing a push protection bypass.
@@ -26247,6 +26609,7 @@ partial module adm.dev.github {
 		// or business.
 		@json("multi_repo", omitempty = true)
 		multiRepo ?bool
+		// A GitHub user.
 		@json("assigned_to", omitempty = true)
 		assignedTo ?SimpleUser
 		// An optional comment from the closure request author.
@@ -26255,6 +26618,7 @@ partial module adm.dev.github {
 		// An optional comment from the closure request reviewer.
 		@json("closure_request_reviewer_comment", omitempty = true)
 		closureRequestReviewerComment ?string
+		// A GitHub user.
 		@json("closure_request_reviewer", omitempty = true)
 		closureRequestReviewer ?SimpleUser
 		// A list of metadata key/value pairs associated with the secret scanning alert.
@@ -27035,6 +27399,7 @@ partial module adm.dev.github {
 		createdAt string = ""
 		@json("updated_at", omitempty = true)
 		updatedAt string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		creator ?SimpleUser
 	}
@@ -27427,6 +27792,7 @@ partial module adm.dev.github {
 		// Unique identifier of the enterprise to which this team belongs
 		@json("enterprise_id", omitempty = true)
 		enterpriseId int = 0
+		// Groups of organization members that gives permissions on specified repositories.
 		@json(omitempty = true)
 		parent ?TeamSimple
 	}
@@ -27859,6 +28225,7 @@ partial module adm.dev.github {
 		membersUrl string = ""
 		@json("repositories_url", omitempty = true)
 		repositoriesUrl string = ""
+		// Groups of organization members that gives permissions on specified repositories.
 		@json(omitempty = true)
 		parent ?TeamSimple
 		@json("members_count", omitempty = true)
@@ -28095,6 +28462,7 @@ partial module adm.dev.github {
 		name string = ""
 		@json("full_name", omitempty = true)
 		fullName string = ""
+		// License Simple
 		@json(omitempty = true)
 		license ?LicenseSimple
 		@json(omitempty = true)
@@ -28103,6 +28471,7 @@ partial module adm.dev.github {
 		permissions ?TeamRepositoryPermissions
 		@json("role_name", omitempty = true)
 		roleName string = ""
+		// A GitHub user.
 		@json(omitempty = true)
 		owner ?SimpleUser
 		// Whether the repository is private or public.
@@ -28253,6 +28622,8 @@ partial module adm.dev.github {
 		// Whether to allow rebase merges for pull requests.
 		@json("allow_rebase_merge", omitempty = true)
 		allowRebaseMerge bool = false
+		// When present and non-empty, a temporary credential for read-only Git access to this
+		// repository.
 		@json("temp_clone_token", omitempty = true)
 		tempCloneToken string = ""
 		// Whether to allow squash merges for pull requests.
@@ -28330,6 +28701,7 @@ partial module adm.dev.github {
 		membersUrl string = ""
 		@json("repositories_url", omitempty = true)
 		repositoriesUrl string = ""
+		// Groups of organization members that gives permissions on specified repositories.
 		@json(omitempty = true)
 		parent ?TeamSimple
 		// The ownership type of the team
@@ -28476,12 +28848,14 @@ partial module adm.dev.github {
 		commitUrl ?string
 		@json("created_at", omitempty = true)
 		createdAt string = ""
+		// GitHub apps are a new way to extend GitHub.
 		@json("performed_via_github_app", omitempty = true)
 		performedViaGithubApp ?Integration
 		@json(omitempty = true)
 		label ?TimelineIssueEventsLabel
+		// The intent behind an agent's action on an issue, including the rationale and confidence.
 		@json(omitempty = true)
-		intent ?IssueEventIntent
+		intent ?NullableIssueEventIntent
 		@json(omitempty = true)
 		milestone ?TimelineIssueEventsMilestone
 		@json(omitempty = true)
@@ -28522,10 +28896,12 @@ partial module adm.dev.github {
 		authorAssociation string = ""
 		@json(omitempty = true)
 		reactions ?ReactionRollup
+		// Context around who pinned an issue comment and when it was pinned.
 		@json(omitempty = true)
-		pin ?PinnedIssueComment
+		pin ?NullablePinnedIssueComment
+		// Details about why an issue comment was minimized.
 		@json(omitempty = true)
-		minimized ?IssueCommentMinimized
+		minimized ?NullableIssueCommentMinimized
 		@json(omitempty = true)
 		source ?TimelineIssueEventsSource
 		// SHA for the commit
@@ -28567,12 +28943,16 @@ partial module adm.dev.github {
 		// The type of issue.
 		@json("prev_issue_type", omitempty = true)
 		prevIssueType ?IssueTypeWebhook
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("sub_issue", omitempty = true)
 		subIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("parent_issue", omitempty = true)
 		parentIssue ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json("blocked_by", omitempty = true)
 		blockedBy ?IssueReference
+		// A minimal reference to an issue linked from a timeline event (e.g.
 		@json(omitempty = true)
 		blocking ?IssueReference
 	}
@@ -29820,7 +30200,7 @@ partial module adm.dev.github {
 		@json(omitempty = true)
 		id int = 0
 		@json(omitempty = true)
-		labels WebhooksIssueLabelsItem[] = []
+		labels WebhooksLabel[] = []
 		@json("labels_url", omitempty = true)
 		labelsUrl string = ""
 		@json(omitempty = true)
@@ -29841,6 +30221,7 @@ partial module adm.dev.github {
 		reactions WebhooksIssueReactions = WebhooksIssueReactions{}
 		@json("repository_url", omitempty = true)
 		repositoryUrl string = ""
+		// Comments provide a way for people to collaborate on an issue.
 		@json("pinned_comment", omitempty = true)
 		pinnedComment ?IssueComment
 		@json("sub_issues_summary", omitempty = true)
@@ -29965,27 +30346,6 @@ partial module adm.dev.github {
 		url string = ""
 		@json("user_view_type", omitempty = true)
 		userViewType string = ""
-	}
-
-	// Label
-	struct WebhooksIssueLabelsItem {
-		// 6-character hex code, without the leading #, identifying the color
-		@json(omitempty = true)
-		color string = ""
-		@json("default", omitempty = true)
-		defaultValue bool = false
-		@json(omitempty = true)
-		description ?string
-		@json(omitempty = true)
-		id int = 0
-		// The name of the label.
-		@json(omitempty = true)
-		name string = ""
-		@json("node_id", omitempty = true)
-		nodeId string = ""
-		// URL for the label
-		@json(omitempty = true)
-		url string = ""
 	}
 
 	// A collection of related issues and pull requests.
@@ -32073,6 +32433,7 @@ partial module adm.dev.github {
 		// The URL to the workflow.
 		@json("workflow_url", omitempty = true)
 		workflowUrl string = ""
+		// A commit.
 		@json("head_commit", omitempty = true)
 		headCommit ?SimpleCommit
 		// Minimal Repository

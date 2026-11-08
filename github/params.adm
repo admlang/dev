@@ -74,6 +74,12 @@ internal partial module adm.dev.github.api {
 			values[name] = value unless value is none
 		}
 
+		// putNull sends the member as JSON null, which clears a field the API
+		// treats so (an issue's milestone); `put` with none leaves it out.
+		def putNull(name string) {
+			values[name] = none
+		}
+
 		def len() int {
 			return values.len()
 		}
